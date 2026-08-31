@@ -1,4 +1,4 @@
-.PHONY: compile test adversarial redteam fuzz demo check clean
+.PHONY: compile test adversarial redteam fuzz demo modelcheck check clean
 
 compile:
 	python -m compileall -q faar test evals
@@ -21,7 +21,10 @@ demo: compile
 	python -m faar.cli mock-run --intent examples/intent.json --grant examples/grant.json --risk examples/risk.json --authority examples/authority.json --db faar-demo.sqlite
 	python -m faar.cli verify-evidence --intent-id intent_demo_000000000001 --db faar-demo.sqlite
 
-check: test adversarial redteam fuzz demo
+modelcheck: compile
+	PYTHONPATH=. python evals/model_check_permit_protocol.py
+
+check: test adversarial redteam fuzz demo modelcheck
 
 clean:
 	rm -rf __pycache__ faar/__pycache__ test/__pycache__ evals/__pycache__ *.sqlite *.db build dist *.egg-info
