@@ -38,21 +38,15 @@ jobs:
           tail -c +112513 /tmp/faar-payload.bin > /tmp/faar-v03.diff.gz
           echo '36e80a854aab9643e37e79b42509d8f738866f96d68001e8bb70edd5c4202f21  /tmp/faar-v021.bundle' | sha256sum -c -
           echo 'e2fd82d7a52a55a98ffcf061bb4247c2feb590b83bfb4271d6933c60879dd422  /tmp/faar-v03.diff.gz' | sha256sum -c -
-
           git bundle verify /tmp/faar-v021.bundle
-          git bundle list-heads /tmp/faar-v021.bundle | tee /tmp/faar-heads.txt
-          grep -F '3b5d3a26ed6a4cec4868d1a88e31787199e7e0d8 refs/heads/main' /tmp/faar-heads.txt
-          grep -F 'c4106879d1d574155c741148f4bd736f47db36c9 refs/heads/redteam/v0.2-hardening' /tmp/faar-heads.txt
-          grep -F '1672cd8e95d1ce3fe3ce10e7b9e5d52a486f9566 refs/tags/v0.1.0' /tmp/faar-heads.txt
-          grep -F '4d146fbc355cfec75f59d90346c6e13288345d3b refs/tags/v0.2.0' /tmp/faar-heads.txt
-          grep -F 'dc3ccf305a43fdb87def69e04b0dab50f553b726 refs/tags/v0.2.1' /tmp/faar-heads.txt
 
-      - name: Rebuild v0.3 on exact v0.2.1 history
+      - name: Rebuild ready v0.3 from v0.2.1
         shell: bash
         run: |
           set -euo pipefail
-          git clone /tmp/faar-v021.bundle /tmp/faar-recovered
-          cd /tmp/faar-recovered
+          git clone /tmp/faar-v021.bundle /tmp/faar-v021
+          git clone /tmp/faar-v021.bundle /tmp/faar-v03
+          cd /tmp/faar-v03
           git checkout -B v0.3/tcb-reduction 3b5d3a26ed6a4cec4868d1a88e31787199e7e0d8
           gzip -dc /tmp/faar-v03.diff.gz > /tmp/faar-v03.diff
           git apply --index /tmp/faar-v03.diff
@@ -64,46 +58,48 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install v0.3 dependencies
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd /tmp/faar-recovered
-          python -m pip install --upgrade pip
-          python -m pip install -e .
-
-      - name: Run complete FAAR gate
+      - name: Install and run complete FAAR gate
         shell: bash
         env:
           TERM: xterm
         run: |
           set -euo pipefail
-          cd /tmp/faar-recovered
+          cd /tmp/faar-v03
+          python -m pip install --upgrade pip
+          python -m pip install -e .
           make check
           PYTHONPATH=. python evals/model_check_permit_protocol.py
+          git clean -fdx
+          git diff --cached --check
 
-      - name: Commit ready v0.3
+      - name: Commit restored v0.2.1 baseline and ready v0.3 to main
         shell: bash
         run: |
           set -euo pipefail
-          cd /tmp/faar-recovered
+          cd "$GITHUB_WORKSPACE"
           git config user.name 'Droptops'
           git config user.email '159727600+Droptops@users.noreply.github.com'
+
+          # Preserve only this bootstrap workflow. Source history is copied without
+          # .github so the Actions token never creates/updates a workflow file.
+          rsync -a --delete --exclude='.git' --exclude='.github' /tmp/faar-v021/ ./
+          git add -A -- ':!.github'
+          git commit -m 'restore: FAAR v0.2.1 baseline'
+          echo "FAAR_V021_RESTORED_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+          rsync -a --delete --exclude='.git' --exclude='.github' /tmp/faar-v03/ ./
+          git add -A -- ':!.github'
+          git diff --cached --check
           git commit -m 'feat: harden FAAR v0.3 trusted execution boundary'
           echo "FAAR_V03_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
 
-      - name: Publish recovered history and ready v0.3
+      - name: Publish ready source snapshot
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
-          cd /tmp/faar-recovered
+          cd "$GITHUB_WORKSPACE"
           git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
-
-          git push --force origin c4106879d1d574155c741148f4bd736f47db36c9:refs/heads/redteam/v0.2-hardening
-          git push origin refs/tags/v0.1.0:refs/tags/v0.1.0 refs/tags/v0.2.0:refs/tags/v0.2.0 refs/tags/v0.2.1:refs/tags/v0.2.1
-          git push --force origin HEAD:refs/heads/v0.3/tcb-reduction
-          git push --force origin HEAD:refs/heads/main
-
-          printf 'published FAAR v0.3 commit: %s\n' "$FAAR_V03_SHA"
+          git push origin HEAD:refs/heads/main
+          printf 'restored baseline: %s\nready v0.3: %s\n' "$FAAR_V021_RESTORED_SHA" "$FAAR_V03_SHA"
