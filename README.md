@@ -156,10 +156,11 @@ docs/
   RED_TEAM_REPORT.md
   DEFINITION_OF_DONE.md
   UNPLUG_TEST.md
+  V0_3_RELEASE.md
   V0_2_RELEASE_GATES.md
 
 schemas/              # intent, grant, risk, attestation, task contracts
-evals/                 # adversarial, red-team, and seeded fuzz harnesses
+evals/                 # adversarial, red-team, fuzz, and bounded-model harnesses
 test/                  # deterministic unit/invariant suite
 examples/              # non-production fixtures
 ```
@@ -176,8 +177,17 @@ examples/              # non-production fixtures
 
 ## Status
 
-**v0.2.1 pre-alpha reference runtime. Not approved for live funds or production credentials.**
+**v0.3.0 pre-alpha reference runtime. Not approved for live funds or production credentials.**
 
-The current deterministic release gate passes 75 unit/invariant tests, 41 named red-team attack classes, 160 denial mutations with zero unauthorized economic effects, 100 same-intent replay attempts with one economic effect, and 96 seeded state-machine fuzz scenarios with zero duplicate-effect or aggregate-budget violations. These are regression results, not formal verification or an external security audit.
+See [`docs/V0_3_RELEASE.md`](docs/V0_3_RELEASE.md). The current deterministic release gate (`make check`) includes unit tests, adversarial denial/replay checks, targeted red-team classes, seeded state-machine fuzz, the demo CLI path, and the bounded permit protocol model checker. Headline results:
 
-Before any live-money adapter, the repository requires the production gates in [`docs/V0_2_RELEASE_GATES.md`](docs/V0_2_RELEASE_GATES.md), including production signing/key isolation, distributed datastore fencing, authoritative risk-state semantics, reviewed venue reconciliation, authenticated ingress, failure injection, and independent security review.
+- 105/105 unit/invariant tests
+- 59 targeted red-team attack classes
+- 160 adversarial denial cases with 0 unauthorized economic effects
+- 100 same-intent replay attempts with 1 valid economic effect
+- 96 seeded fuzz scenarios with 0 duplicate-effect and 0 aggregate-budget violations
+- bounded permit model: max depth 10, 12 unique states, 15 transitions, 0 invariant violations, stale permit consumable after revoke = false
+
+These are deterministic regression, adversarial, fuzz, and bounded-model results. They are not formal verification, an independent security audit, or a production-safety claim.
+
+Before any live-money adapter, the repository still requires the production gates in [`docs/V0_2_RELEASE_GATES.md`](docs/V0_2_RELEASE_GATES.md), including production signing/key isolation, distributed datastore fencing, authoritative risk-state semantics, reviewed venue reconciliation, authenticated ingress, failure injection, and independent security review.
