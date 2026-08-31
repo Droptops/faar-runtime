@@ -27,6 +27,12 @@ can retain signing material while offering only `verify()`. Strong isolation
 requires a separate signer process/KMS/HSM. Longer term, FAAR should take
 serialized public-key material and construct the verifier internally.
 
+v0.5 takes that next step on a separate execution plane: `faar-authority`
+holds `SigningKeyProvider` material; the executor is constructed from
+`VerifierDescriptor` records and never receives private keys. Compromise of
+the v0.5 executor does not yield a permit minting primitive. Compromise of
+`faar-authority` still can.
+
 ## Reference attestations
 
 The repository uses HMAC-SHA256 so tests can exercise cryptographic binding without third-party dependencies. Each reference key is explicitly scoped to one or more `AttestationKind` roles; a risk-only key cannot mint AUTHORITY even with a valid MAC. HMAC remains symmetric: any verifier holding a permitted key can also sign within that role. This is not the preferred production separation.

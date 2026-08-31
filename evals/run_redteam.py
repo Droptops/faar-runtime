@@ -91,6 +91,12 @@ ATTACK_CLASSES = [
     "grant revoke racing permit consume never double-consumes",
     "two outstanding permits cannot exist for one intent",
     "partial-fill cancel lookup cannot erase a known effect",
+    "malicious verifier descriptor rejected at construction",
+    "spawned executor process holds zero Ed25519 private keys",
+    "amount mutation is denied with no treasury movement",
+    "beneficiary substitution is denied at the execution gateway",
+    "delayed execution after permit expiry is denied",
+    "crash after treasury effect before receipt commit recovers once",
 ]
 
 
@@ -98,7 +104,7 @@ def main() -> None:
     cmd = [sys.executable, "-m", "unittest", "discover", "-s", "test", "-p", "test_*.py"]
     completed = subprocess.run(cmd, capture_output=True, text=True)
     report = {
-        "suite": "FAAR v0.4 targeted red-team matrix",
+        "suite": "FAAR v0.5 targeted red-team matrix",
         "attack_classes": len(ATTACK_CLASSES),
         "classes": ATTACK_CLASSES,
         "unit_suite_exit_code": completed.returncode,

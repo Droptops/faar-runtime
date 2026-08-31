@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.5.0 — unreleased
+
+Out-of-process authority issuance and serialized verifier descriptors. Still **pre-alpha and not approved for live funds or production credentials**. Not a tag.
+
+- execution plane is constructed from `VerifierDescriptor` public material, not arbitrary verifier objects
+- `faar-authority` mints signed execution permits; the executor does not import signing providers
+- `SigningKeyProvider` with in-memory Ed25519, file-backed Ed25519, and an unimplemented KMS/HSM interface
+- `ExecutionGateway` is the choke point for fake-money treasury `PAY`
+- `AuthorityLedger` contract (SQLite reference) for permits, receipts, lineage, and account bindings
+- mock treasury adapter: exactly-once transfer to an allowlisted beneficiary within a daily budget
+- distributed-boundary eval for descriptor forgery, executor isolation, replay, expiry, and crash-after-effect
+
+The v0.4 in-process `FAARRuntime` path is unchanged. These are deterministic/subprocess results, not a production KMS or live-payments claim.
+
 ## 0.4.0 — 2026-08-31
 
 Isolated authority-plane reference release over frozen v0.3.0. Still **pre-alpha and not approved for live funds or production credentials**.

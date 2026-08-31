@@ -68,7 +68,10 @@ mint/verify. HMAC-SHA256 remains available for local attestation and
 evidence-MAC tests. Isolated permit signing rejects HMAC because any holder
 that can verify also has enough key material to mint. Ed25519 signers expose
 `sign()` and `public_verifier()` only; Ed25519 verifiers expose `verify()`
-only. Production should keep signing material in a separate process/KMS/HSM.
+only. v0.5 additionally splits **processes**: `faar-authority` holds
+`SigningKeyProvider` material; the executor is constructed from serialized
+`VerifierDescriptor` public keys. Production should keep signing material in
+a separate process/KMS/HSM.
 
 ## Intent lifecycle
 
