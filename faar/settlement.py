@@ -131,6 +131,23 @@ class QuorumSettlementVerifier:
                     verified_request_hash=expected_hash,
                 )
             return SettlementRecord(SettlementStatus.UNKNOWN, evidence={"quorum": "no-authoritative-facts"}, authoritative=False)
+        # Reaching quorum is necessary but not sufficient. If two DISTINCT
+        # authoritative facts each reach quorum (e.g. a 2-2 split with quorum=2),
+        # settlement is genuinely contested and must fail closed, not be resolved
+        # by whichever fact `max` happens to visit first.
+        quorum_facts = [fact for fact, count in counts.items() if count >= self.quorum]
+        if len(quorum_facts) > 1:
+            return SettlementRecord(
+                SettlementStatus.CONTRADICTORY,
+                evidence={
+                    "quorum": "multiple-facts-reached-quorum",
+                    "required": self.quorum,
+                    "facts": [self._fact(r) for r in records],
+                    "binding_mismatches": binding_mismatches,
+                },
+                authoritative=True,
+                verified_request_hash=expected_hash,
+            )
         fact, count = max(counts.items(), key=lambda kv: kv[1])
         if count < self.quorum:
             return SettlementRecord(

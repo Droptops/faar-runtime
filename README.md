@@ -177,11 +177,11 @@ examples/              # non-production fixtures
 
 ## Status
 
-**v0.3.0 pre-alpha reference runtime. Not approved for live funds or production credentials.**
+**v0.3.1 pre-alpha reference runtime. Not approved for live funds or production credentials.**
 
 See [`docs/V0_3_RELEASE.md`](docs/V0_3_RELEASE.md). The current deterministic release gate (`make check`) includes unit tests, adversarial denial/replay checks, targeted red-team classes, seeded state-machine fuzz, the demo CLI path, and the bounded permit protocol model checker. Headline results:
 
-- 105/105 unit/invariant tests
+- 125/125 unit/invariant tests
 - 59 targeted red-team attack classes
 - 160 adversarial denial cases with 0 unauthorized economic effects
 - 100 same-intent replay attempts with 1 valid economic effect

@@ -77,9 +77,9 @@ FAAR distinguishes authoritative and non-authoritative reconciliation for both a
 
 ### Evidence-store tampering
 
-A database-only attacker may rewrite rows. Hash chains detect ordinary mutation and an optional HMAC detects rewriting by an attacker without the evidence key.
+A database-only attacker may rewrite, delete, or truncate rows. Hash chains detect ordinary mutation, interior deletion, and reordering; an optional evidence HMAC detects rewriting by an attacker without the key; and a signed per-intent head commitment (sequence number plus head hash under the same key) detects tail-truncation and whole-chain deletion, which a prev-hash chain alone cannot (a deleted suffix leaves an internally consistent prefix).
 
-Residual risk: compromise of the runtime host plus evidence key can forge new valid MACs. Production evidence may require remote append-only logging, signed checkpoints, or external transparency anchoring.
+Residual risk: the head commitment is only meaningful when an evidence key is configured — without a key a database-level attacker can rewrite the head row too, so the chain-only guarantees are the ceiling. Compromise of the runtime host plus evidence key can still forge new valid MACs. Production evidence may require remote append-only logging, signed checkpoints, or external transparency anchoring.
 
 ### Malicious/buggy execution adapter
 

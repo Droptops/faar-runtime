@@ -55,7 +55,9 @@ def _amount_usd(intent: Intent) -> Decimal | None:
 
 def _assets(intent: Intent) -> set[str]:
     fields = ("asset", "base_asset", "quote_asset", "from_asset", "to_asset")
-    return {str(intent.payload[f]) for f in fields if intent.payload.get(f)}
+    # Use presence, not truthiness: a falsy-but-present asset value (0, False)
+    # must still be validated against the allowlist, not silently dropped.
+    return {str(intent.payload[f]) for f in fields if intent.payload.get(f) not in (None, "")}
 
 
 _RAW_EXECUTION_FIELDS = {
@@ -158,7 +160,14 @@ def evaluate_capability(intent: Intent, grant: CapabilityGrant, now: datetime) -
     if grant.valid_until is not None and now > grant.valid_until:
         reasons.append("GRANT_EXPIRED")
 
-    target = intent.payload.get("target") or intent.payload.get("counterparty") or intent.payload.get("contract")
+    # Coalesce on presence, not truthiness: `a or b` would fall through a falsy
+    # target (0, False) to the next key and ultimately to None, skipping the
+    # denied_targets / TARGET_REQUIRED checks for that value.
+    target = intent.payload.get("target")
+    if target is None:
+        target = intent.payload.get("counterparty")
+    if target is None:
+        target = intent.payload.get("contract")
     if target is not None:
         target = str(target)
         if target in grant.denied_targets:

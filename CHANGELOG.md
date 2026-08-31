@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.3.1 — 2026-08-31
+
+Red-team patch over v0.3.0 from a second adversarial review pass. Still **pre-alpha and not approved for live funds or production credentials**. See [`docs/RED_TEAM_REPORT.md`](docs/RED_TEAM_REPORT.md) findings RT-36..RT-41.
+
+- **Settlement quorum fails closed (RT-36):** `QuorumSettlementVerifier` returns `CONTRADICTORY` when two distinct authoritative facts each reach quorum (e.g. a 2-2 split), instead of resolving the contest by iteration order.
+- **Capability asset scope (RT-37):** falsy-but-present asset values (e.g. integer `0`) are validated against `allowed_assets` instead of being dropped by a truthiness check.
+- **Capability target scope (RT-38):** falsy-but-present targets are checked against `denied_targets` / `TARGET_REQUIRED` instead of coalescing to `None`.
+- **Action-velocity limit (RT-39):** the per-grant velocity reservation uses a sliding window over the trailing `action_window_seconds` instead of a fixed tumbling bucket that allowed up to 2x the limit across a boundary.
+- **Evidence tamper-evidence (RT-40):** a signed per-intent head commitment lets a keyed verifier detect tail-truncation and whole-chain deletion, which the prev-hash chain alone could not.
+- **Supply chain (RT-41):** GitHub Actions pinned to commit SHAs; the `cryptography` dependency range loosened from the over-tight `>=46,<47`.
+
+Unit/invariant suite expanded to 125 tests. The adversarial, red-team, fuzz, demo, and bounded-model gates are unchanged in count and remain green. These are regression results, not formal verification, an independent audit, or a production-safety claim.
+
 ## 0.3.0 — 2026-08-31
 
 v0.3.0 reference runtime. Still **pre-alpha and not approved for live funds or production credentials**.

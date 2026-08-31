@@ -43,6 +43,21 @@ class SettlementQuorumTests(unittest.TestCase):
         self.assertEqual(SettlementStatus.CONTRADICTORY, result.status)
         self.assertTrue(result.authoritative)
 
+    def test_two_facts_each_reaching_quorum_fail_closed(self):
+        # 4 sources, 2 report FINALIZED and 2 report NONE, quorum=2. Both facts
+        # reach quorum; the settlement is genuinely contested and must not be
+        # resolved to whichever fact `max` visits first.
+        finalized = SettlementRecord(SettlementStatus.FINALIZED, "fx-1", Decimal("50"), authoritative=True, verified_request_hash=REQ_HASH)
+        none = SettlementRecord(SettlementStatus.NONE, authoritative=True, verified_request_hash=REQ_HASH)
+        q = QuorumSettlementVerifier(
+            [Source(finalized, "a"), Source(finalized, "b"), Source(none, "c"), Source(none, "d")],
+            quorum=2,
+        )
+        result = q.verify(REQ)
+        self.assertEqual(SettlementStatus.CONTRADICTORY, result.status)
+        self.assertTrue(result.authoritative)
+        self.assertIsNone(result.effect_id)
+
     def test_non_authoritative_source_cannot_form_quorum(self):
         good = SettlementRecord(SettlementStatus.FINALIZED, "fx-1", Decimal("50"), authoritative=True, verified_request_hash=REQ_HASH)
         weak = SettlementRecord(SettlementStatus.FINALIZED, "fx-1", Decimal("50"), authoritative=False)
