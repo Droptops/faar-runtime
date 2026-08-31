@@ -13,10 +13,15 @@ from .models import Attestation, AttestationAlgorithm, AttestationKind, Intent
 
 
 def has_signing_api(obj: object) -> bool:
-    """True if `obj` exposes a callable `sign` minting path.
+    """Defense-in-depth: True if `obj` exposes a callable `sign` minting path.
 
-    Runtime and executor trust objects must fail this check. A `can_sign` flag is
-    not sufficient: a compromised verifier must not have an API that can mint.
+    Runtime and executor construction reject objects that expose `sign()`. This is
+    not proof that an object holds no private key: an arbitrary Python object can
+    retain signing material while offering only `verify()`. FAAR-provided verifier
+    implementations accept public-key material only. Strong private-key isolation
+    requires a separate signer process/KMS/HSM or an equivalent construction
+    boundary; the long-term runtime API should take serialized public-key material
+    and construct the verifier internally.
     """
     return callable(getattr(obj, "sign", None))
 
@@ -89,10 +94,10 @@ class HMACTrustStore:
     This remains useful for deterministic compatibility tests, but it is not a
     TCB-isolating verifier: anyone able to verify also has enough material to forge
     attestations. FAAR runtime construction rejects any trust object that exposes a
-    signing API.
+    signing API. HMAC keeps both `sign` and `verify` because the secret is shared;
+    isolation is structural (Ed25519 signer vs verifier classes), not a `can_sign` flag.
     """
 
-    can_sign = True
     algorithm = AttestationAlgorithm.HMAC_SHA256
 
     def __init__(
@@ -233,8 +238,8 @@ def _verify_ed25519_attestation(
     return not reasons, tuple(reasons)
 
 
-class Ed25519TrustStore:
-    """Role-scoped asymmetric attestation signer.
+class Ed25519AttestationSigner:
+    """Role-scoped asymmetric attestation signer. Sign-only; no verify() API.
 
     Isolated verifiers must use `public_verifier()`, which returns
     `Ed25519AttestationVerifier` and does not expose a minting API.
@@ -253,10 +258,10 @@ class Ed25519TrustStore:
             raise ValueError("at least one attestation key is required")
         self._keys = {str(k): v for k, v in keys.items()}
         self._key_kinds = _normalize_kinds(set(self._keys), key_kinds)
-        capabilities = {hasattr(v, "sign") for v in self._keys.values()}
-        if len(capabilities) != 1:
-            raise ValueError("attestation trust store cannot mix private and public keys")
-        self.can_sign = capabilities.pop()
+        if any(not has_signing_api(v) for v in self._keys.values()):
+            raise ValueError("attestation signer requires signing-capable private keys")
+        if any(not hasattr(v, "public_key") for v in self._keys.values()):
+            raise ValueError("cannot derive a verify-only projection from signing material without a public key")
         if max_clock_skew_seconds < 0:
             raise ValueError("max_clock_skew_seconds must be non-negative")
         self.max_clock_skew_seconds = max_clock_skew_seconds
@@ -267,7 +272,7 @@ class Ed25519TrustStore:
         key_kinds: Mapping[str, Iterable[AttestationKind]],
         *,
         max_clock_skew_seconds: int = 5,
-    ) -> "Ed25519TrustStore":
+    ) -> "Ed25519AttestationSigner":
         from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
         return cls(
             {str(k): Ed25519PrivateKey.generate() for k in key_kinds},
@@ -276,11 +281,7 @@ class Ed25519TrustStore:
         )
 
     def public_verifier(self, *, key_lifecycle: KeyLifecycle | None = None) -> "Ed25519AttestationVerifier":
-        public = {}
-        for key_id, key in self._keys.items():
-            if callable(getattr(key, "sign", None)) and not hasattr(key, "public_key"):
-                raise ValueError("cannot derive a verify-only attestation store from signing material without a public key")
-            public[key_id] = key.public_key() if hasattr(key, "public_key") else key
+        public = {key_id: key.public_key() for key_id, key in self._keys.items()}
         return Ed25519AttestationVerifier(
             public, key_kinds=self._key_kinds,
             max_clock_skew_seconds=self.max_clock_skew_seconds,
@@ -300,8 +301,6 @@ class Ed25519TrustStore:
         issued_at: datetime,
         ttl_seconds: int = 30,
     ) -> Attestation:
-        if not self.can_sign:
-            raise PermissionError("verify-only attestation trust store cannot sign")
         if ttl_seconds <= 0:
             raise ValueError("ttl_seconds must be positive")
         try:
@@ -325,20 +324,10 @@ class Ed25519TrustStore:
             issued_at, expires_at, signature,
         )
 
-    def verify(
-        self,
-        attestation: Attestation,
-        *,
-        kind: AttestationKind,
-        subject: object,
-        intent: Intent,
-        now: datetime,
-    ) -> tuple[bool, tuple[str, ...]]:
-        return _verify_ed25519_attestation(
-            self._keys, self._key_kinds, attestation,
-            kind=kind, subject=subject, intent=intent, now=now,
-            max_clock_skew_seconds=self.max_clock_skew_seconds,
-        )
+
+# Compatibility name. This class is the signer, not a dual-role store: it has
+# `sign()` and `public_verifier()`, and no `verify()`.
+Ed25519TrustStore = Ed25519AttestationSigner
 
 
 class Ed25519AttestationVerifier:
@@ -401,3 +390,25 @@ class Ed25519AttestationVerifier:
         if not crypto_ok:
             reasons.extend(crypto_reasons)
         return not reasons, tuple(dict.fromkeys(reasons))
+
+
+def require_verify_only_attestation_trust(
+    obj: object,
+    *,
+    hardened: bool = True,
+    signing_api_error: str,
+    hardened_error: str | None = None,
+) -> None:
+    """Construction guard for runtime/executor attestation trust objects.
+
+    Rejects a callable `sign()` minting API. In hardened mode, also requires a
+    FAAR-provided `Ed25519AttestationVerifier`. This is defense-in-depth, not
+    proof that an arbitrary object holds no private key.
+    """
+    if has_signing_api(obj):
+        raise ValueError(signing_api_error)
+    if hardened and not isinstance(obj, Ed25519AttestationVerifier):
+        raise ValueError(
+            hardened_error
+            or "hardened construction accepts only FAAR-provided Ed25519AttestationVerifier"
+        )

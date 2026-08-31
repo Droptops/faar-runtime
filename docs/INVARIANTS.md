@@ -160,6 +160,7 @@ This is a reference control plane. Direct store access remains inside the TCB.
 ## Remaining after v0.4
 
 - HMAC remains a local development option for attestations and evidence MACs, not for isolated permit minting
+- `has_signing_api()` rejects exposed minting APIs; it does not prove an arbitrary object holds no private key
 - SQLite is a reference local fence, not a distributed production datastore
 - no independent production signer process / KMS / HSM
 - no live-venue adapter

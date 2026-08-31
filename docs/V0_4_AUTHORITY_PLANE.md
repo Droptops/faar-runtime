@@ -33,6 +33,61 @@ Evidence / Settlement
 Out of scope: live-money adapters, KMS/HSM, distributed production datastores,
 formal verification, independent audit.
 
+## Signer / verifier role purity
+
+Permit and attestation Ed25519 paths are sign-only vs verify-only:
+
+```text
+Ed25519PermitSigner / Ed25519AttestationSigner
+    sign()
+    public_verifier()
+
+Ed25519PermitVerifier / Ed25519AttestationVerifier
+    verify()
+```
+
+There is no `verify()` on a signer and no `sign()` on a verifier. HMAC trust
+stores remain dual-role because the secret is shared; they are compatibility
+test objects, not isolated runtime trust.
+
+`Ed25519TrustStore` is a compatibility alias for `Ed25519AttestationSigner`.
+`Ed25519PermitSignature` is a compatibility alias for `Ed25519PermitSigner`.
+
+Hardened `FAARRuntime` / `ConstrainedPermitAuthority` construction (`hardened=True`,
+the default) accepts only a FAAR-provided `Ed25519AttestationVerifier`. Objects
+that expose a callable `sign()` are rejected in every mode.
+
+## `has_signing_api()` is defense-in-depth, not a security boundary
+
+`has_signing_api(obj)` is `callable(getattr(obj, "sign", None))`. Runtime and
+executor constructors use it to reject objects that expose a minting API.
+FAAR-provided verifier implementations accept public-key material only and
+reject ordinary Ed25519 private-key objects.
+
+An arbitrary Python object can still retain a private key internally while
+exposing only `verify()`. `has_signing_api()` cannot discover that. Strong
+private-key isolation requires a separate signer process/KMS/HSM or an
+equivalent construction boundary. The long-term runtime API is not “give me an
+arbitrary verifier object”; it is “give me serialized public-key material / a
+public-key descriptor and let FAAR construct the verifier internally.”
+
+## Python API compatibility (not a wire break)
+
+Permit and attestation **wire formats are unchanged**. The Python classes are not.
+
+Before the signer/verifier split, `Ed25519PermitSignature` accepted
+`public_key=...` and supported `verify()`. It is now an alias for
+`Ed25519PermitSigner`, whose constructor accepts only `private_key` (or
+generates one) and which has no `verify()`. Callers that constructed a
+public-key-only permit object must use `Ed25519PermitVerifier`.
+
+`Ed25519TrustStore` previously implemented both `sign()` and `verify()`. It is
+now an alias for `Ed25519AttestationSigner` and has no `verify()`. Isolated
+verification uses `public_verifier()` → `Ed25519AttestationVerifier`.
+
+Residual `can_sign` flags were removed. Structural capability (presence of
+`sign()` / `verify()`, and FAAR class identity in hardened mode) supersedes them.
+
 ## What SQLite proves and does not prove
 
 The reference store uses SQLite with `BEGIN IMMEDIATE`, unique constraints, and
