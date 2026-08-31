@@ -10,12 +10,22 @@ FAAR is useful only if its trust boundaries are explicit.
 | Grant authority | Trusted for capability envelope/status | Can broaden/re-enable economic authority |
 | FAAR runtime | Trusted security kernel | Full bypass possible |
 | Isolated permit signer | Trusted to mint bounded ExecutionPermit | Can authorize in-policy requests while its key is ACTIVE |
-| Permit/attestation verifier | Trusted to accept artifacts for ACTIVE/RETIRED keys | Compromise of verify-only material cannot mint |
+| Permit/attestation verifier | Trusted to accept artifacts for ACTIVE/RETIRED keys | Compromise of FAAR-provided public-key verifier material cannot mint; an arbitrary `verify()`-only object may still hide a key |
 | Authenticated ingress | Trusted for principal binding / admin split | Bypass by talking to the store directly is a trusted-operator path |
 | Datastore | Trusted for availability/transactions; MAC hardens DB-only mutation | Corruption can stop service; forged state depends on key/host access |
 | Adapter | Trusted credential/execution + reconciliation boundary | Can submit a different action before runtime detects bad evidence; live design should reduce this trust |
 | Venue/RPC | External and potentially ambiguous | Requires adapter-specific reconciliation/finality |
 | Task-contract signer | Trusted for definition of done | Can define misleading success criteria |
+
+## `has_signing_api()` claim boundary
+
+Runtime and executor constructors reject objects exposing a callable `sign()`
+minting API. FAAR-provided `Ed25519PermitVerifier` and
+`Ed25519AttestationVerifier` accept public-key material only. That is
+defense-in-depth, not proof of private-key absence: a caller-supplied object
+can retain signing material while offering only `verify()`. Strong isolation
+requires a separate signer process/KMS/HSM. Longer term, FAAR should take
+serialized public-key material and construct the verifier internally.
 
 ## Reference attestations
 

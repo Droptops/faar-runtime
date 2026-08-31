@@ -21,6 +21,13 @@ from faar.models import (
     IntentState,
     SettlementStatus,
 )
+from faar.attestation import (
+    Ed25519AttestationSigner,
+    Ed25519AttestationVerifier,
+    Ed25519TrustStore,
+    has_signing_api,
+)
+from faar.permits import Ed25519PermitSigner, Ed25519PermitSignature, Ed25519PermitVerifier
 from faar.runtime import FAARRuntime
 from faar.settlement import MockSettlementVerifier, SettlementRecord, SettlementSecurityProfile, REFERENCE_SETTLEMENT_PROFILE
 from faar.models import ExecutionRequest
@@ -96,6 +103,54 @@ class FAARRuntimeTests(unittest.TestCase):
                 self.store, {"mock-dex": self.venue}, self.trust, self.permit_authority,
                 {"mock-dex": self.settlement},
             )
+
+    def test_signer_verifier_role_symmetry_across_permit_and_attestation(self):
+        att_signer = self.trust
+        att_verifier = verification_trust(self.trust)
+        self.assertIs(Ed25519TrustStore, Ed25519AttestationSigner)
+        self.assertIsInstance(att_signer, Ed25519AttestationSigner)
+        self.assertIsInstance(att_verifier, Ed25519AttestationVerifier)
+        self.assertTrue(has_signing_api(att_signer))
+        self.assertFalse(hasattr(att_signer, "verify"))
+        self.assertFalse(has_signing_api(att_verifier))
+        self.assertFalse(hasattr(att_verifier, "sign"))
+
+        permit_signer = Ed25519PermitSigner("role-symmetry")
+        permit_verifier = permit_signer.public_verifier()
+        self.assertIs(Ed25519PermitSignature, Ed25519PermitSigner)
+        self.assertIsInstance(permit_signer, Ed25519PermitSigner)
+        self.assertIsInstance(permit_verifier, Ed25519PermitVerifier)
+        self.assertTrue(has_signing_api(permit_signer))
+        self.assertFalse(hasattr(permit_signer, "verify"))
+        self.assertFalse(has_signing_api(permit_verifier))
+        self.assertFalse(hasattr(permit_verifier, "sign"))
+
+    def test_hardened_runtime_accepts_only_faar_attestation_verifier(self):
+        class HiddenKeyImpostor:
+            """Verify-only surface that can still retain private material internally."""
+
+            def __init__(self, hidden):
+                self._hidden = hidden
+
+            def verify(self, *args, **kwargs):
+                return True, ()
+
+        impostor = HiddenKeyImpostor(self.trust)
+        with self.assertRaisesRegex(ValueError, "Ed25519AttestationVerifier"):
+            FAARRuntime(
+                self.store, {"mock-dex": self.venue}, impostor, self.permit_authority,
+                {"mock-dex": self.settlement},
+            )
+        runtime = FAARRuntime(
+            self.store, {"mock-dex": self.venue}, impostor, self.permit_authority,
+            {"mock-dex": self.settlement}, hardened=False,
+        )
+        self.assertIs(runtime.trust, impostor)
+        accepted = FAARRuntime(
+            self.store, {"mock-dex": self.venue}, verification_trust(self.trust),
+            self.permit_authority, {"mock-dex": self.settlement},
+        )
+        self.assertIsInstance(accepted.trust, Ed25519AttestationVerifier)
 
     def test_happy_path_finalizes_once(self):
         i = intent()

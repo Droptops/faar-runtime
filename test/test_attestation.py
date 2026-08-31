@@ -6,7 +6,13 @@ import unittest
 
 from dataclasses import replace
 
-from faar.attestation import Ed25519AttestationVerifier, Ed25519TrustStore, HMACTrustStore, has_signing_api
+from faar.attestation import (
+    Ed25519AttestationSigner,
+    Ed25519AttestationVerifier,
+    Ed25519TrustStore,
+    HMACTrustStore,
+    has_signing_api,
+)
 from faar.canonical import canonical_hash
 from faar.models import Attestation, AttestationKind
 from support import AUTH, NOW, TRUST_KEYS, TRUST_KEY_KINDS, intent
@@ -55,7 +61,11 @@ class AttestationScopeTests(unittest.TestCase):
             att, kind=AttestationKind.AUTHORITY, subject=AUTH, intent=i, now=NOW
         )
         self.assertTrue(ok, reasons)
+        self.assertIs(Ed25519TrustStore, Ed25519AttestationSigner)
+        self.assertIsInstance(signer, Ed25519AttestationSigner)
         self.assertIsInstance(verifier, Ed25519AttestationVerifier)
+        self.assertTrue(has_signing_api(signer))
+        self.assertFalse(hasattr(signer, "verify"))
         self.assertFalse(has_signing_api(verifier))
         self.assertFalse(hasattr(verifier, "sign"))
 

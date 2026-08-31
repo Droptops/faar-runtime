@@ -6,7 +6,7 @@ from datetime import datetime
 from typing import Callable, Mapping
 
 from .adapters import AmbiguousExecution, DeterministicFailure, ExecutionAdapter
-from .attestation import AttestationVerifier, has_signing_api
+from .attestation import AttestationVerifier, require_verify_only_attestation_trust
 from .permits import ConstrainedPermitAuthority, PermitIssuanceError
 from .settlement import SettlementVerifier
 from .canonical import canonical_hash
@@ -52,6 +52,7 @@ class FAARRuntime:
         *,
         clock: Callable[[], datetime] = utcnow,
         allow_test_time_override: bool = False,
+        hardened: bool = True,
     ) -> None:
         self.store = store
         self.adapters = dict(adapters)
@@ -63,8 +64,12 @@ class FAARRuntime:
                     "stable intent identity, idempotent submission, stable effect identity, "
                     "permit enforcement, and single-use permit consumption are required"
                 )
-        if has_signing_api(trust):
-            raise ValueError("FAAR runtime must receive a verify-only attestation trust store")
+        require_verify_only_attestation_trust(
+            trust,
+            hardened=hardened,
+            signing_api_error="FAAR runtime must receive a verify-only attestation trust store",
+            hardened_error="hardened FAAR runtime accepts only FAAR-provided Ed25519AttestationVerifier",
+        )
         self.trust = trust
         self.permit_authority = permit_authority
         self.settlement_verifiers = dict(settlement_verifiers)

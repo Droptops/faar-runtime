@@ -4,7 +4,12 @@
 
 Isolated authority-plane reference release over frozen v0.3.0. Still **pre-alpha and not approved for live funds or production credentials**.
 
-- explicit `PermitSigner` / `PermitVerifier` split retained; isolated permit signer cannot choose policy and cannot mint with HMAC
+- explicit `PermitSigner` / `PermitVerifier` and `AttestationSigner` / `AttestationVerifier` splits; Ed25519 signers are sign-only and Ed25519 verifiers are verify-only
+- `Ed25519TrustStore` is a compatibility alias for `Ed25519AttestationSigner` (no `verify()`)
+- hardened runtime/permit-authority construction accepts only FAAR-provided `Ed25519AttestationVerifier`
+- `has_signing_api()` is documented as defense-in-depth, not proof that an object holds no private key
+- Python API break documented separately from unchanged wire formats: `Ed25519PermitSignature` no longer accepts `public_key=` or `verify()`
+- residual `can_sign` flags removed; structural capability detection supersedes them
 - durable key lifecycle (`ACTIVE` / `RETIRED` / `REVOKED`) for permit, attestation, and ingress keys
 - `key_id` is bound to a public-material hash; substitution/collision is rejected
 - revoked keys cannot be resurrected; retirement still verifies in-flight artifacts

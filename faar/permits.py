@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Protocol
 
-from .attestation import AttestationVerifier, has_signing_api
+from .attestation import AttestationVerifier, has_signing_api, require_verify_only_attestation_trust
 from .canonical import canonical_hash, canonical_json
 from .gates import evaluate_authority, evaluate_capability, evaluate_risk
 from .keys import KeyConflict, KeyLifecycle, KeyStatus, ed25519_public_material_hash
@@ -75,7 +75,6 @@ class HMACPermitSignature:
     signer_id: str
     key: bytes
     algorithm: PermitAlgorithm = PermitAlgorithm.HMAC_SHA256
-    can_sign: bool = True
 
     def __post_init__(self) -> None:
         if not self.signer_id or len(self.key) < 16:
@@ -112,7 +111,10 @@ class Ed25519PermitVerifier:
 
 
 class Ed25519PermitSigner:
-    """Isolated permit minting backend. Venues receive only `public_verifier()`."""
+    """Isolated permit minting backend. Sign-only; no verify() API.
+
+    Venues and execution gateways receive only `public_verifier()`.
+    """
 
     algorithm = PermitAlgorithm.ED25519
 
@@ -139,7 +141,9 @@ class Ed25519PermitSigner:
         return Ed25519PermitVerifier(self.signer_id, self._public_key)
 
 
-# Compatibility name used by existing callers; this class is the signer, not a verifier.
+# Compatibility name. This is the signer: constructor takes private_key only and
+# has no verify(). Callers that previously passed public_key= must use
+# Ed25519PermitVerifier. Wire formats are unchanged.
 Ed25519PermitSignature = Ed25519PermitSigner
 
 
@@ -246,13 +250,18 @@ class ConstrainedPermitAuthority:
         *,
         max_permit_ttl_seconds: int = 5,
         key_lifecycle: KeyLifecycle | None = None,
+        hardened: bool = True,
     ) -> None:
         if max_permit_ttl_seconds <= 0:
             raise ValueError("max_permit_ttl_seconds must be positive")
         if not has_signing_api(signature):
             raise ValueError("permit authority requires a signing-capable private backend")
-        if has_signing_api(trust):
-            raise ValueError("permit authority must receive a verify-only upstream attestation trust store")
+        require_verify_only_attestation_trust(
+            trust,
+            hardened=hardened,
+            signing_api_error="permit authority must receive a verify-only upstream attestation trust store",
+            hardened_error="hardened permit authority accepts only FAAR-provided Ed25519AttestationVerifier",
+        )
         self.store = store
         self.trust = trust
         self.signature = signature

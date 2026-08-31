@@ -117,6 +117,13 @@ Caller-provided time cannot roll the security clock backwards, but a compromised
 
 v0.2 uses the adapter's authoritative reconciliation interface. A stronger live architecture should separate **execution** from **independent effect verification** so the component holding execution credentials is not the sole source of truth about what it did.
 
+### R-13 — `has_signing_api()` cannot prove key absence
+
+Runtime/executor constructors reject objects exposing callable `sign()`.
+FAAR-provided verifiers accept public-key material only. An arbitrary Python
+object can still hide a private key behind `verify()`. Strong isolation
+requires a separate signer process/KMS/HSM.
+
 ## Claim boundary
 
 The strongest supportable claim is narrow:
@@ -133,4 +140,6 @@ It is **not** a production-security claim, live-venue claim, custody claim, or p
 | RT-28 | HMAC permit backends could mint and verify with the same secret | High | Isolated permit signer requires Ed25519 |
 | RT-29 | Revoked ingress keys could still authenticate | High | Ingress consults `KeyLifecycle` on every authenticate |
 | RT-30 | In-process verifier map could overwrite a named key | High | Material-hash compare before map update |
+| RT-36 | Ed25519 attestation trust store implemented both `sign()` and `verify()` | High | `Ed25519AttestationSigner` is sign-only; `Ed25519AttestationVerifier` is verify-only |
+| RT-37 | Arbitrary `verify()`-only objects could enter runtime construction | Medium | Hardened construction accepts only FAAR `Ed25519AttestationVerifier` |
 

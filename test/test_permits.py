@@ -11,6 +11,7 @@ from faar.models import ExecutionRequest
 from faar.permits import (
     ConstrainedPermitAuthority,
     Ed25519PermitSignature,
+    Ed25519PermitSigner,
     Ed25519PermitVerifier,
     ExecutionPermitVerifier,
     HMACPermitSignature,
@@ -54,6 +55,14 @@ class PermitBoundaryTests(unittest.TestCase):
     def test_permit_authority_rejects_signing_capable_upstream_trust(self):
         with self.assertRaisesRegex(ValueError, "verify-only upstream attestation"):
             ConstrainedPermitAuthority(self.store, self.trust, Ed25519PermitSignature("bad-boundary"))
+
+    def test_hardened_permit_authority_rejects_non_faar_attestation_verifier(self):
+        class Impostor:
+            def verify(self, *args, **kwargs):
+                return True, ()
+
+        with self.assertRaisesRegex(ValueError, "Ed25519AttestationVerifier"):
+            ConstrainedPermitAuthority(self.store, Impostor(), Ed25519PermitSignature("hardened-boundary"))
 
     def test_transport_cannot_broaden_signed_request(self):
         i, req, permit = self.issue()
@@ -168,7 +177,11 @@ class PermitBoundaryTests(unittest.TestCase):
         payload = b"FAAR permit test"
         signature = signer.sign(payload)
         self.assertTrue(verifier.verify(payload, signature))
+        self.assertIs(Ed25519PermitSignature, Ed25519PermitSigner)
+        self.assertIsInstance(signer, Ed25519PermitSigner)
         self.assertIsInstance(verifier, Ed25519PermitVerifier)
+        self.assertTrue(has_signing_api(signer))
+        self.assertFalse(hasattr(signer, "verify"))
         self.assertFalse(has_signing_api(verifier))
         self.assertFalse(hasattr(verifier, "sign"))
         self.assertFalse(verifier.verify(payload + b"tampered", signature))

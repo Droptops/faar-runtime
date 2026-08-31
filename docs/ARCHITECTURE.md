@@ -63,7 +63,12 @@ v0.2 therefore binds two upstream decisions to the exact canonical intent:
 - **authority attestation**: posture and work primitive;
 - **risk attestation**: portfolio/market state and risk-state version.
 
-The reference implementation uses Ed25519 for isolated permit mint/verify. HMAC-SHA256 remains available for local attestation and evidence-MAC tests. Isolated permit signing rejects HMAC because any holder that can verify also has enough key material to mint. Production should separate signing and verification with KMS/HSM-backed asymmetric keys.
+The reference implementation uses Ed25519 for isolated permit and attestation
+mint/verify. HMAC-SHA256 remains available for local attestation and
+evidence-MAC tests. Isolated permit signing rejects HMAC because any holder
+that can verify also has enough key material to mint. Ed25519 signers expose
+`sign()` and `public_verifier()` only; Ed25519 verifiers expose `verify()`
+only. Production should keep signing material in a separate process/KMS/HSM.
 
 ## Intent lifecycle
 
