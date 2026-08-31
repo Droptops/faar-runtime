@@ -137,22 +137,31 @@ See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 ## Repository layout
 
 ```text
+faar/
+  runtime.py          # authority/risk/execution state machine
+  gates.py            # deterministic policy gates
+  attestation.py      # scoped signed attestations
+  store.py            # durable SQLite reference store
+  adapters.py         # execution/reconciliation contract
+  paper.py            # safe paper-trading adapter
+  outcomes.py         # definition-of-done verification
+
 docs/
   ARCHITECTURE.md
   INVARIANTS.md
   THREAT_MODEL.md
-schemas/
-  intent.schema.json
-  capability.schema.json
-evals/
-  README.md
-src/
-  README.md
-test/
-  README.md
-BUILD_SPEC.md
-AGENTS.md
-SECURITY.md
+  TRUST_MODEL.md
+  RISK_ENGINE_CONTRACT.md
+  ADAPTER_CONTRACT.md
+  RED_TEAM_REPORT.md
+  DEFINITION_OF_DONE.md
+  UNPLUG_TEST.md
+  V0_2_RELEASE_GATES.md
+
+schemas/              # intent, grant, risk, attestation, task contracts
+evals/                 # adversarial, red-team, and seeded fuzz harnesses
+test/                  # deterministic unit/invariant suite
+examples/              # non-production fixtures
 ```
 
 ## MVP sequence
@@ -167,6 +176,8 @@ SECURITY.md
 
 ## Status
 
-**Pre-alpha / architecture bootstrap.** No production deployment, audit, formal verification, custody claim, or safety claim is implied by this repository.
+**v0.2.1 pre-alpha reference runtime. Not approved for live funds or production credentials.**
 
-Do not use real funds or production credentials until explicit release gates are defined and independently reviewed.
+The current deterministic release gate passes 75 unit/invariant tests, 41 named red-team attack classes, 160 denial mutations with zero unauthorized economic effects, 100 same-intent replay attempts with one economic effect, and 96 seeded state-machine fuzz scenarios with zero duplicate-effect or aggregate-budget violations. These are regression results, not formal verification or an external security audit.
+
+Before any live-money adapter, the repository requires the production gates in [`docs/V0_2_RELEASE_GATES.md`](docs/V0_2_RELEASE_GATES.md), including production signing/key isolation, distributed datastore fencing, authoritative risk-state semantics, reviewed venue reconciliation, authenticated ingress, failure injection, and independent security review.

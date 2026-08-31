@@ -1,0 +1,18 @@
+{
+  "schema_version": "0.2",
+  "intent_id": "intent_demo_000000000001",
+  "actor_id": "agent:meme-quant-01",
+  "grant_id": "grant:demo",
+  "grant_version": 1,
+  "primitive": "SWAP",
+  "venue": "mock-dex",
+  "created_at": "2026-08-30T18:01:00+00:00",
+  "expires_at": "2026-08-30T18:01:15+00:00",
+  "payload": {
+    "from_asset": "USDC",
+    "to_asset": "MEME",
+    "amount_usd": "50.00",
+    "target": "router:approved-v1"
+  },
+  "metadata": {"strategy": "demo"}
+}

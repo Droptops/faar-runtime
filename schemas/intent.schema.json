@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://faar.dev/schemas/intent.schema.json",
+  "title": "FAAR Intent",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "intent_id",
+    "actor_id",
+    "grant_id",
+    "grant_version",
+    "primitive",
+    "venue",
+    "created_at",
+    "expires_at",
+    "payload"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "0.2"
+    },
+    "intent_id": {
+      "type": "string",
+      "minLength": 16,
+      "maxLength": 128
+    },
+    "actor_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "grant_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "grant_version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "primitive": {
+      "enum": [
+        "PAY",
+        "SWAP",
+        "BUY",
+        "SELL",
+        "PLACE_ORDER",
+        "CANCEL_ORDER"
+      ]
+    },
+    "venue": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "expires_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "payload": {
+      "type": "object"
+    },
+    "metadata": {
+      "type": "object"
+    }
+  }
+}

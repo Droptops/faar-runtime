@@ -1,0 +1,16 @@
+{
+  "observed_at": "2026-08-30T18:01:00+00:00",
+  "position_after_usd": "150",
+  "daily_turnover_after_usd": "600",
+  "daily_loss_usd": "20",
+  "market_data_age_seconds": 2,
+  "requested_slippage_bps": 50,
+  "price_impact_bps": 40,
+  "actions_in_window": 1,
+  "circuit_breaker_active": false,
+  "data_complete": true,
+  "source_count": 2,
+  "sources_agree": true,
+  "state_version": 1,
+  "scope": "portfolio"
+}

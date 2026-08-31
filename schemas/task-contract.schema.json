@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://faar.dev/schemas/task-contract.schema.json",
+  "title": "FAAR Definition-of-Done Task Contract",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["task_id", "intent_id", "objective", "criteria", "issued_at", "expires_at"],
+  "properties": {
+    "task_id": {"type": "string", "minLength": 1, "maxLength": 128},
+    "intent_id": {"type": "string", "minLength": 16, "maxLength": 128},
+    "objective": {"type": "string", "minLength": 1, "maxLength": 2048},
+    "criteria": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "op"],
+        "properties": {
+          "path": {"type": "string", "minLength": 1},
+          "op": {"enum": ["present", "eq", "gte", "lte"]},
+          "value": {}
+        }
+      }
+    },
+    "issued_at": {"type": "string", "format": "date-time"},
+    "expires_at": {"type": "string", "format": "date-time"}
+  }
+}

@@ -1,0 +1,37 @@
+{
+  "schema_version": "0.2",
+  "grant_id": "grant:demo",
+  "version": 1,
+  "actor_id": "agent:meme-quant-01",
+  "status": "ACTIVE",
+  "allowed_primitives": [
+    "SWAP"
+  ],
+  "allowed_venues": [
+    "mock-dex"
+  ],
+  "allowed_assets": [
+    "USDC",
+    "MEME"
+  ],
+  "allowed_targets": [
+    "router:approved-v1"
+  ],
+  "denied_targets": [],
+  "valid_until": "2027-01-01T00:00:00+00:00",
+  "limits": {
+    "max_order_usd": 75,
+    "max_position_usd": 250,
+    "max_daily_turnover_usd": 1500,
+    "max_daily_loss_usd": 100,
+    "max_slippage_bps": 75,
+    "max_price_impact_bps": 100,
+    "max_market_data_age_seconds": 10,
+    "max_actions_per_window": 10,
+    "action_window_seconds": 60,
+    "max_risk_snapshot_age_seconds": 5,
+    "max_intent_ttl_seconds": 15,
+    "max_clock_skew_seconds": 2,
+    "max_submission_attempts": 2
+  }
+}

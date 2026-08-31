@@ -1,0 +1,237 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://faar.dev/schemas/capability.schema.json",
+  "title": "FAAR Capability Grant",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "grant_id",
+    "version",
+    "actor_id",
+    "status",
+    "allowed_primitives",
+    "allowed_venues",
+    "limits"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "0.2"
+    },
+    "grant_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "actor_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "status": {
+      "enum": [
+        "ACTIVE",
+        "PAUSED",
+        "REVOKED"
+      ]
+    },
+    "allowed_primitives": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "PAY",
+          "SWAP",
+          "BUY",
+          "SELL",
+          "PLACE_ORDER",
+          "CANCEL_ORDER"
+        ]
+      },
+      "minItems": 1
+    },
+    "allowed_venues": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "minItems": 1
+    },
+    "allowed_assets": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "allowed_targets": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "denied_targets": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "valid_until": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "max_order_usd": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "max_position_usd": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "max_daily_turnover_usd": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "max_daily_loss_usd": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "max_slippage_bps": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "max_price_impact_bps": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "max_market_data_age_seconds": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "max_actions_per_window": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "action_window_seconds": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_risk_snapshot_age_seconds": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "max_intent_ttl_seconds": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_clock_skew_seconds": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "max_submission_attempts": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "required": [
+        "max_actions_per_window",
+        "action_window_seconds"
+      ]
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "allowed_primitives": {
+            "contains": {
+              "enum": [
+                "PAY",
+                "SWAP",
+                "BUY",
+                "SELL",
+                "PLACE_ORDER"
+              ]
+            }
+          }
+        },
+        "required": [
+          "allowed_primitives"
+        ]
+      },
+      "then": {
+        "properties": {
+          "allowed_assets": {
+            "type": "array",
+            "uniqueItems": true,
+            "minItems": 1,
+            "items": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "limits": {
+            "type": "object",
+            "required": [
+              "max_order_usd",
+              "max_daily_turnover_usd",
+              "max_actions_per_window",
+              "action_window_seconds"
+            ]
+          }
+        },
+        "required": [
+          "allowed_assets"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "allowed_primitives": {
+            "contains": {
+              "enum": [
+                "PAY",
+                "SWAP"
+              ]
+            }
+          }
+        },
+        "required": [
+          "allowed_primitives"
+        ]
+      },
+      "then": {
+        "properties": {
+          "allowed_targets": {
+            "type": "array",
+            "uniqueItems": true,
+            "minItems": 1,
+            "items": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        "required": [
+          "allowed_targets"
+        ]
+      }
+    }
+  ]
+}

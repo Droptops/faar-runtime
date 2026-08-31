@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://faar.dev/schemas/attestation.schema.json",
+  "title": "FAAR Trusted Input Attestation",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["kind", "key_id", "subject_hash", "intent_hash", "issued_at", "expires_at", "mac"],
+  "properties": {
+    "kind": {"enum": ["AUTHORITY", "RISK", "TASK"]},
+    "key_id": {"type": "string", "minLength": 1, "maxLength": 128},
+    "subject_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "intent_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "issued_at": {"type": "string", "format": "date-time"},
+    "expires_at": {"type": "string", "format": "date-time"},
+    "mac": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://faar.dev/schemas/authority-decision.schema.json",
+  "title": "FAAR Authority Decision",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["posture", "primitive"],
+  "properties": {
+    "posture": {"enum": ["ADVISE", "EXECUTE", "DEFER", "STOP"]},
+    "primitive": {
+      "enum": [
+        "EXECUTE_ACTION", "GIVE_FACT", "GIVE_RECOMMENDATION",
+        "ASK_CLARIFYING_QUESTION", "STATE_BLOCKER",
+        "RECOMMEND_NEAREST_SAFE_ALTERNATIVE", "COMPARE_OPTIONS",
+        "MAKE_PLAN", "REFUSE_AND_REDIRECT", "SUMMARIZE"
+      ]
+    },
+    "reason_codes": {"type": "array", "items": {"type": "string"}},
+    "source": {"type": "string", "minLength": 1}
+  }
+}

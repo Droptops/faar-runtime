@@ -1,0 +1,86 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://faar.dev/schemas/risk-snapshot.schema.json",
+  "title": "FAAR Risk Snapshot",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "observed_at",
+    "state_version",
+    "scope"
+  ],
+  "properties": {
+    "observed_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "position_after_usd": {
+      "type": [
+        "number",
+        "string",
+        "null"
+      ]
+    },
+    "daily_turnover_after_usd": {
+      "type": [
+        "number",
+        "string",
+        "null"
+      ]
+    },
+    "daily_loss_usd": {
+      "type": [
+        "number",
+        "string",
+        "null"
+      ]
+    },
+    "market_data_age_seconds": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "requested_slippage_bps": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "price_impact_bps": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "actions_in_window": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "circuit_breaker_active": {
+      "type": "boolean"
+    },
+    "data_complete": {
+      "type": "boolean"
+    },
+    "source_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "sources_agree": {
+      "type": "boolean"
+    },
+    "state_version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "scope": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    }
+  }
+}
