@@ -26,7 +26,7 @@ from faar.settlement import MockSettlementVerifier, SettlementRecord, Settlement
 from faar.models import ExecutionRequest
 from faar.store import GrantConflict, IntentConflict, SQLiteIntentStore
 
-from support import AUTH, NOW, PRINCIPAL, attest_pair, grant, intent, risk, trust, verification_trust, build_mock_runtime, permit_stack
+from support import AUTH, NOW, PRINCIPAL, attest_pair, grant, intent, risk, trust, verification_trust, build_mock_runtime
 
 
 class AdapterBackedVerifier:
@@ -61,10 +61,9 @@ class FAARRuntimeTests(unittest.TestCase):
         self.store.close()
 
     def runtime_for(self, adapter, *, verifier=None, clock=lambda: NOW, allow_test_time_override=True):
-        permit_authority, _ = permit_stack(self.store, self.trust)
         verifier = verifier or AdapterBackedVerifier(adapter)
         return FAARRuntime(
-            self.store, {"mock-dex": adapter}, verification_trust(self.trust), permit_authority,
+            self.store, {"mock-dex": adapter}, verification_trust(self.trust), self.permit_authority,
             {"mock-dex": verifier}, clock=clock, allow_test_time_override=allow_test_time_override,
         )
 
