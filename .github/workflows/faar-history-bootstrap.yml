@@ -1,10 +1,119 @@
 name: FAAR history bootstrap
+
 on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/faar-history-bootstrap.yml
   workflow_dispatch:
+
 permissions:
   contents: write
+
 jobs:
   restore:
     runs-on: ubuntu-latest
     steps:
-      - run: echo bootstrap-placeholder
+      - name: Checkout staged recovery payload
+        uses: actions/checkout@v4
+
+      - name: Reconstruct and verify recovered Git bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -d '' parts < <(find .faar-bootstrap -maxdepth 1 -type f -name 'part-*' -print0 | sort -zV)
+          test "${#parts[@]}" -ge 5
+          printf 'recovery shards: %s\n' "${parts[@]}"
+          cat "${parts[@]}" | tr -d '\r\n' | base64 --decode > /tmp/faar.bundle
+          git bundle verify /tmp/faar.bundle
+          git bundle list-heads /tmp/faar.bundle | tee /tmp/faar-heads.txt
+          grep -F '3b5d3a26ed6a4cec4868d1a88e31787199e7e0d8 refs/heads/main' /tmp/faar-heads.txt
+          grep -F '50e8b5c69cb3e6e36981a29ac9341136fca2ab18 refs/heads/v0.3/tcb-reduction' /tmp/faar-heads.txt
+          grep -F 'c4106879d1d574155c741148f4bd736f47db36c9 refs/heads/redteam/v0.2-hardening' /tmp/faar-heads.txt
+          grep -F '1672cd8e95d1ce3fe3ce10e7b9e5d52a486f9566 refs/tags/v0.1.0' /tmp/faar-heads.txt
+          grep -F '4d146fbc355cfec75f59d90346c6e13288345d3b refs/tags/v0.2.0' /tmp/faar-heads.txt
+          grep -F 'dc3ccf305a43fdb87def69e04b0dab50f553b726 refs/tags/v0.2.1' /tmp/faar-heads.txt
+
+      - name: Recover v0.3 working branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone /tmp/faar.bundle /tmp/faar-recovered
+          cd /tmp/faar-recovered
+          git checkout -B v0.3/tcb-reduction 50e8b5c69cb3e6e36981a29ac9341136fca2ab18
+
+      - name: Apply deterministic settlement validation-order fix if needed
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd /tmp/faar-recovered
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('faar/settlement.py')
+          text = path.read_text()
+          old = '''        names = [s.name for s in self.sources]\n        if len(set(names)) != len(names):\n            raise ValueError("settlement quorum sources must have unique identities")\n        if len({id(s) for s in self.sources}) != len(self.sources):\n            raise ValueError("the same settlement verifier object cannot be counted twice")\n'''
+          new = '''        if len({id(s) for s in self.sources}) != len(self.sources):\n            raise ValueError("the same settlement verifier object cannot be counted twice")\n        names = [s.name for s in self.sources]\n        if len(set(names)) != len(names):\n            raise ValueError("settlement quorum sources must have unique identities")\n'''
+          if old in text:
+              path.write_text(text.replace(old, new, 1))
+              print('applied settlement validation-order fix')
+          elif new in text:
+              print('settlement validation-order fix already present')
+          else:
+              raise SystemExit('unexpected QuorumSettlementVerifier validation block; refusing restore')
+          PY
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: /tmp/faar-recovered/pyproject.toml
+
+      - name: Install recovered v0.3
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd /tmp/faar-recovered
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+
+      - name: Run complete deterministic gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd /tmp/faar-recovered
+          make check
+          if test -f evals/model_check_permit_protocol.py; then
+            PYTHONPATH=. python evals/model_check_permit_protocol.py
+          fi
+
+      - name: Commit validated v0.3 fix if tree changed
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd /tmp/faar-recovered
+          git config user.name 'Droptops'
+          git config user.email '159727600+Droptops@users.noreply.github.com'
+          git add faar/settlement.py
+          if ! git diff --cached --quiet; then
+            git commit -m 'fix: harden settlement quorum validation order'
+          fi
+          echo "FAAR_V03_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Restore exact history and publish validated v0.3
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd /tmp/faar-recovered
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+
+          # Publish the validated work first; replace temporary bootstrap main last.
+          git push --force origin HEAD:refs/heads/v0.3/tcb-reduction
+          git push --force origin c4106879d1d574155c741148f4bd736f47db36c9:refs/heads/redteam/v0.2-hardening
+          git push origin refs/tags/v0.1.0:refs/tags/v0.1.0 refs/tags/v0.2.0:refs/tags/v0.2.0 refs/tags/v0.2.1:refs/tags/v0.2.1
+          git push --force origin 3b5d3a26ed6a4cec4868d1a88e31787199e7e0d8:refs/heads/main
+
+          printf 'validated v0.3: %s\n' "$FAAR_V03_SHA"
