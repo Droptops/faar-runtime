@@ -6,7 +6,7 @@ Run:
 make test
 ```
 
-The v0.3.0 deterministic suite (105 unit/invariant tests) covers capability/risk gating, signed intent-bound attestations, immutable grant fingerprints, runtime pause/revoke, revocation fencing, same-intent and cross-intent concurrency, aggregate turnover reservations, single-consumption risk-state versions, timeout/crash recovery, authoritative reconciliation, durable retry budgets, effect identity continuity/uniqueness, malformed/non-finite input, bounded grant construction, canonical resource bounds, sanitized adapter inputs, positive-settlement authority, settled-amount envelopes, paper-trading effects, evidence-chain/MAC integrity, and signed definition-of-done criteria.
+The deterministic suite covers capability/risk gating, signed intent-bound attestations, isolated permit mint vs verify, key lifecycle (active/retired/revoked), principal-bound ingress, immutable grant fingerprints, runtime pause/revoke, revocation fencing, same-intent and cross-intent concurrency, multiprocess permit consume, aggregate turnover reservations, crash/restart of consumed and revoked authority, timeout/crash recovery, authoritative reconciliation, durable retry budgets, effect identity continuity/uniqueness, malformed/non-finite input, bounded grant construction, sanitized adapter inputs, positive-settlement authority, paper-trading effects, evidence-chain/MAC integrity, and signed definition-of-done criteria. Counts change as tests are added; `make check` is the live gate.
 
 The unit suite is complemented by:
 

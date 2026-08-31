@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.4.0 — 2026-08-31
+
+Isolated authority-plane reference release over frozen v0.3.0. Still **pre-alpha and not approved for live funds or production credentials**.
+
+- explicit `PermitSigner` / `PermitVerifier` split retained; isolated permit signer cannot choose policy and cannot mint with HMAC
+- durable key lifecycle (`ACTIVE` / `RETIRED` / `REVOKED`) for permit, attestation, and ingress keys
+- `key_id` is bound to a public-material hash; substitution/collision is rejected
+- revoked keys cannot be resurrected; retirement still verifies in-flight artifacts
+- principal-bound authenticated ingress with distinct ADMIN vs PRINCIPAL roles
+- stronger grant/permit fencing across threads and processes; consumed permits and revoked grants survive store restart
+- deterministic failure-injection eval (`make faults`) added to `make check`
+- bounded permit model expanded with key lifecycle states
+
+These are deterministic regression, adversarial, fuzz, bounded-model, and in-process fault results. They are not formal verification, an independent security audit, or a production-safety claim.
+
 ## 0.3.0 — 2026-08-31
 
 v0.3.0 reference runtime. Still **pre-alpha and not approved for live funds or production credentials**.

@@ -106,28 +106,23 @@ The model may propose a trade outside that envelope. FAAR must still deny it det
 
 ```text
 Strategy / LLM
-      │
+      │ proposed intent
+      ▼
+Authenticated Ingress
       ▼
 Authority Router (AAR semantics)
-      │
       ▼
 Canonical Intent + intent_id
-      │
       ▼
-Capability Gate
-      │
+Capability + Risk gates
       ▼
-Risk Gate
-      │
+Permit Authority → Isolated Signer
       ▼
-Intent Reservation / Replay Guard
-      │
+Verify-only Execution Plane
       ▼
-Deterministic Executor
-      │
+Deterministic Adapter
       ▼
-Settlement Verifier
-      │
+Independent Settlement Verifier
       ▼
 Evidence Log
 ```
@@ -141,8 +136,12 @@ faar/
   runtime.py          # authority/risk/execution state machine
   gates.py            # deterministic policy gates
   attestation.py      # scoped signed attestations
+  permits.py          # isolated permit mint vs verify-only execution
+  keys.py             # ACTIVE/RETIRED/REVOKED verification-key lifecycle
+  ingress.py          # principal-bound authenticated reference ingress
   store.py            # durable SQLite reference store
   adapters.py         # execution/reconciliation contract
+  faults.py           # deterministic failure-injection catalog
   paper.py            # safe paper-trading adapter
   outcomes.py         # definition-of-done verification
 
@@ -156,6 +155,7 @@ docs/
   RED_TEAM_REPORT.md
   DEFINITION_OF_DONE.md
   UNPLUG_TEST.md
+  V0_4_AUTHORITY_PLANE.md
   V0_3_RELEASE.md
   V0_2_RELEASE_GATES.md
 
@@ -177,17 +177,12 @@ examples/              # non-production fixtures
 
 ## Status
 
-**v0.3.0 pre-alpha reference runtime. Not approved for live funds or production credentials.**
+**v0.4.0 pre-alpha reference runtime. Not approved for live funds or production credentials.**
 
-See [`docs/V0_3_RELEASE.md`](docs/V0_3_RELEASE.md). The current deterministic release gate (`make check`) includes unit tests, adversarial denial/replay checks, targeted red-team classes, seeded state-machine fuzz, the demo CLI path, and the bounded permit protocol model checker. Headline results:
+See [`docs/V0_4_AUTHORITY_PLANE.md`](docs/V0_4_AUTHORITY_PLANE.md) and [`docs/V0_3_RELEASE.md`](docs/V0_3_RELEASE.md). v0.3.0 remains frozen at `3bb828fe6b599c31e6adf87b2643215d318d9403`.
 
-- 105/105 unit/invariant tests
-- 59 targeted red-team attack classes
-- 160 adversarial denial cases with 0 unauthorized economic effects
-- 100 same-intent replay attempts with 1 valid economic effect
-- 96 seeded fuzz scenarios with 0 duplicate-effect and 0 aggregate-budget violations
-- bounded permit model: max depth 10, 12 unique states, 15 transitions, 0 invariant violations, stale permit consumable after revoke = false
+The current deterministic release gate is `make check` (unit/invariant tests, adversarial, red-team, fuzz, demo, bounded permit/key model, and in-process failure injection).
 
-These are deterministic regression, adversarial, fuzz, and bounded-model results. They are not formal verification, an independent security audit, or a production-safety claim.
+These are deterministic regression, adversarial, fuzz, bounded-model, and fault-catalog results. They are not formal verification, an independent security audit, or a production-safety claim.
 
 Before any live-money adapter, the repository still requires the production gates in [`docs/V0_2_RELEASE_GATES.md`](docs/V0_2_RELEASE_GATES.md), including production signing/key isolation, distributed datastore fencing, authoritative risk-state semantics, reviewed venue reconciliation, authenticated ingress, failure injection, and independent security review.

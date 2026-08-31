@@ -1,4 +1,4 @@
-# FAAR v0.2 Architecture
+# FAAR v0.4 Architecture
 
 ## Security objective
 
@@ -7,7 +7,11 @@ FAAR narrows the path from an untrusted agent proposal to an external economic e
 ```text
                      UNTRUSTED
               Strategy / LLM / tools
-                       │ proposal
+                       │ proposed intent
+                       ▼
+              Authenticated Ingress
+              principal-bound, server clock
+              ADMIN ≠ PRINCIPAL
                        ▼
               Canonical economic Intent
                        │ stable hash
@@ -27,26 +31,21 @@ FAAR narrows the path from an untrusted agent proposal to an external economic e
  runtime status           │                      │
        └───────────────┬───┴──────────────────────┘
                        ▼
-               submission fence
+               Permit Authority (policy)
                        │
                        ▼
-               reviewed adapter
-                       │
+               Isolated Signer (ACTIVE keys only)
+                       ▼
+               Verify-only Execution Plane
+                       ▼
+               Deterministic Adapter
+                 ExecutionRequest + permit
                        ▼
               external venue/chain
-                       │
                        ▼
-          authoritative reconciliation
-                       │
+          Independent reconciliation
                        ▼
-              economic settlement
-                       │
-                       ▼
-             signed task contract
-                       │
-                       ▼
-          deterministic outcome check
-             MET / NOT_MET / UNKNOWN
+              Evidence / Settlement
 ```
 
 ## Why split the trust domains
@@ -64,7 +63,7 @@ v0.2 therefore binds two upstream decisions to the exact canonical intent:
 - **authority attestation**: posture and work primitive;
 - **risk attestation**: portfolio/market state and risk-state version.
 
-The reference implementation uses HMAC-SHA256 because it is dependency-free and easy to test. Production should normally separate signing and verification with KMS/HSM-backed asymmetric keys.
+The reference implementation uses Ed25519 for isolated permit mint/verify. HMAC-SHA256 remains available for local attestation and evidence-MAC tests. Isolated permit signing rejects HMAC because any holder that can verify also has enough key material to mint. Production should separate signing and verification with KMS/HSM-backed asymmetric keys.
 
 ## Intent lifecycle
 

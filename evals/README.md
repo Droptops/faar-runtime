@@ -7,6 +7,7 @@ make adversarial
 make redteam
 make fuzz
 make modelcheck
+make faults
 # or everything:
 make check
 ```
@@ -31,7 +32,7 @@ timeout_after_effect_successful_effects = 1
 
 ## Targeted red team
 
-`run_redteam.py` exercises 59 named attack classes, including cross-intent attestation replay, risk-state reuse, concurrent budget oversubscription, effect-identity/amount mutation, weak positive/negative settlement evidence, expiry/revocation races, grant substitution, unbounded-grant construction, confused-deputy payloads, evidence tampering, and post-hoc definition-of-done rewrite.
+`run_redteam.py` exercises the v0.4 attack class set (v0.3.0 baseline 59 plus isolated-authority cases). Coverage includes cross-intent attestation replay, concurrent budget oversubscription, revocation races, grant substitution, revoked-key resurrection, principal substitution, cross-principal intent squat, and multiprocess permit double-consume.
 
 ## Seeded state-machine fuzz
 
@@ -39,7 +40,7 @@ timeout_after_effect_successful_effects = 1
 
 ## Bounded permit protocol model
 
-`model_check_permit_protocol.py` exhaustively explores a bounded abstract permit/revocation/settlement state space. It is included in `make check`. Current result: max depth 10, 12 unique states, 15 transitions, 0 invariant violations, stale permit consumable after revoke = false. This is bounded-model regression evidence, not formal verification of the Python runtime or any external venue.
+`model_check_permit_protocol.py` exhaustively explores a bounded abstract permit/key/revocation/settlement state space. It is included in `make check`. The v0.4 model adds key ACTIVE/RETIRED/REVOKED, issued/consumed/settled, and no-resurrection properties. Latest bounded result: max depth 10, 36 unique states, 76 transitions, 0 invariant violations. This is bounded-model regression evidence, not formal verification of the Python runtime or any external venue.
 
 ## Claim boundary
 

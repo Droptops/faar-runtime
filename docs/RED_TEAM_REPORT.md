@@ -121,6 +121,16 @@ v0.2 uses the adapter's authoritative reconciliation interface. A stronger live 
 
 The strongest supportable claim is narrow:
 
-> Under the current deterministic mock/paper adapter model and the encoded fault classes, FAAR v0.3.0 preserves the tested authorization, bounded-capability, replay/recovery, aggregate-usage, and settlement-integrity invariants.
+> Under the current deterministic mock/paper adapter model and the encoded fault classes, FAAR v0.4.0 preserves the tested authorization, bounded-capability, replay/recovery, aggregate-usage, key-lifecycle, principal-ingress, and settlement-integrity invariants.
 
 It is **not** a production-security claim, live-venue claim, custody claim, or proof that a compromised trusted adapter cannot move funds incorrectly.
+
+## Findings fixed in v0.4
+
+| ID | Finding | Severity in reference model | v0.4 response |
+|---|---|---:|---|
+| RT-27 | Same `key_id` could bind a different public key via `add_verifier` | High | Durable `material_hash` + collision rejection |
+| RT-28 | HMAC permit backends could mint and verify with the same secret | High | Isolated permit signer requires Ed25519 |
+| RT-29 | Revoked ingress keys could still authenticate | High | Ingress consults `KeyLifecycle` on every authenticate |
+| RT-30 | In-process verifier map could overwrite a named key | High | Material-hash compare before map update |
+

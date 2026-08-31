@@ -9,6 +9,9 @@ FAAR is useful only if its trust boundaries are explicit.
 | Risk signer | Trusted for risk/portfolio semantics | Can understate risk or issue unsafe versions |
 | Grant authority | Trusted for capability envelope/status | Can broaden/re-enable economic authority |
 | FAAR runtime | Trusted security kernel | Full bypass possible |
+| Isolated permit signer | Trusted to mint bounded ExecutionPermit | Can authorize in-policy requests while its key is ACTIVE |
+| Permit/attestation verifier | Trusted to accept artifacts for ACTIVE/RETIRED keys | Compromise of verify-only material cannot mint |
+| Authenticated ingress | Trusted for principal binding / admin split | Bypass by talking to the store directly is a trusted-operator path |
 | Datastore | Trusted for availability/transactions; MAC hardens DB-only mutation | Corruption can stop service; forged state depends on key/host access |
 | Adapter | Trusted credential/execution + reconciliation boundary | Can submit a different action before runtime detects bad evidence; live design should reduce this trust |
 | Venue/RPC | External and potentially ambiguous | Requires adapter-specific reconciliation/finality |
@@ -31,7 +34,7 @@ FAAR verifier
         │ public key / KMS verify permission only
 ```
 
-Key rotation should use explicit `key_id` values and overlapping verification windows without silently accepting unknown signers.
+Key rotation should use explicit `key_id` values bound to a public-material hash. Retired keys may verify artifacts issued before retirement. Revoked keys cannot mint, verify, or be resurrected.
 
 ## Trust is not transitive
 

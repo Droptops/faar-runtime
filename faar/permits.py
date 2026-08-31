@@ -11,6 +11,7 @@ from typing import Protocol
 from .attestation import AttestationVerifier, has_signing_api
 from .canonical import canonical_hash, canonical_json
 from .gates import evaluate_authority, evaluate_capability, evaluate_risk
+from .keys import KeyConflict, KeyLifecycle, KeyStatus, ed25519_public_material_hash
 from .models import (
     Attestation,
     AttestationKind,
@@ -104,6 +105,10 @@ class Ed25519PermitVerifier:
     def verify(self, payload: bytes, signature: str) -> bool:
         return _ed25519_verify(self._public_key, payload, signature)
 
+    @property
+    def material_hash(self) -> str:
+        return ed25519_public_material_hash(self._public_key)
+
 
 class Ed25519PermitSigner:
     """Isolated permit minting backend. Venues receive only `public_verifier()`."""
@@ -137,6 +142,45 @@ class Ed25519PermitSigner:
 Ed25519PermitSignature = Ed25519PermitSigner
 
 
+class IsolatedPermitSigner:
+    """Signs canonical ExecutionPermit objects. Holds no policy and cannot expand them.
+
+    Policy/risk decisions belong in ConstrainedPermitAuthority. This object only
+    mints a signature over a fully formed permit, and only while its key is ACTIVE.
+    """
+
+    def __init__(self, backend: PermitSigner, lifecycle: KeyLifecycle) -> None:
+        if not has_signing_api(backend):
+            raise ValueError("isolated permit signer requires signing-capable private backend")
+        if has_signing_api(lifecycle):
+            raise ValueError("key lifecycle directory must not expose a signing API")
+        if getattr(backend, "algorithm", None) is not PermitAlgorithm.ED25519:
+            raise ValueError("isolated permit signer requires Ed25519; HMAC cannot be isolated from verification")
+        if not hasattr(backend, "public_verifier"):
+            raise ValueError("isolated permit signer requires a public_verifier() projection")
+        self.backend = backend
+        self.lifecycle = lifecycle
+        self.lifecycle.register_active(
+            backend.signer_id,
+            material_hash=backend.public_verifier().material_hash,
+        )
+
+    def sign(self, permit: ExecutionPermit, *, now: datetime) -> SignedExecutionPermit:
+        if now.tzinfo is None:
+            raise PermitIssuanceError(("PERMIT_SIGNER_TIME_NOT_AWARE",))
+        try:
+            self.lifecycle.assert_active_for_signing(self.backend.signer_id)
+        except Exception as exc:
+            raise PermitIssuanceError(("PERMIT_SIGNER_KEY_NOT_ACTIVE",)) from exc
+        payload = canonical_json(permit).encode("utf-8")
+        return SignedExecutionPermit(
+            permit=permit,
+            signer_id=self.backend.signer_id,
+            algorithm=self.backend.algorithm,
+            signature=self.backend.sign(payload),
+        )
+
+
 class PermitControlStore(Protocol):
     def verify_grant(self, grant: CapabilityGrant, grant_hash: str) -> None: ...
     def verify_usage_held(self, intent: Intent, grant: CapabilityGrant) -> bool: ...
@@ -158,6 +202,12 @@ class PermitControlStore(Protocol):
         self, *, permit_id: str, principal_id: str, grant_id: str, grant_version: int,
         grant_epoch: int, fence_token: int, permit_hash: str,
     ) -> tuple[bool, tuple[str, ...]]: ...
+    def register_key(
+        self, key_id: str, plane: str, status: str = "ACTIVE", *, material_hash: str | None = None
+    ) -> None: ...
+    def retire_key(self, key_id: str, *, at: datetime) -> None: ...
+    def revoke_key(self, key_id: str, *, at: datetime) -> None: ...
+    def get_key(self, key_id: str): ...
 
 
 def _amount(request: ExecutionRequest) -> Decimal | None:
@@ -194,6 +244,7 @@ class ConstrainedPermitAuthority:
         signature: PermitSigner,
         *,
         max_permit_ttl_seconds: int = 5,
+        key_lifecycle: KeyLifecycle | None = None,
     ) -> None:
         if max_permit_ttl_seconds <= 0:
             raise ValueError("max_permit_ttl_seconds must be positive")
@@ -205,6 +256,8 @@ class ConstrainedPermitAuthority:
         self.trust = trust
         self.signature = signature
         self.max_permit_ttl_seconds = max_permit_ttl_seconds
+        lifecycle = key_lifecycle or KeyLifecycle(store, "PERMIT")
+        self.isolated_signer = IsolatedPermitSigner(signature, lifecycle)
 
     def issue(
         self,
@@ -331,12 +384,7 @@ class ConstrainedPermitAuthority:
             expires_at=expires_at,
         )
         payload = canonical_json(permit).encode("utf-8")
-        signed = SignedExecutionPermit(
-            permit=permit,
-            signer_id=self.signature.signer_id,
-            algorithm=self.signature.algorithm,
-            signature=self.signature.sign(payload),
-        )
+        signed = self.isolated_signer.sign(permit, now=now)
         self.store.record_execution_permit(
             permit_id,
             intent,
@@ -358,6 +406,8 @@ class ExecutionPermitVerifier:
         *,
         max_clock_skew_seconds: int = 2,
         allow_signing_backend_for_tests: bool = False,
+        key_lifecycle: KeyLifecycle | None = None,
+        extra_verifiers: tuple[PermitVerifier, ...] = (),
     ) -> None:
         if has_signing_api(signature) and not allow_signing_backend_for_tests:
             raise ValueError(
@@ -367,6 +417,31 @@ class ExecutionPermitVerifier:
         self.signature = signature
         self.control_store = control_store
         self.max_clock_skew_seconds = max_clock_skew_seconds
+        self.lifecycle = key_lifecycle or KeyLifecycle(control_store, "PERMIT")
+        self._verifiers: dict[str, PermitVerifier] = {}
+        self.add_verifier(signature)
+        for extra in extra_verifiers:
+            self.add_verifier(extra)
+
+    def add_verifier(self, signature: PermitVerifier) -> None:
+        if has_signing_api(signature):
+            raise ValueError("execution permit verifier cannot hold signing-capable backends")
+        incoming = getattr(signature, "material_hash", None)
+        if not incoming:
+            raise ValueError("permit verifier must bind a public material hash")
+        existing = self.lifecycle.get(signature.signer_id)
+        if existing is None:
+            self.lifecycle.register_active(signature.signer_id, material_hash=incoming)
+        elif existing.status is KeyStatus.REVOKED:
+            raise ValueError("revoked permit keys cannot be reintroduced to a verifier")
+        elif existing.material_hash and existing.material_hash != incoming:
+            raise KeyConflict("key_id collision: public material does not match registered key")
+        elif not existing.material_hash:
+            self.lifecycle.register_active(signature.signer_id, material_hash=incoming)
+        prior = self._verifiers.get(signature.signer_id)
+        if prior is not None and getattr(prior, "material_hash", None) != incoming:
+            raise KeyConflict("key_id collision: public material does not match registered key")
+        self._verifiers[signature.signer_id] = signature
 
     def verify(
         self,
@@ -377,13 +452,18 @@ class ExecutionPermitVerifier:
     ) -> tuple[bool, tuple[str, ...]]:
         reasons: list[str] = []
         permit = signed.permit
-        if signed.signer_id != self.signature.signer_id:
+        ok, key_reason = self.lifecycle.accept_artifact(signed.signer_id, issued_at=permit.issued_at)
+        if not ok:
+            reasons.append("PERMIT_" + (key_reason or "KEY_REJECTED"))
+        backend = self._verifiers.get(signed.signer_id)
+        if backend is None:
             reasons.append("PERMIT_SIGNER_UNKNOWN")
-        if signed.algorithm != self.signature.algorithm:
-            reasons.append("PERMIT_ALGORITHM_MISMATCH")
-        payload = canonical_json(permit).encode("utf-8")
-        if not self.signature.verify(payload, signed.signature):
-            reasons.append("PERMIT_SIGNATURE_INVALID")
+        else:
+            if signed.algorithm != backend.algorithm:
+                reasons.append("PERMIT_ALGORITHM_MISMATCH")
+            payload = canonical_json(permit).encode("utf-8")
+            if not backend.verify(payload, signed.signature):
+                reasons.append("PERMIT_SIGNATURE_INVALID")
         if permit.request_hash != canonical_hash(request):
             reasons.append("PERMIT_REQUEST_HASH_MISMATCH")
         if permit.principal_id != request.principal_id or permit.intent_id != request.intent_id:
@@ -417,11 +497,11 @@ class ExecutionPermitVerifier:
         self, signed: SignedExecutionPermit, request: ExecutionRequest, *, now: datetime
     ) -> tuple[bool, tuple[str, ...]]:
         """Cryptographically verify, then atomically consume the execution permit."""
-        ok, reasons = self.verify(signed, request, now=now)
-        if not ok:
-            return False, reasons
-        permit = signed.permit
         try:
+            ok, reasons = self.verify(signed, request, now=now)
+            if not ok:
+                return False, reasons
+            permit = signed.permit
             return self.control_store.consume_execution_permit(
                 permit_id=permit.permit_id,
                 principal_id=permit.principal_id,

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Targeted red-team regression matrix for FAAR v0.3.
+"""Targeted red-team regression matrix for FAAR v0.4.
 
 The unit suite contains the detailed assertions. This script produces a compact,
 reviewer-facing readout of the attack classes the implementation currently blocks.
@@ -72,6 +72,20 @@ ATTACK_CLASSES = [
     "signing-capable attestation trust entering permit authority",
     "verify-only Ed25519 trust store cannot mint attestations",
     "settlement verifier and submitter object identity collapse",
+    "revoked verification key cannot be resurrected",
+    "retired key cannot mint new permits",
+    "principal substitution at authenticated ingress",
+    "cross-principal intent-id squatting",
+    "principal cannot administer grants",
+    "multiprocess double-consume of a single permit",
+    "consumed permit remains consumed after store restart",
+    "same key_id cannot bind different public material",
+    "isolated permit signer rejects HMAC backends",
+    "revoked ingress verification key is rejected",
+    "partial fill cannot mint a second effect identity",
+    "inconsistent settlement providers are contradictory",
+    "datastore interrupt fails closed on permit consume",
+    "grant revoke racing permit consume never double-consumes",
 ]
 
 
@@ -79,7 +93,7 @@ def main() -> None:
     cmd = [sys.executable, "-m", "unittest", "discover", "-s", "test", "-p", "test_*.py"]
     completed = subprocess.run(cmd, capture_output=True, text=True)
     report = {
-        "suite": "FAAR v0.3 targeted red-team matrix",
+        "suite": "FAAR v0.4 targeted red-team matrix",
         "attack_classes": len(ATTACK_CLASSES),
         "classes": ATTACK_CLASSES,
         "unit_suite_exit_code": completed.returncode,

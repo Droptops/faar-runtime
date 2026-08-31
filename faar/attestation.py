@@ -8,6 +8,7 @@ from collections.abc import Iterable
 from typing import Mapping, Protocol
 
 from .canonical import canonical_hash, canonical_json
+from .keys import KeyConflict, KeyLifecycle, KeyStatus, ed25519_public_material_hash
 from .models import Attestation, AttestationAlgorithm, AttestationKind, Intent
 
 
@@ -274,7 +275,7 @@ class Ed25519TrustStore:
             max_clock_skew_seconds=max_clock_skew_seconds,
         )
 
-    def public_verifier(self) -> "Ed25519AttestationVerifier":
+    def public_verifier(self, *, key_lifecycle: KeyLifecycle | None = None) -> "Ed25519AttestationVerifier":
         public = {}
         for key_id, key in self._keys.items():
             if callable(getattr(key, "sign", None)) and not hasattr(key, "public_key"):
@@ -283,6 +284,7 @@ class Ed25519TrustStore:
         return Ed25519AttestationVerifier(
             public, key_kinds=self._key_kinds,
             max_clock_skew_seconds=self.max_clock_skew_seconds,
+            key_lifecycle=key_lifecycle,
         )
 
     def _kind_allowed(self, key_id: str, kind: AttestationKind) -> bool:
@@ -350,6 +352,7 @@ class Ed25519AttestationVerifier:
         *,
         key_kinds: Mapping[str, Iterable[AttestationKind]],
         max_clock_skew_seconds: int = 5,
+        key_lifecycle: KeyLifecycle | None = None,
     ) -> None:
         if not keys:
             raise ValueError("at least one attestation key is required")
@@ -360,6 +363,21 @@ class Ed25519AttestationVerifier:
         if max_clock_skew_seconds < 0:
             raise ValueError("max_clock_skew_seconds must be non-negative")
         self.max_clock_skew_seconds = max_clock_skew_seconds
+        self.lifecycle = key_lifecycle
+        if self.lifecycle is not None:
+            if has_signing_api(self.lifecycle):
+                raise ValueError("attestation key lifecycle must not expose a signing API")
+            for key_id, key in self._keys.items():
+                material = ed25519_public_material_hash(key)
+                existing = self.lifecycle.get(key_id)
+                if existing is None:
+                    self.lifecycle.register_active(key_id, material_hash=material)
+                elif existing.status is KeyStatus.REVOKED:
+                    raise ValueError("revoked attestation keys cannot be reintroduced to a verifier")
+                elif existing.material_hash and existing.material_hash != material:
+                    raise KeyConflict("key_id collision: public material does not match registered key")
+                elif not existing.material_hash:
+                    self.lifecycle.register_active(key_id, material_hash=material)
 
     def verify(
         self,
@@ -370,8 +388,16 @@ class Ed25519AttestationVerifier:
         intent: Intent,
         now: datetime,
     ) -> tuple[bool, tuple[str, ...]]:
-        return _verify_ed25519_attestation(
+        reasons: list[str] = []
+        if self.lifecycle is not None:
+            ok, key_reason = self.lifecycle.accept_artifact(attestation.key_id, issued_at=attestation.issued_at)
+            if not ok:
+                reasons.append(key_reason or "KEY_REJECTED")
+        crypto_ok, crypto_reasons = _verify_ed25519_attestation(
             self._keys, self._key_kinds, attestation,
             kind=kind, subject=subject, intent=intent, now=now,
             max_clock_skew_seconds=self.max_clock_skew_seconds,
         )
+        if not crypto_ok:
+            reasons.extend(crypto_reasons)
+        return not reasons, tuple(dict.fromkeys(reasons))

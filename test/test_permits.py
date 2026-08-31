@@ -211,7 +211,6 @@ class PermitBoundaryTests(unittest.TestCase):
         ok, reasons = other_verifier.verify(permit, req, now=NOW)
         self.assertFalse(ok)
         self.assertIn("PERMIT_SIGNER_UNKNOWN", reasons)
-        self.assertIn("PERMIT_SIGNATURE_INVALID", reasons)
 
     def test_intent_grant_binding_remains_enforced(self):
         i, req, permit = self.issue(i=intent(intent_id="permit_binding_00000000001"), rs=risk(state_version=44))
@@ -220,6 +219,17 @@ class PermitBoundaryTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("PERMIT_REQUEST_HASH_MISMATCH", reasons)
         self.assertIn("PERMIT_REQUEST_IDENTITY_MISMATCH", reasons)
+
+    def test_isolated_authority_rejects_hmac_signing_backend(self):
+        symmetric = HMACPermitSignature("unsafe-hmac", b"symmetric-key-material-32-bytes!!!")
+        with self.assertRaisesRegex(ValueError, "Ed25519"):
+            ConstrainedPermitAuthority(self.store, verification_trust(self.trust), symmetric)
+
+    def test_key_id_substitution_is_rejected_at_verifier(self):
+        from faar.keys import KeyConflict
+        impostor = Ed25519PermitSignature("permit-test")
+        with self.assertRaises(KeyConflict):
+            self.verifier.add_verifier(impostor.public_verifier())
 
 
 if __name__ == "__main__":

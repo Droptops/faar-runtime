@@ -139,3 +139,32 @@ For money-moving primitives, positive settlement must include a finite positive 
 ## I-25 — Executor input is capability-minimized
 
 Execution adapters receive a sanitized `ExecutionRequest` containing only `intent_id`, economic primitive, venue, and the post-gate payload. Model metadata, grant documents, authority/risk objects, and raw signing material are structurally excluded from the adapter interface.
+
+## I-26 — Verification keys have an irreversible lifecycle
+
+Permit and attestation verification keys are named by explicit `key_id` and stored as `ACTIVE`, `RETIRED`, or `REVOKED`.
+
+- `ACTIVE` keys may mint and verify.
+- `RETIRED` keys must not mint. Artifacts issued at or before retirement may still verify.
+- `REVOKED` keys must not mint or verify, including artifacts issued before revocation.
+- A revoked key cannot be re-registered as active. Rotation uses a new `key_id`.
+
+Status is re-read from the durable store on every decision so an in-process cache cannot keep a revoked key alive. The stored `material_hash` binds `key_id` to one public key; a different key cannot occupy the same identifier.
+
+## I-27 — Untrusted ingress is principal-bound
+
+Callers that are not the FAAR runtime itself must authenticate. A `PRINCIPAL` token can submit only for its own `principal_id` and only with a principal-namespaced or server-minted `intent_id`. Grant provision/pause/revoke requires a distinct `ADMIN` token. Security time is the server clock.
+
+This is a reference control plane. Direct store access remains inside the TCB.
+
+## Remaining after v0.4
+
+- HMAC remains a local development option for attestations and evidence MACs, not for isolated permit minting
+- SQLite is a reference local fence, not a distributed production datastore
+- no independent production signer process / KMS / HSM
+- no live-venue adapter
+- no cryptographic audit
+- no distributed production deployment
+- retired-key acceptance uses signed `issued_at`; a backdated mint after retire is a residual if the signer is compromised after retirement
+- authenticated ingress is a reference principal-binding layer, not an internet-facing production identity service
+

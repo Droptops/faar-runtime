@@ -112,7 +112,33 @@ class AttestationScopeTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("ATTESTATION_INTENT_MISMATCH", reasons)
 
-    def test_key_scope_configuration_must_cover_exact_key_set(self):
+    def test_revoked_attestation_key_is_rejected(self):
+        from faar.keys import KeyLifecycle
+        from faar.store import SQLiteIntentStore
+        import tempfile
+        f = tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False); f.close()
+        store = SQLiteIntentStore(f.name)
+        try:
+            i = intent()
+            signer = Ed25519TrustStore.generate(TRUST_KEY_KINDS)
+            life = KeyLifecycle(store, "ATTESTATION")
+            verifier = signer.public_verifier(key_lifecycle=life)
+            att = signer.sign(
+                "authority-test", AttestationKind.AUTHORITY, AUTH, i,
+                issued_at=NOW, ttl_seconds=20,
+            )
+            ok, reasons = verifier.verify(
+                att, kind=AttestationKind.AUTHORITY, subject=AUTH, intent=i, now=NOW
+            )
+            self.assertTrue(ok, reasons)
+            life.revoke("authority-test", at=NOW)
+            ok2, reasons2 = verifier.verify(
+                att, kind=AttestationKind.AUTHORITY, subject=AUTH, intent=i, now=NOW
+            )
+            self.assertFalse(ok2)
+            self.assertIn("KEY_REVOKED", reasons2)
+        finally:
+            store.close()
         with self.assertRaises(ValueError):
             HMACTrustStore(
                 {"a": b"0123456789abcdef"},

@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Iterable, Iterator
 
 from .canonical import canonical_json
+from .keys import KEY_PLANES, KeyConflict, KeyState, KeyStatus
 from .models import CapabilityGrant, Intent, IntentState, RiskSnapshot
 
 
@@ -213,6 +214,20 @@ class SQLiteIntentStore:
                 consumed_at TEXT,
                 UNIQUE(grant_id, grant_version, fence_token)
             );
+            CREATE TABLE IF NOT EXISTS verification_keys (
+                key_id TEXT PRIMARY KEY,
+                plane TEXT NOT NULL CHECK(plane IN ('PERMIT','ATTESTATION','INGRESS')),
+                status TEXT NOT NULL CHECK(status IN ('ACTIVE','RETIRED','REVOKED')),
+                material_hash TEXT,
+                retired_at TEXT,
+                revoked_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS principal_intent_seq (
+                principal_id TEXT PRIMARY KEY,
+                seq INTEGER NOT NULL
+            );
             """
         )
         self._migrate_columns()
@@ -247,12 +262,155 @@ class SQLiteIntentStore:
             permit_cols = {row["name"] for row in self._conn.execute("PRAGMA table_info(execution_permits)").fetchall()}
             if "consumed_at" not in permit_cols:
                 self._conn.execute("ALTER TABLE execution_permits ADD COLUMN consumed_at TEXT")
+            key_cols = {row["name"] for row in self._conn.execute("PRAGMA table_info(verification_keys)").fetchall()}
+            if key_cols and "material_hash" not in key_cols:
+                self._conn.execute("ALTER TABLE verification_keys ADD COLUMN material_hash TEXT")
 
     def close(self) -> None:
         self._conn.close()
 
     def _now(self) -> str:
         return datetime.now(timezone.utc).isoformat()
+
+    @staticmethod
+    def _parse_dt(raw: str | None) -> datetime | None:
+        if not raw:
+            return None
+        value = datetime.fromisoformat(raw)
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value
+
+    def _row_to_key_state(self, row: sqlite3.Row) -> KeyState:
+        return KeyState(
+            key_id=str(row["key_id"]),
+            plane=str(row["plane"]),
+            status=KeyStatus(row["status"]),
+            retired_at=self._parse_dt(row["retired_at"]),
+            revoked_at=self._parse_dt(row["revoked_at"]),
+            material_hash=row["material_hash"] if "material_hash" in row.keys() else None,
+        )
+
+    def register_key(
+        self, key_id: str, plane: str, status: str = "ACTIVE", *, material_hash: str | None = None
+    ) -> None:
+        if not key_id:
+            raise ValueError("key_id is required")
+        if plane not in KEY_PLANES:
+            raise ValueError("invalid key plane")
+        if status != "ACTIVE":
+            raise ValueError("keys must be registered ACTIVE")
+        now = self._now()
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute(
+                    "SELECT * FROM verification_keys WHERE key_id=?", (key_id,)
+                ).fetchone()
+                if row is None:
+                    self._conn.execute(
+                        "INSERT INTO verification_keys(key_id,plane,status,material_hash,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+                        (key_id, plane, "ACTIVE", material_hash, now, now),
+                    )
+                else:
+                    current = str(row["status"])
+                    if str(row["plane"]) != plane:
+                        raise KeyConflict("key_id is already registered on a different plane")
+                    if current == "REVOKED":
+                        raise KeyConflict("revoked keys cannot be resurrected")
+                    if current == "RETIRED":
+                        raise KeyConflict("retired keys cannot be reactivated; register a new key_id")
+                    stored = row["material_hash"] if "material_hash" in row.keys() else None
+                    if stored and material_hash and stored != material_hash:
+                        raise KeyConflict("key_id collision: public material does not match registered key")
+                    if not stored and material_hash:
+                        self._conn.execute(
+                            "UPDATE verification_keys SET material_hash=?, updated_at=? WHERE key_id=?",
+                            (material_hash, now, key_id),
+                        )
+                self._conn.execute("COMMIT")
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
+
+    def retire_key(self, key_id: str, *, at: datetime) -> None:
+        if at.tzinfo is None:
+            raise ValueError("retirement timestamp must be timezone-aware")
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute(
+                    "SELECT * FROM verification_keys WHERE key_id=?", (key_id,)
+                ).fetchone()
+                if row is None:
+                    raise KeyConflict(f"key {key_id} is not registered")
+                current = str(row["status"])
+                if current == "REVOKED":
+                    raise KeyConflict("revoked keys cannot be retired or resurrected")
+                if current == "ACTIVE":
+                    self._conn.execute(
+                        "UPDATE verification_keys SET status=?, retired_at=?, updated_at=? WHERE key_id=?",
+                        ("RETIRED", at.isoformat(), self._now(), key_id),
+                    )
+                self._conn.execute("COMMIT")
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
+
+    def revoke_key(self, key_id: str, *, at: datetime) -> None:
+        if at.tzinfo is None:
+            raise ValueError("revocation timestamp must be timezone-aware")
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute(
+                    "SELECT * FROM verification_keys WHERE key_id=?", (key_id,)
+                ).fetchone()
+                if row is None:
+                    raise KeyConflict(f"key {key_id} is not registered")
+                if str(row["status"]) != "REVOKED":
+                    self._conn.execute(
+                        "UPDATE verification_keys SET status=?, revoked_at=?, updated_at=? WHERE key_id=?",
+                        ("REVOKED", at.isoformat(), self._now(), key_id),
+                    )
+                self._conn.execute("COMMIT")
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
+
+    def get_key(self, key_id: str) -> KeyState | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM verification_keys WHERE key_id=?", (key_id,)
+            ).fetchone()
+        return None if row is None else self._row_to_key_state(row)
+
+    def next_principal_intent_seq(self, principal_id: str) -> int:
+        if not principal_id:
+            raise ValueError("principal_id is required")
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute(
+                    "SELECT seq FROM principal_intent_seq WHERE principal_id=?", (principal_id,)
+                ).fetchone()
+                if row is None:
+                    self._conn.execute(
+                        "INSERT INTO principal_intent_seq(principal_id,seq) VALUES(?,?)",
+                        (principal_id, 1),
+                    )
+                    seq = 1
+                else:
+                    seq = int(row["seq"]) + 1
+                    self._conn.execute(
+                        "UPDATE principal_intent_seq SET seq=? WHERE principal_id=?",
+                        (seq, principal_id),
+                    )
+                self._conn.execute("COMMIT")
+                return seq
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
 
     def _grant_lock(self, grant_id: str, version: int) -> threading.RLock:
         key = (grant_id, version)
@@ -421,7 +579,7 @@ class SQLiteIntentStore:
 
     def next_execution_fence(self, grant: CapabilityGrant) -> tuple[int, int]:
         """Atomically allocate a monotonically increasing fence for an ACTIVE grant."""
-        with self._lock:
+        with self.execution_guard(grant.grant_id, grant.version), self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
                 row = self._conn.execute(
@@ -558,7 +716,7 @@ class SQLiteIntentStore:
         the grant epoch is ACTIVE, or a pause/revoke completes first and consumption
         is rejected. A consumed permit is single-use even if a transport retries it.
         """
-        with self._lock:
+        with self.execution_guard(grant_id, grant_version), self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
                 row = self._conn.execute(

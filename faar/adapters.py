@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from threading import RLock
 from decimal import Decimal, InvalidOperation
@@ -58,6 +58,7 @@ class MockMode(StrEnum):
     TIMEOUT_BEFORE_EFFECT = "TIMEOUT_BEFORE_EFFECT"
     TIMEOUT_AFTER_EFFECT = "TIMEOUT_AFTER_EFFECT"
     AMBIGUOUS = "AMBIGUOUS"
+    PARTIAL_FILL = "PARTIAL_FILL"
 
 
 class ExecutionAdapter(Protocol):
@@ -131,6 +132,12 @@ class MockVenue:
             if self.mode == MockMode.AMBIGUOUS:
                 raise AmbiguousExecution("venue remains ambiguous")
             receipt = self._receipt(request)
+            if self.mode == MockMode.PARTIAL_FILL and receipt.amount_usd is not None:
+                receipt = replace(
+                    receipt,
+                    status=SettlementStatus.CONFIRMED,
+                    amount_usd=receipt.amount_usd / 2,
+                )
             self._effects[key] = receipt
             if self.mode == MockMode.TIMEOUT_AFTER_EFFECT:
                 raise AmbiguousExecution("timeout after venue effect; caller must reconcile")

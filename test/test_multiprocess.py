@@ -58,6 +58,24 @@ def _submit_worker(path, intent_id, barrier, queue):
         store.close()
 
 
+def _permit_consume_worker(path, payload, queue):
+    store = SQLiteIntentStore(path)
+    try:
+        ok, reasons = store.consume_execution_permit(**payload)
+        queue.put((ok, tuple(reasons)))
+    finally:
+        store.close()
+
+
+def _revoke_grant_worker(path, principal_id, grant_id, version, queue):
+    store = SQLiteIntentStore(path)
+    try:
+        store.set_grant_status(principal_id, grant_id, version, "REVOKED")
+        queue.put(("revoked", ()))
+    finally:
+        store.close()
+
+
 class MultiProcessStoreTests(unittest.TestCase):
     def test_distinct_processes_cannot_oversubscribe_daily_budget(self):
         f = tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False); f.close()
@@ -108,6 +126,7 @@ class MultiProcessStoreTests(unittest.TestCase):
             self.assertEqual(1, store.get(i.intent_id).submission_count)
         finally:
             store.close()
+
     def test_durable_intent_lease_blocks_second_process(self):
         f = tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False); f.close()
         parent = SQLiteIntentStore(f.name)
@@ -135,6 +154,114 @@ class MultiProcessStoreTests(unittest.TestCase):
         finally:
             store.close()
 
+    def test_distinct_processes_cannot_double_consume_permit(self):
+        from faar.canonical import canonical_hash as ch
+        from faar.models import ExecutionRequest
+        from faar.permits import ConstrainedPermitAuthority, Ed25519PermitSignature
+        from support import AUTH, attest_pair, trust, verification_trust
+
+        f = tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False); f.close()
+        store = SQLiteIntentStore(f.name)
+        g = grant(grant_id="grant:mp-permit")
+        store.provision_grant(g, canonical_hash(g))
+        t = trust()
+        sig = Ed25519PermitSignature("mp-permit")
+        authority = ConstrainedPermitAuthority(store, verification_trust(t), sig)
+        i = intent(intent_id="mp_permit_00000000000001", grant_id=g.grant_id)
+        store.register(i, canonical_hash(i))
+        rs = risk(state_version=301)
+        self.assertTrue(store.reserve_usage(i, g, rs, NOW)[0])
+        aa, ra = attest_pair(t, i, AUTH, rs, NOW)
+        req = ExecutionRequest.from_intent(i)
+        permit = authority.issue(
+            req, intent=i, authority=AUTH, grant=g, risk=rs,
+            authority_attestation=aa, risk_attestation=ra, now=NOW,
+        )
+        payload = dict(
+            permit_id=permit.permit.permit_id,
+            principal_id=permit.permit.principal_id,
+            grant_id=permit.permit.grant_id,
+            grant_version=permit.permit.grant_version,
+            grant_epoch=permit.permit.grant_epoch,
+            fence_token=permit.permit.fence_token,
+            permit_hash=ch(permit),
+        )
+        store.close()
+
+        ctx = mp.get_context("spawn")
+        queue = ctx.Queue()
+        p1 = ctx.Process(target=_permit_consume_worker, args=(f.name, payload, queue))
+        p2 = ctx.Process(target=_permit_consume_worker, args=(f.name, payload, queue))
+        p1.start(); p2.start(); p1.join(10); p2.join(10)
+        self.assertEqual(0, p1.exitcode); self.assertEqual(0, p2.exitcode)
+        results = [queue.get(timeout=2), queue.get(timeout=2)]
+        self.assertEqual(1, sum(1 for ok, _ in results if ok))
+        denied = [reasons for ok, reasons in results if not ok]
+        self.assertEqual(1, len(denied))
+        self.assertIn("PERMIT_ALREADY_CONSUMED", denied[0])
+
+    def test_revoke_and_consume_race_never_double_consumes(self):
+        from faar.canonical import canonical_hash as ch
+        from faar.models import ExecutionRequest
+        from faar.permits import ConstrainedPermitAuthority, Ed25519PermitSignature
+        from support import AUTH, PRINCIPAL, attest_pair, trust, verification_trust
+
+        f = tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False); f.close()
+        store = SQLiteIntentStore(f.name)
+        g = grant(grant_id="grant:mp-revoke")
+        store.provision_grant(g, canonical_hash(g))
+        t = trust()
+        sig = Ed25519PermitSignature("mp-revoke")
+        authority = ConstrainedPermitAuthority(store, verification_trust(t), sig)
+        i = intent(intent_id="mp_revoke_00000000000001", grant_id=g.grant_id)
+        store.register(i, canonical_hash(i))
+        rs = risk(state_version=302)
+        self.assertTrue(store.reserve_usage(i, g, rs, NOW)[0])
+        aa, ra = attest_pair(t, i, AUTH, rs, NOW)
+        req = ExecutionRequest.from_intent(i)
+        permit = authority.issue(
+            req, intent=i, authority=AUTH, grant=g, risk=rs,
+            authority_attestation=aa, risk_attestation=ra, now=NOW,
+        )
+        payload = dict(
+            permit_id=permit.permit.permit_id,
+            principal_id=permit.permit.principal_id,
+            grant_id=permit.permit.grant_id,
+            grant_version=permit.permit.grant_version,
+            grant_epoch=permit.permit.grant_epoch,
+            fence_token=permit.permit.fence_token,
+            permit_hash=ch(permit),
+        )
+        store.close()
+
+        ctx = mp.get_context("spawn")
+        queue = ctx.Queue()
+        p1 = ctx.Process(target=_permit_consume_worker, args=(f.name, payload, queue))
+        p2 = ctx.Process(target=_revoke_grant_worker, args=(f.name, PRINCIPAL, g.grant_id, g.version, queue))
+        p1.start(); p2.start(); p1.join(10); p2.join(10)
+        self.assertEqual(0, p1.exitcode); self.assertEqual(0, p2.exitcode)
+        results = [queue.get(timeout=2), queue.get(timeout=2)]
+        consumed = sum(1 for ok, _ in results if ok is True)
+        self.assertLessEqual(consumed, 1)
+        restarted = SQLiteIntentStore(f.name)
+        try:
+            row = restarted._conn.execute(
+                "SELECT consumed_at FROM execution_permits WHERE permit_id=?", (payload["permit_id"],)
+            ).fetchone()
+            status = restarted.get_grant_status(PRINCIPAL, g.grant_id, g.version)
+            if consumed == 1:
+                self.assertIsNotNone(row["consumed_at"])
+            else:
+                self.assertEqual("REVOKED", status)
+                self.assertIsNone(row["consumed_at"])
+            if status == "REVOKED":
+                ok, reasons = restarted.consume_execution_permit(**payload)
+                self.assertFalse(ok)
+                self.assertTrue(
+                    "PERMIT_GRANT_NOT_ACTIVE" in reasons or "PERMIT_ALREADY_CONSUMED" in reasons or "PERMIT_GRANT_EPOCH_STALE" in reasons
+                )
+        finally:
+            restarted.close()
 
 
 if __name__ == "__main__":
