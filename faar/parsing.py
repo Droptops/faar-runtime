@@ -14,9 +14,13 @@ from .models import (
     CapabilityGrant,
     CapabilityLimits,
     EconomicPrimitive,
+    ExecutionPermit,
+    ExecutionRequest,
     GrantStatus,
     Intent,
+    PermitAlgorithm,
     RiskSnapshot,
+    SignedExecutionPermit,
 )
 
 
@@ -147,4 +151,39 @@ def parse_risk(data: dict[str, Any]) -> RiskSnapshot:
         data_complete=_strict_bool(data.get("data_complete", True), "data_complete"),
         source_count=_int(data.get("source_count", 1), "source_count"),
         sources_agree=_strict_bool(data.get("sources_agree", True), "sources_agree"),
+    )
+
+
+def parse_execution_request(data: dict[str, Any]) -> ExecutionRequest:
+    return ExecutionRequest(
+        principal_id=data["principal_id"],
+        intent_id=data["intent_id"],
+        primitive=EconomicPrimitive(data["primitive"]),
+        venue=data["venue"],
+        payload=data.get("payload", {}),
+    )
+
+
+def parse_signed_permit(data: dict[str, Any]) -> SignedExecutionPermit:
+    body = data["permit"]
+    return SignedExecutionPermit(
+        permit=ExecutionPermit(
+            permit_id=body["permit_id"],
+            principal_id=body["principal_id"],
+            intent_id=body["intent_id"],
+            grant_id=body["grant_id"],
+            grant_version=_int(body["grant_version"], "grant_version"),
+            grant_hash=body["grant_hash"],
+            request_hash=body["request_hash"],
+            authority_attestation_hash=body["authority_attestation_hash"],
+            risk_attestation_hash=body["risk_attestation_hash"],
+            grant_epoch=_int(body["grant_epoch"], "grant_epoch"),
+            fence_token=_int(body["fence_token"], "fence_token"),
+            max_amount_usd=_dec(body.get("max_amount_usd")),
+            issued_at=_dt(body["issued_at"]),
+            expires_at=_dt(body["expires_at"]),
+        ),
+        signer_id=data["signer_id"],
+        algorithm=PermitAlgorithm(data["algorithm"]),
+        signature=data["signature"],
     )

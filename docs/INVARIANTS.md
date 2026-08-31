@@ -157,15 +157,27 @@ Callers that are not the FAAR runtime itself must authenticate. A `PRINCIPAL` to
 
 This is a reference control plane. Direct store access remains inside the TCB.
 
-## Remaining after v0.4
+## I-28 — Execution plane is built from serialized public material
+
+The v0.5 executor is constructed from `VerifierDescriptor` records (scheme, key_id, public_key, purpose, status, material_hash). FAAR builds verify-only objects internally. HMAC, private-key encodings, and `REVOKED` descriptors are rejected. Arbitrary Python objects are not the hardened execution-plane API.
+
+## I-29 — Permit minting is outside the execution process
+
+The execution process is started without private signing material and without instantiating signer providers. It may verify signed permits and execute an authorized mock effect. Compromise of the executor does not yield a FAAR permit/attestation minting primitive.
+
+## Remaining after v0.5
 
 - HMAC remains a local development option for attestations and evidence MACs, not for isolated permit minting
 - `has_signing_api()` rejects exposed minting APIs; it does not prove an arbitrary object holds no private key
+- `ExecutionPermitVerifier` still lives in `faar.permits` beside signer classes; process isolation + descriptors are the v0.5 boundary
 - SQLite is a reference local fence, not a distributed production datastore
-- no independent production signer process / KMS / HSM
+- KMS/HSM is an interface only; no cloud adapter ships
+- no independent production signer process beyond the reference `faar-authority` Unix-socket service
 - no live-venue adapter
+- mock treasury is fake money
 - no cryptographic audit
 - no distributed production deployment
 - retired-key acceptance uses signed `issued_at`; a backdated mint after retire is a residual if the signer is compromised after retirement
 - authenticated ingress is a reference principal-binding layer, not an internet-facing production identity service
+- compromise of `faar-authority` still mints in-policy permits while keys are ACTIVE
 

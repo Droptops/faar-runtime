@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "faar-runtime"
-version = "0.4.0"
+version = "0.5.0"
 description = "Financial Agent Authority Router — deterministic authority and economic execution runtime"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -21,6 +21,8 @@ classifiers = [
 
 [project.scripts]
 faar = "faar.cli:main"
+faar-authority = "faar.authority_service:main"
+faar-executor = "faar.executor:main"
 
 [tool.setuptools]
 packages = ["faar"]

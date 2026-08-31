@@ -1,0 +1,35 @@
+{
+  "schema_version": "0.3",
+  "principal_id": "principal:test",
+  "grant_id": "grant:treasury",
+  "version": 1,
+  "actor_id": "agent:quant",
+  "status": "ACTIVE",
+  "allowed_primitives": [
+    "PAY"
+  ],
+  "allowed_venues": [
+    "mock-treasury"
+  ],
+  "allowed_assets": [
+    "USDC"
+  ],
+  "allowed_targets": [
+    "beneficiary:approved"
+  ],
+  "denied_targets": [],
+  "valid_until": "2027-01-01T00:00:00+00:00",
+  "limits": {
+    "max_order_usd": 75,
+    "max_position_usd": 250,
+    "max_daily_turnover_usd": 1500,
+    "max_daily_loss_usd": 100,
+    "max_market_data_age_seconds": 10,
+    "max_risk_snapshot_age_seconds": 5,
+    "max_intent_ttl_seconds": 15,
+    "max_clock_skew_seconds": 2,
+    "max_actions_per_window": 10,
+    "action_window_seconds": 60,
+    "max_submission_attempts": 2
+  }
+}

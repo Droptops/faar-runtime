@@ -1,0 +1,18 @@
+{
+  "schema_version": "0.3",
+  "principal_id": "principal:test",
+  "intent_id": "intent_pay_000000000001",
+  "actor_id": "agent:quant",
+  "grant_id": "grant:treasury",
+  "grant_version": 1,
+  "primitive": "PAY",
+  "venue": "mock-treasury",
+  "created_at": "2026-08-30T17:59:59+00:00",
+  "expires_at": "2026-08-30T18:00:14+00:00",
+  "payload": {
+    "asset": "USDC",
+    "amount_usd": "25.00",
+    "target": "beneficiary:approved",
+    "payment_reference": "payroll-001"
+  }
+}

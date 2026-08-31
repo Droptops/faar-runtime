@@ -133,7 +133,14 @@ See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ```text
 faar/
-  runtime.py          # authority/risk/execution state machine
+  descriptors.py      # serialized public verifier descriptors
+  signing.py          # SigningKeyProvider (authority process only)
+  authority_service.py# out-of-process permit mint
+  executor.py         # verify-only execution plane
+  gateway.py          # financial side-effect choke point
+  ledger.py           # authority ledger contract (SQLite reference)
+  treasury.py         # fake-money PAY adapter
+  runtime.py          # v0.4 in-process authority/risk/execution state machine
   gates.py            # deterministic policy gates
   attestation.py      # scoped signed attestations
   permits.py          # isolated permit mint vs verify-only execution
@@ -155,6 +162,7 @@ docs/
   RED_TEAM_REPORT.md
   DEFINITION_OF_DONE.md
   UNPLUG_TEST.md
+  V0_5_AUTHORITY_SERVICE.md
   V0_4_AUTHORITY_PLANE.md
   V0_3_RELEASE.md
   V0_2_RELEASE_GATES.md
