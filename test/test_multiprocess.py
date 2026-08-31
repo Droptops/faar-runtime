@@ -67,6 +67,23 @@ def _permit_consume_worker(path, payload, queue):
         store.close()
 
 
+def _record_permit_worker(path, payload, queue):
+    from faar.store import PermitConflict
+    store = SQLiteIntentStore(path)
+    try:
+        g = grant(grant_id=payload["grant_id"])
+        i = intent(intent_id=payload["intent_id"], grant_id=payload["grant_id"])
+        store.record_execution_permit(
+            payload["permit_id"], i, g,
+            payload["grant_epoch"], payload["fence_token"], payload["permit_hash"],
+        )
+        queue.put("ok")
+    except PermitConflict:
+        queue.put("conflict")
+    finally:
+        store.close()
+
+
 def _revoke_grant_worker(path, principal_id, grant_id, version, queue):
     store = SQLiteIntentStore(path)
     try:
@@ -262,6 +279,35 @@ class MultiProcessStoreTests(unittest.TestCase):
                 )
         finally:
             restarted.close()
+
+    def test_distinct_processes_cannot_mint_two_outstanding_permits(self):
+        f = tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False); f.close()
+        parent = SQLiteIntentStore(f.name)
+        g = grant(grant_id="grant:mp-outstanding")
+        parent.provision_grant(g, canonical_hash(g))
+        i = intent(intent_id="mp_outstanding_0000000001", grant_id=g.grant_id)
+        parent.register(i, canonical_hash(i))
+        parent.close()
+
+        ctx = mp.get_context("spawn")
+        queue = ctx.Queue()
+        base = dict(intent_id=i.intent_id, grant_id=g.grant_id, grant_epoch=1, permit_hash="h")
+        p1 = ctx.Process(target=_record_permit_worker, args=(f.name, {**base, "permit_id": "p1", "fence_token": 1}, queue))
+        p2 = ctx.Process(target=_record_permit_worker, args=(f.name, {**base, "permit_id": "p2", "fence_token": 2}, queue))
+        p1.start(); p2.start(); p1.join(10); p2.join(10)
+        self.assertEqual(0, p1.exitcode); self.assertEqual(0, p2.exitcode)
+        results = [queue.get(timeout=2), queue.get(timeout=2)]
+        self.assertEqual(1, results.count("ok"))
+        self.assertEqual(1, results.count("conflict"))
+        store = SQLiteIntentStore(f.name)
+        try:
+            rows = store._conn.execute(
+                "SELECT permit_id, consumed_at FROM execution_permits WHERE intent_id=?", (i.intent_id,)
+            ).fetchall()
+            self.assertEqual(1, len(rows))
+            self.assertIsNone(rows[0]["consumed_at"])
+        finally:
+            store.close()
 
 
 if __name__ == "__main__":

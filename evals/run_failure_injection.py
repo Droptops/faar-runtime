@@ -194,6 +194,32 @@ def main() -> None:
     })
     store.close()
 
+    store, grant, trust, runtime, venue, verifier = _stack(MockMode.PARTIAL_FILL)
+    i = _intent("fault_partial_cancel_0000000001")
+    filled = _run(runtime, trust, grant, i, 7)
+    class _CancelLook:
+        name = "mock-dex"
+        security_profile = REFERENCE_SETTLEMENT_PROFILE
+        def verify(self, request):
+            return SettlementRecord(
+                SettlementStatus.NONE, evidence={"cancel": True}, authoritative=True,
+                verified_request_hash=canonical_hash(request),
+            )
+    runtime.settlement_verifiers["mock-dex"] = _CancelLook()
+    cancelled = _run(runtime, trust, grant, i, 7)
+    cases.append({
+        "fault": InjectedFault.PARTIAL_FILL_CANCEL_RACE.value,
+        "filled": filled.state.value,
+        "after_cancel_lookup": cancelled.state.value,
+        "effects": venue.successful_effect_count(i.intent_id),
+        "pass": (
+            filled.state == IntentState.CONFIRMED
+            and cancelled.state == IntentState.STOPPED
+            and venue.successful_effect_count(i.intent_id) == 1
+        ),
+    })
+    store.close()
+
     req = ExecutionRequest.from_intent(_intent("fault_inconsistent_00000000001"))
     req_hash = canonical_hash(req)
 

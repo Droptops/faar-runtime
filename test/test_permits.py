@@ -131,9 +131,11 @@ class PermitBoundaryTests(unittest.TestCase):
         self.assertEqual(0, self.venue.successful_effect_count(i.intent_id, principal_id=PRINCIPAL))
 
     def test_fresh_retry_risk_state_cannot_be_reused_by_different_intent(self):
-        i1, req1, _ = self.issue(
+        i1, req1, permit1 = self.issue(
             i=intent(intent_id="permit_risk_owner_000000001"), rs=risk(state_version=20)
         )
+        ok, reasons = self.verifier.consume(permit1, req1, now=NOW)
+        self.assertTrue(ok, reasons)
         fresh = risk(state_version=21)
         aa1, ra1 = attest_pair(self.trust, i1, AUTH, fresh, NOW)
         self.authority.issue(
@@ -230,6 +232,27 @@ class PermitBoundaryTests(unittest.TestCase):
         impostor = Ed25519PermitSignature("permit-test")
         with self.assertRaises(KeyConflict):
             self.verifier.add_verifier(impostor.public_verifier())
+
+    def test_second_outstanding_permit_for_same_intent_is_rejected(self):
+        i, req, permit = self.issue(
+            i=intent(intent_id="permit_outstanding_000000001"), rs=risk(state_version=50)
+        )
+        aa, ra = attest_pair(self.trust, i, AUTH, risk(state_version=50), NOW)
+        with self.assertRaises(PermitIssuanceError) as ctx:
+            self.authority.issue(
+                req, intent=i, authority=AUTH, grant=self.grant, risk=risk(state_version=50),
+                authority_attestation=aa, risk_attestation=ra, now=NOW,
+            )
+        self.assertIn("PERMIT_ALREADY_OUTSTANDING", ctx.exception.reasons)
+        ok, reasons = self.verifier.consume(permit, req, now=NOW)
+        self.assertTrue(ok, reasons)
+        retry_rs = risk(state_version=51)
+        aa2, ra2 = attest_pair(self.trust, i, AUTH, retry_rs, NOW)
+        replacement = self.authority.issue(
+            req, intent=i, authority=AUTH, grant=self.grant, risk=retry_rs,
+            authority_attestation=aa2, risk_attestation=ra2, now=NOW,
+        )
+        self.assertNotEqual(permit.permit.permit_id, replacement.permit.permit_id)
 
 
 if __name__ == "__main__":

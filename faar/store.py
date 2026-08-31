@@ -56,6 +56,10 @@ class GrantConflict(RuntimeError):
     pass
 
 
+class PermitConflict(RuntimeError):
+    pass
+
+
 class EffectConflict(RuntimeError):
     pass
 
@@ -214,6 +218,8 @@ class SQLiteIntentStore:
                 consumed_at TEXT,
                 UNIQUE(grant_id, grant_version, fence_token)
             );
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_execution_permits_outstanding
+              ON execution_permits(intent_id) WHERE consumed_at IS NULL;
             CREATE TABLE IF NOT EXISTS verification_keys (
                 key_id TEXT PRIMARY KEY,
                 plane TEXT NOT NULL CHECK(plane IN ('PERMIT','ATTESTATION','INGRESS')),
@@ -265,6 +271,10 @@ class SQLiteIntentStore:
             key_cols = {row["name"] for row in self._conn.execute("PRAGMA table_info(verification_keys)").fetchall()}
             if key_cols and "material_hash" not in key_cols:
                 self._conn.execute("ALTER TABLE verification_keys ADD COLUMN material_hash TEXT")
+            self._conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ux_execution_permits_outstanding "
+                "ON execution_permits(intent_id) WHERE consumed_at IS NULL"
+            )
 
     def close(self) -> None:
         self._conn.close()
@@ -692,11 +702,35 @@ class SQLiteIntentStore:
         return [dict(r) for r in rows]
 
     def record_execution_permit(self, permit_id: str, intent: Intent, grant: CapabilityGrant, grant_epoch: int, fence_token: int, permit_hash: str) -> None:
-        with self._lock:
-            self._conn.execute(
-                "INSERT INTO execution_permits(permit_id,intent_id,principal_id,grant_id,grant_version,grant_epoch,fence_token,permit_hash,issued_at) VALUES(?,?,?,?,?,?,?,?,?)",
-                (permit_id, intent.intent_id, intent.principal_id, grant.grant_id, grant.version, grant_epoch, fence_token, permit_hash, self._now()),
-            )
+        """Record a newly minted permit. At most one unconsumed permit may exist per intent.
+
+        A retry after consumption may mint a replacement. Two outstanding permits for
+        one intent would duplicate execution authority at any gateway that consumes
+        permits without additional intent-level idempotency.
+        """
+        with self.execution_guard(grant.grant_id, grant.version), self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                outstanding = self._conn.execute(
+                    "SELECT permit_id FROM execution_permits WHERE intent_id=? AND consumed_at IS NULL",
+                    (intent.intent_id,),
+                ).fetchone()
+                if outstanding is not None:
+                    self._conn.execute("COMMIT")
+                    raise PermitConflict("PERMIT_ALREADY_OUTSTANDING")
+                self._conn.execute(
+                    "INSERT INTO execution_permits(permit_id,intent_id,principal_id,grant_id,grant_version,grant_epoch,fence_token,permit_hash,issued_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                    (permit_id, intent.intent_id, intent.principal_id, grant.grant_id, grant.version, grant_epoch, fence_token, permit_hash, self._now()),
+                )
+                self._conn.execute("COMMIT")
+            except PermitConflict:
+                raise
+            except sqlite3.IntegrityError as exc:
+                self._conn.execute("ROLLBACK")
+                raise PermitConflict("PERMIT_ALREADY_OUTSTANDING") from exc
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
 
     def consume_execution_permit(
         self,

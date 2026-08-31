@@ -9,7 +9,7 @@ Isolated authority-plane reference release over frozen v0.3.0. Still **pre-alpha
 - `key_id` is bound to a public-material hash; substitution/collision is rejected
 - revoked keys cannot be resurrected; retirement still verifies in-flight artifacts
 - principal-bound authenticated ingress with distinct ADMIN vs PRINCIPAL roles
-- stronger grant/permit fencing across threads and processes; consumed permits and revoked grants survive store restart
+- stronger grant/permit fencing across threads and processes; at most one outstanding permit per intent; consumed permits and revoked grants survive store restart
 - deterministic failure-injection eval (`make faults`) added to `make check`
 - bounded permit model expanded with key lifecycle states
 

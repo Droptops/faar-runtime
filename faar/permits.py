@@ -12,6 +12,7 @@ from .attestation import AttestationVerifier, has_signing_api
 from .canonical import canonical_hash, canonical_json
 from .gates import evaluate_authority, evaluate_capability, evaluate_risk
 from .keys import KeyConflict, KeyLifecycle, KeyStatus, ed25519_public_material_hash
+from .store import PermitConflict
 from .models import (
     Attestation,
     AttestationKind,
@@ -383,16 +384,18 @@ class ConstrainedPermitAuthority:
             issued_at=now,
             expires_at=expires_at,
         )
-        payload = canonical_json(permit).encode("utf-8")
         signed = self.isolated_signer.sign(permit, now=now)
-        self.store.record_execution_permit(
-            permit_id,
-            intent,
-            grant,
-            epoch,
-            fence,
-            canonical_hash(signed),
-        )
+        try:
+            self.store.record_execution_permit(
+                permit_id,
+                intent,
+                grant,
+                epoch,
+                fence,
+                canonical_hash(signed),
+            )
+        except PermitConflict:
+            raise PermitIssuanceError(("PERMIT_ALREADY_OUTSTANDING",))
         return signed
 
 

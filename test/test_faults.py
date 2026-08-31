@@ -103,6 +103,34 @@ class FailureInjectionTests(unittest.TestCase):
         self.assertEqual(1, self.venue.successful_effect_count(i.intent_id))
         self.assertEqual(self.store.get(i.intent_id).effect_id, again.effect_id)
 
+    def test_partial_fill_cancel_race_does_not_erase_or_duplicate_effect(self):
+        from faar.canonical import canonical_hash as ch
+        from faar.models import SettlementRecord, SettlementStatus
+        from faar.settlement import REFERENCE_SETTLEMENT_PROFILE
+
+        i, result = self._run("fault_partial_cancel_00000001", 209, MockMode.PARTIAL_FILL)
+        self.assertEqual(IntentState.CONFIRMED, result.state)
+        self.assertEqual(1, self.venue.successful_effect_count(i.intent_id))
+        effect = self.store.get(i.intent_id).effect_id
+
+        class CancelLook:
+            name = "mock-dex"
+            security_profile = REFERENCE_SETTLEMENT_PROFILE
+            def verify(self, request):
+                return SettlementRecord(
+                    SettlementStatus.NONE, evidence={"cancel": True}, authoritative=True,
+                    verified_request_hash=ch(request),
+                )
+
+        self.runtime.settlement_verifiers["mock-dex"] = CancelLook()
+        rs = risk(state_version=209)
+        aa, ra = attest_pair(self.t, i, AUTH, rs, NOW)
+        cancelled = self.runtime.process(i, AUTH, self.g, rs, authority_attestation=aa, risk_attestation=ra, now=NOW)
+        self.assertEqual(IntentState.STOPPED, cancelled.state)
+        self.assertIn("SETTLEMENT_LOST_PREVIOUS_EFFECT", cancelled.reason_codes)
+        self.assertEqual(1, self.venue.successful_effect_count(i.intent_id))
+        self.assertEqual(effect, self.store.get(i.intent_id).effect_id)
+
     def test_datastore_interrupt_fails_closed_on_permit_consume(self):
         i = intent(intent_id="fault_datastore_interrupt_001")
         rs = risk(state_version=208)

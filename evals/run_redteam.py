@@ -86,6 +86,8 @@ ATTACK_CLASSES = [
     "inconsistent settlement providers are contradictory",
     "datastore interrupt fails closed on permit consume",
     "grant revoke racing permit consume never double-consumes",
+    "two outstanding permits cannot exist for one intent",
+    "partial-fill cancel lookup cannot erase a known effect",
 ]
 
 

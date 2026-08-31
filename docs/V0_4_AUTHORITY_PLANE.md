@@ -76,8 +76,9 @@ still a trusted-operator path.
 `make faults` runs an in-process mock-venue catalog covering timeout before/after
 venue acceptance, process-crash restart of consumed permits, network ambiguity,
 stale verifier after key revocation, grant already revoked, partial fill /
-repeat submit, inconsistent settlement providers, datastore interruption, and
-duplicate-worker permit consume. It is not an OS crash or live-network test.
+repeat submit, partial-fill vs cancel lookup race, inconsistent settlement
+providers, datastore interruption, and duplicate-worker permit consume. It is
+not an OS crash or live-network test.
 
 ## Claim boundary
 
