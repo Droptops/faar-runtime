@@ -11,9 +11,16 @@ from .canonical import canonical_hash, canonical_json
 from .models import Attestation, AttestationAlgorithm, AttestationKind, Intent
 
 
-class AttestationVerifier(Protocol):
-    can_sign: bool
+def has_signing_api(obj: object) -> bool:
+    """True if `obj` exposes a callable `sign` minting path.
 
+    Runtime and executor trust objects must fail this check. A `can_sign` flag is
+    not sufficient: a compromised verifier must not have an API that can mint.
+    """
+    return callable(getattr(obj, "sign", None))
+
+
+class AttestationVerifier(Protocol):
     def verify(
         self,
         attestation: Attestation,
@@ -23,6 +30,19 @@ class AttestationVerifier(Protocol):
         intent: Intent,
         now: datetime,
     ) -> tuple[bool, tuple[str, ...]]: ...
+
+
+class AttestationSigner(Protocol):
+    def sign(
+        self,
+        key_id: str,
+        kind: AttestationKind,
+        subject: object,
+        intent: Intent,
+        *,
+        issued_at: datetime,
+        ttl_seconds: int = 30,
+    ) -> Attestation: ...
 
 
 def _normalize_kinds(
@@ -67,8 +87,8 @@ class HMACTrustStore:
 
     This remains useful for deterministic compatibility tests, but it is not a
     TCB-isolating verifier: anyone able to verify also has enough material to forge
-    attestations. FAAR v0.3 runtime construction rejects signing-capable trust stores
-    by default.
+    attestations. FAAR runtime construction rejects any trust object that exposes a
+    signing API.
     """
 
     can_sign = True
@@ -166,8 +186,58 @@ class HMACTrustStore:
         return not reasons, tuple(reasons)
 
 
+def _verify_ed25519_attestation(
+    keys: Mapping[str, object],
+    key_kinds: Mapping[str, frozenset[AttestationKind]],
+    attestation: Attestation,
+    *,
+    kind: AttestationKind,
+    subject: object,
+    intent: Intent,
+    now: datetime,
+    max_clock_skew_seconds: int,
+) -> tuple[bool, tuple[str, ...]]:
+    reasons: list[str] = []
+    if attestation.algorithm != AttestationAlgorithm.ED25519:
+        reasons.append("ATTESTATION_ALGORITHM_MISMATCH")
+    if attestation.kind != kind:
+        reasons.append("ATTESTATION_KIND_MISMATCH")
+    key = keys.get(attestation.key_id)
+    if key is None:
+        reasons.append("ATTESTATION_KEY_UNKNOWN")
+        return False, tuple(reasons)
+    if kind not in key_kinds.get(attestation.key_id, frozenset()):
+        reasons.append("ATTESTATION_KEY_KIND_NOT_ALLOWED")
+    if attestation.subject_hash != canonical_hash(subject):
+        reasons.append("ATTESTATION_SUBJECT_MISMATCH")
+    if attestation.intent_hash != canonical_hash(intent):
+        reasons.append("ATTESTATION_INTENT_MISMATCH")
+    skew = timedelta(seconds=max_clock_skew_seconds)
+    if attestation.issued_at > now + skew:
+        reasons.append("ATTESTATION_FROM_FUTURE")
+    if now > attestation.expires_at + skew:
+        reasons.append("ATTESTATION_EXPIRED")
+    payload = _payload(
+        algorithm=attestation.algorithm, kind=attestation.kind, key_id=attestation.key_id,
+        subject_hash=attestation.subject_hash, intent_hash=attestation.intent_hash,
+        issued_at=attestation.issued_at, expires_at=attestation.expires_at,
+    )
+    pad = "=" * (-len(attestation.signature) % 4)
+    try:
+        raw = base64.urlsafe_b64decode(attestation.signature + pad)
+        public = key.public_key() if hasattr(key, "public_key") else key
+        public.verify(raw, payload)
+    except Exception:
+        reasons.append("ATTESTATION_SIGNATURE_INVALID")
+    return not reasons, tuple(reasons)
+
+
 class Ed25519TrustStore:
-    """Role-scoped asymmetric attestation signer or verify-only trust store."""
+    """Role-scoped asymmetric attestation signer.
+
+    Isolated verifiers must use `public_verifier()`, which returns
+    `Ed25519AttestationVerifier` and does not expose a minting API.
+    """
 
     algorithm = AttestationAlgorithm.ED25519
 
@@ -204,12 +274,13 @@ class Ed25519TrustStore:
             max_clock_skew_seconds=max_clock_skew_seconds,
         )
 
-    def public_verifier(self) -> "Ed25519TrustStore":
-        public = {
-            key_id: (key.public_key() if hasattr(key, "public_key") else key)
-            for key_id, key in self._keys.items()
-        }
-        return Ed25519TrustStore(
+    def public_verifier(self) -> "Ed25519AttestationVerifier":
+        public = {}
+        for key_id, key in self._keys.items():
+            if callable(getattr(key, "sign", None)) and not hasattr(key, "public_key"):
+                raise ValueError("cannot derive a verify-only attestation store from signing material without a public key")
+            public[key_id] = key.public_key() if hasattr(key, "public_key") else key
+        return Ed25519AttestationVerifier(
             public, key_kinds=self._key_kinds,
             max_clock_skew_seconds=self.max_clock_skew_seconds,
         )
@@ -261,36 +332,46 @@ class Ed25519TrustStore:
         intent: Intent,
         now: datetime,
     ) -> tuple[bool, tuple[str, ...]]:
-        reasons: list[str] = []
-        if attestation.algorithm != self.algorithm:
-            reasons.append("ATTESTATION_ALGORITHM_MISMATCH")
-        if attestation.kind != kind:
-            reasons.append("ATTESTATION_KIND_MISMATCH")
-        key = self._keys.get(attestation.key_id)
-        if key is None:
-            reasons.append("ATTESTATION_KEY_UNKNOWN")
-            return False, tuple(reasons)
-        if not self._kind_allowed(attestation.key_id, kind):
-            reasons.append("ATTESTATION_KEY_KIND_NOT_ALLOWED")
-        if attestation.subject_hash != canonical_hash(subject):
-            reasons.append("ATTESTATION_SUBJECT_MISMATCH")
-        if attestation.intent_hash != canonical_hash(intent):
-            reasons.append("ATTESTATION_INTENT_MISMATCH")
-        skew = timedelta(seconds=self.max_clock_skew_seconds)
-        if attestation.issued_at > now + skew:
-            reasons.append("ATTESTATION_FROM_FUTURE")
-        if now > attestation.expires_at + skew:
-            reasons.append("ATTESTATION_EXPIRED")
-        payload = _payload(
-            algorithm=attestation.algorithm, kind=attestation.kind, key_id=attestation.key_id,
-            subject_hash=attestation.subject_hash, intent_hash=attestation.intent_hash,
-            issued_at=attestation.issued_at, expires_at=attestation.expires_at,
+        return _verify_ed25519_attestation(
+            self._keys, self._key_kinds, attestation,
+            kind=kind, subject=subject, intent=intent, now=now,
+            max_clock_skew_seconds=self.max_clock_skew_seconds,
         )
-        pad = "=" * (-len(attestation.signature) % 4)
-        try:
-            raw = base64.urlsafe_b64decode(attestation.signature + pad)
-            public = key.public_key() if hasattr(key, "public_key") else key
-            public.verify(raw, payload)
-        except Exception:
-            reasons.append("ATTESTATION_SIGNATURE_INVALID")
-        return not reasons, tuple(reasons)
+
+
+class Ed25519AttestationVerifier:
+    """Public-key-only attestation verifier. No minting API and no private keys."""
+
+    algorithm = AttestationAlgorithm.ED25519
+
+    def __init__(
+        self,
+        keys: Mapping[str, object],
+        *,
+        key_kinds: Mapping[str, Iterable[AttestationKind]],
+        max_clock_skew_seconds: int = 5,
+    ) -> None:
+        if not keys:
+            raise ValueError("at least one attestation key is required")
+        if any(has_signing_api(v) for v in keys.values()):
+            raise ValueError("attestation verifier cannot hold signing-capable private keys")
+        self._keys = {str(k): v for k, v in keys.items()}
+        self._key_kinds = _normalize_kinds(set(self._keys), key_kinds)
+        if max_clock_skew_seconds < 0:
+            raise ValueError("max_clock_skew_seconds must be non-negative")
+        self.max_clock_skew_seconds = max_clock_skew_seconds
+
+    def verify(
+        self,
+        attestation: Attestation,
+        *,
+        kind: AttestationKind,
+        subject: object,
+        intent: Intent,
+        now: datetime,
+    ) -> tuple[bool, tuple[str, ...]]:
+        return _verify_ed25519_attestation(
+            self._keys, self._key_kinds, attestation,
+            kind=kind, subject=subject, intent=intent, now=now,
+            max_clock_skew_seconds=self.max_clock_skew_seconds,
+        )

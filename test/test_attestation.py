@@ -4,7 +4,9 @@ import hashlib
 import hmac
 import unittest
 
-from faar.attestation import Ed25519TrustStore, HMACTrustStore
+from dataclasses import replace
+
+from faar.attestation import Ed25519AttestationVerifier, Ed25519TrustStore, HMACTrustStore, has_signing_api
 from faar.canonical import canonical_hash
 from faar.models import Attestation, AttestationKind
 from support import AUTH, NOW, TRUST_KEYS, TRUST_KEY_KINDS, intent
@@ -53,12 +55,62 @@ class AttestationScopeTests(unittest.TestCase):
             att, kind=AttestationKind.AUTHORITY, subject=AUTH, intent=i, now=NOW
         )
         self.assertTrue(ok, reasons)
-        self.assertFalse(verifier.can_sign)
-        with self.assertRaises(PermissionError):
-            verifier.sign(
-                "authority-test", AttestationKind.AUTHORITY, AUTH, i,
-                issued_at=NOW, ttl_seconds=20,
+        self.assertIsInstance(verifier, Ed25519AttestationVerifier)
+        self.assertFalse(has_signing_api(verifier))
+        self.assertFalse(hasattr(verifier, "sign"))
+
+    def test_attestation_verifier_rejects_private_key_material(self):
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+        with self.assertRaisesRegex(ValueError, "signing-capable"):
+            Ed25519AttestationVerifier(
+                {"authority-test": Ed25519PrivateKey.generate()},
+                key_kinds={"authority-test": {AttestationKind.AUTHORITY}},
             )
+
+    def test_tampered_attestation_signature_fails(self):
+        i = intent()
+        signer = Ed25519TrustStore.generate(TRUST_KEY_KINDS)
+        verifier = signer.public_verifier()
+        att = signer.sign(
+            "authority-test", AttestationKind.AUTHORITY, AUTH, i,
+            issued_at=NOW, ttl_seconds=20,
+        )
+        tampered = replace(att, signature=att.signature[:-4] + "AAAA")
+        ok, reasons = verifier.verify(
+            tampered, kind=AttestationKind.AUTHORITY, subject=AUTH, intent=i, now=NOW
+        )
+        self.assertFalse(ok)
+        self.assertIn("ATTESTATION_SIGNATURE_INVALID", reasons)
+
+    def test_untrusted_attestation_signer_fails(self):
+        i = intent()
+        trusted = Ed25519TrustStore.generate(TRUST_KEY_KINDS)
+        untrusted = Ed25519TrustStore.generate(TRUST_KEY_KINDS)
+        verifier = trusted.public_verifier()
+        forged = untrusted.sign(
+            "authority-test", AttestationKind.AUTHORITY, AUTH, i,
+            issued_at=NOW, ttl_seconds=20,
+        )
+        ok, reasons = verifier.verify(
+            forged, kind=AttestationKind.AUTHORITY, subject=AUTH, intent=i, now=NOW
+        )
+        self.assertFalse(ok)
+        self.assertIn("ATTESTATION_SIGNATURE_INVALID", reasons)
+
+    def test_attestation_intent_binding_remains_enforced(self):
+        i = intent()
+        other = intent(intent_id="intent_other_000000000001")
+        signer = Ed25519TrustStore.generate(TRUST_KEY_KINDS)
+        verifier = signer.public_verifier()
+        att = signer.sign(
+            "authority-test", AttestationKind.AUTHORITY, AUTH, i,
+            issued_at=NOW, ttl_seconds=20,
+        )
+        ok, reasons = verifier.verify(
+            att, kind=AttestationKind.AUTHORITY, subject=AUTH, intent=other, now=NOW
+        )
+        self.assertFalse(ok)
+        self.assertIn("ATTESTATION_INTENT_MISMATCH", reasons)
 
     def test_key_scope_configuration_must_cover_exact_key_set(self):
         with self.assertRaises(ValueError):

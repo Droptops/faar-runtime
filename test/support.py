@@ -4,7 +4,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
-from faar.attestation import Ed25519TrustStore, HMACTrustStore
+from faar.attestation import Ed25519TrustStore, HMACTrustStore, has_signing_api
 from faar.permits import ConstrainedPermitAuthority, Ed25519PermitSignature, ExecutionPermitVerifier
 from faar.adapters import MockVenue, MockMode
 from faar.settlement import MockSettlementVerifier
@@ -42,7 +42,7 @@ def trust() -> Ed25519TrustStore:
 
 
 def verification_trust(t):
-    return t.public_verifier() if getattr(t, "can_sign", False) and hasattr(t, "public_verifier") else t
+    return t.public_verifier() if has_signing_api(t) and hasattr(t, "public_verifier") else t
 
 
 def intent(**changes):

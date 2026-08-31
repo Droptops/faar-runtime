@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Protocol
 
-from .attestation import AttestationVerifier
+from .attestation import AttestationVerifier, has_signing_api
 from .canonical import canonical_hash, canonical_json
 from .gates import evaluate_authority, evaluate_capability, evaluate_risk
 from .models import (
@@ -33,20 +33,39 @@ class PermitIssuanceError(RuntimeError):
         self.reasons = reasons
 
 
-class PermitSignatureBackend(Protocol):
+class PermitVerifier(Protocol):
+    """Public-side cryptographic verifier. Must not expose a minting API."""
+
     signer_id: str
     algorithm: PermitAlgorithm
-    can_sign: bool
+
+    def verify(self, payload: bytes, signature: str) -> bool: ...
+
+
+class PermitSigner(Protocol):
+    """Private-side minting authority for signed execution permits."""
+
+    signer_id: str
+    algorithm: PermitAlgorithm
 
     def sign(self, payload: bytes) -> str: ...
-    def verify(self, payload: bytes, signature: str) -> bool: ...
+
+
+def _ed25519_verify(public_key, payload: bytes, signature: str) -> bool:
+    pad = "=" * (-len(signature) % 4)
+    try:
+        raw = base64.urlsafe_b64decode(signature + pad)
+        public_key.verify(raw, payload)
+        return True
+    except Exception:
+        return False
 
 
 @dataclass(frozen=True)
 class HMACPermitSignature:
     """Symmetric compatibility backend. Not suitable for an isolated verifier.
 
-    Any holder that can verify also has enough key material to mint permits. v0.3
+    Any holder that can verify also has enough key material to mint permits. v0.4
     therefore rejects this backend at execution gateways unless an explicit test-only
     override is supplied.
     """
@@ -67,47 +86,55 @@ class HMACPermitSignature:
         return hmac.compare_digest(self.sign(payload), signature)
 
 
-class Ed25519PermitSignature:
-    """Optional asymmetric reference backend.
-
-    The private-key form is appropriate for the isolated permit signer. Venues and
-    settlement infrastructure should receive only `public_verifier()`, so compromise
-    of a transport component cannot mint new permits.
-    """
+class Ed25519PermitVerifier:
+    """Public-key-only permit verifier. Holds no signing material and exposes no sign()."""
 
     algorithm = PermitAlgorithm.ED25519
 
-    def __init__(self, signer_id: str, private_key=None, public_key=None) -> None:
+    def __init__(self, signer_id: str, public_key) -> None:
+        if not signer_id:
+            raise ValueError("signer_id is required")
+        if public_key is None:
+            raise ValueError("public_key is required")
+        if has_signing_api(public_key):
+            raise ValueError("permit verifier cannot hold signing-capable key material")
+        self.signer_id = signer_id
+        self._public_key = public_key
+
+    def verify(self, payload: bytes, signature: str) -> bool:
+        return _ed25519_verify(self._public_key, payload, signature)
+
+
+class Ed25519PermitSigner:
+    """Isolated permit minting backend. Venues receive only `public_verifier()`."""
+
+    algorithm = PermitAlgorithm.ED25519
+
+    def __init__(self, signer_id: str, private_key=None) -> None:
         if not signer_id:
             raise ValueError("signer_id is required")
         try:
             from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
         except ImportError as exc:  # pragma: no cover - optional dependency guard
             raise RuntimeError("cryptography is required for Ed25519 permit signatures") from exc
-        if private_key is None and public_key is None:
+        if private_key is None:
             private_key = Ed25519PrivateKey.generate()
+        if not has_signing_api(private_key):
+            raise ValueError("permit signer requires signing-capable private key material")
         self.signer_id = signer_id
         self._private_key = private_key
-        self._public_key = public_key or private_key.public_key()
-        self.can_sign = private_key is not None
+        self._public_key = private_key.public_key()
 
     def sign(self, payload: bytes) -> str:
-        if self._private_key is None:
-            raise PermissionError("public verifier cannot sign permits")
         raw = self._private_key.sign(payload)
         return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
 
-    def verify(self, payload: bytes, signature: str) -> bool:
-        pad = "=" * (-len(signature) % 4)
-        try:
-            raw = base64.urlsafe_b64decode(signature + pad)
-            self._public_key.verify(raw, payload)
-            return True
-        except Exception:
-            return False
+    def public_verifier(self) -> Ed25519PermitVerifier:
+        return Ed25519PermitVerifier(self.signer_id, self._public_key)
 
-    def public_verifier(self) -> "Ed25519PermitSignature":
-        return Ed25519PermitSignature(self.signer_id, public_key=self._public_key)
+
+# Compatibility name used by existing callers; this class is the signer, not a verifier.
+Ed25519PermitSignature = Ed25519PermitSigner
 
 
 class PermitControlStore(Protocol):
@@ -164,15 +191,15 @@ class ConstrainedPermitAuthority:
         self,
         store: PermitControlStore,
         trust: AttestationVerifier,
-        signature: PermitSignatureBackend,
+        signature: PermitSigner,
         *,
         max_permit_ttl_seconds: int = 5,
     ) -> None:
         if max_permit_ttl_seconds <= 0:
             raise ValueError("max_permit_ttl_seconds must be positive")
-        if not getattr(signature, "can_sign", True):
+        if not has_signing_api(signature):
             raise ValueError("permit authority requires a signing-capable private backend")
-        if getattr(trust, "can_sign", False):
+        if has_signing_api(trust):
             raise ValueError("permit authority must receive a verify-only upstream attestation trust store")
         self.store = store
         self.trust = trust
@@ -326,13 +353,13 @@ class ExecutionPermitVerifier:
 
     def __init__(
         self,
-        signature: PermitSignatureBackend,
+        signature: PermitVerifier,
         control_store: PermitControlStore,
         *,
         max_clock_skew_seconds: int = 2,
         allow_signing_backend_for_tests: bool = False,
     ) -> None:
-        if getattr(signature, "can_sign", True) and not allow_signing_backend_for_tests:
+        if has_signing_api(signature) and not allow_signing_backend_for_tests:
             raise ValueError(
                 "execution permit verifier must be verify-only; private/symmetric signing material "
                 "must not enter the execution transport trust domain"

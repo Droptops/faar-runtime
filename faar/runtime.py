@@ -6,7 +6,7 @@ from datetime import datetime
 from typing import Callable, Mapping
 
 from .adapters import AmbiguousExecution, DeterministicFailure, ExecutionAdapter
-from .attestation import AttestationVerifier
+from .attestation import AttestationVerifier, has_signing_api
 from .permits import ConstrainedPermitAuthority, PermitIssuanceError
 from .settlement import SettlementVerifier
 from .canonical import canonical_hash
@@ -63,7 +63,7 @@ class FAARRuntime:
                     "stable intent identity, idempotent submission, stable effect identity, "
                     "permit enforcement, and single-use permit consumption are required"
                 )
-        if getattr(trust, "can_sign", False):
+        if has_signing_api(trust):
             raise ValueError("FAAR runtime must receive a verify-only attestation trust store")
         self.trust = trust
         self.permit_authority = permit_authority
