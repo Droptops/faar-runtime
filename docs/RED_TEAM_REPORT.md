@@ -50,11 +50,11 @@ Method: source review, state-machine analysis, concurrency fault reasoning, dete
 
 ## Executable regression matrix
 
-Current local `make check` result:
+The findings table above records the v0.2 hardening work. The matrix below is the current `make check` result for v0.3.0:
 
 ```text
-75 unit/invariant tests -> PASS
-41 targeted red-team attack classes -> PASS
+105 unit/invariant tests -> PASS
+59 targeted red-team attack classes -> PASS
 160 deterministic denial mutations -> 0 unauthorized economic effects
 100 retries of one logical intent -> 1 successful effect
 ambiguous timeout-after-effect recovery -> 1 successful effect
@@ -62,6 +62,7 @@ ambiguous timeout-after-effect recovery -> 1 successful effect
 96 seeded replay/concurrency state-machine scenarios -> 0 aggregate-budget violations
 CLI end-to-end mock execution -> FINALIZED once
 evidence chain verification -> valid
+bounded permit protocol model -> 0 invariant violations; stale permit consumable after revoke = false
 ```
 
 The deterministic denial count covers attacks stopped **before the trusted adapter is permitted to create an effect**. A malicious adapter remains part of the TCB; post-effect amount checks can detect a bad effect report but cannot magically undo a venue action the adapter already performed.
@@ -120,6 +121,6 @@ v0.2 uses the adapter's authoritative reconciliation interface. A stronger live 
 
 The strongest supportable claim is narrow:
 
-> Under the current deterministic mock/paper adapter model and the encoded fault classes, FAAR v0.2 preserves the tested authorization, bounded-capability, replay/recovery, aggregate-usage, and settlement-integrity invariants.
+> Under the current deterministic mock/paper adapter model and the encoded fault classes, FAAR v0.3.0 preserves the tested authorization, bounded-capability, replay/recovery, aggregate-usage, and settlement-integrity invariants.
 
 It is **not** a production-security claim, live-venue claim, custody claim, or proof that a compromised trusted adapter cannot move funds incorrectly.

@@ -1,6 +1,6 @@
 # Security Policy
 
-FAAR is pre-alpha security-sensitive financial infrastructure. v0.2 is a hardened reference runtime, not a live-money release.
+FAAR is pre-alpha security-sensitive financial infrastructure. v0.3.0 is a hardened reference runtime, not a live-money release.
 
 ## Current status
 
