@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Targeted red-team regression matrix for FAAR v0.2.
+"""Targeted red-team regression matrix for FAAR v0.3.
 
 The unit suite contains the detailed assertions. This script produces a compact,
 reviewer-facing readout of the attack classes the implementation currently blocks.
@@ -54,6 +54,24 @@ ATTACK_CLASSES = [
     "adapter evidence shadowing normalized settlement fields",
     "future-dated signed task-contract use",
     "PAY settlement amount under/over-match",
+    "execution permit request-hash broadening",
+    "stale permit after pause/revoke epoch change",
+    "single-use permit replay at capability gateway",
+    "symmetric/private permit key leakage into execution gateway",
+    "fresh retry risk-state reuse by another intent",
+    "submitter receipt self-finalization",
+    "settlement request-binding mismatch",
+    "unexpected permit signer failure before adapter",
+    "submitter deterministic failure hiding observed effect",
+    "duplicate settlement verifier identity in quorum",
+    "same verifier object counted twice in quorum",
+    "observed effect rebound to different execution request",
+    "durable cross-process same-intent lease contention",
+    "untrusted evidence depth/width resource exhaustion",
+    "signing-capable attestation trust entering runtime",
+    "signing-capable attestation trust entering permit authority",
+    "verify-only Ed25519 trust store cannot mint attestations",
+    "settlement verifier and submitter object identity collapse",
 ]
 
 
@@ -61,7 +79,7 @@ def main() -> None:
     cmd = [sys.executable, "-m", "unittest", "discover", "-s", "test", "-p", "test_*.py"]
     completed = subprocess.run(cmd, capture_output=True, text=True)
     report = {
-        "suite": "FAAR v0.2 targeted red-team matrix",
+        "suite": "FAAR v0.3 targeted red-team matrix",
         "attack_classes": len(ATTACK_CLASSES),
         "classes": ATTACK_CLASSES,
         "unit_suite_exit_code": completed.returncode,

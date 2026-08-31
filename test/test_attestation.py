@@ -4,7 +4,7 @@ import hashlib
 import hmac
 import unittest
 
-from faar.attestation import HMACTrustStore
+from faar.attestation import Ed25519TrustStore, HMACTrustStore
 from faar.canonical import canonical_hash
 from faar.models import Attestation, AttestationKind
 from support import AUTH, NOW, TRUST_KEYS, TRUST_KEY_KINDS, intent
@@ -39,6 +39,26 @@ class AttestationScopeTests(unittest.TestCase):
         )
         self.assertFalse(ok)
         self.assertIn("ATTESTATION_KEY_KIND_NOT_ALLOWED", reasons)
+
+
+    def test_ed25519_public_verifier_validates_but_cannot_sign(self):
+        i = intent()
+        signer = Ed25519TrustStore.generate(TRUST_KEY_KINDS)
+        verifier = signer.public_verifier()
+        att = signer.sign(
+            "authority-test", AttestationKind.AUTHORITY, AUTH, i,
+            issued_at=NOW, ttl_seconds=20,
+        )
+        ok, reasons = verifier.verify(
+            att, kind=AttestationKind.AUTHORITY, subject=AUTH, intent=i, now=NOW
+        )
+        self.assertTrue(ok, reasons)
+        self.assertFalse(verifier.can_sign)
+        with self.assertRaises(PermissionError):
+            verifier.sign(
+                "authority-test", AttestationKind.AUTHORITY, AUTH, i,
+                issued_at=NOW, ttl_seconds=20,
+            )
 
     def test_key_scope_configuration_must_cover_exact_key_set(self):
         with self.assertRaises(ValueError):

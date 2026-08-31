@@ -15,7 +15,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 from faar.adapters import MockMode, MockVenue
-from faar.attestation import HMACTrustStore
+from faar.attestation import Ed25519TrustStore
 from faar.canonical import canonical_hash
 from faar.models import (
     AttestationKind,
@@ -30,6 +30,8 @@ from faar.models import (
     RiskSnapshot,
 )
 from faar.runtime import FAARRuntime
+from faar.permits import ConstrainedPermitAuthority, Ed25519PermitSignature, ExecutionPermitVerifier
+from faar.settlement import MockSettlementVerifier
 from faar.store import SQLiteIntentStore
 
 
@@ -47,6 +49,7 @@ AUTH = AuthorityDecision(AuthorityPosture.EXECUTE, AuthorityPrimitive.EXECUTE_AC
 
 def make_grant(*, daily_cap: str = "100", attempts: int = 3) -> CapabilityGrant:
     return CapabilityGrant(
+        principal_id="principal:test",
         grant_id="grant:fuzz",
         version=1,
         actor_id="agent:fuzz",
@@ -74,6 +77,7 @@ def make_grant(*, daily_cap: str = "100", attempts: int = 3) -> CapabilityGrant:
 
 def make_intent(iid: str, amount: int) -> Intent:
     return Intent(
+        principal_id="principal:test",
         intent_id=iid,
         actor_id="agent:fuzz",
         grant_id="grant:fuzz",
@@ -110,7 +114,7 @@ def make_risk(version: int) -> RiskSnapshot:
     )
 
 
-def signed(trust: HMACTrustStore, i: Intent, r: RiskSnapshot):
+def signed(trust: Ed25519TrustStore, i: Intent, r: RiskSnapshot):
     return (
         trust.sign("auth", AttestationKind.AUTHORITY, AUTH, i, issued_at=NOW, ttl_seconds=30),
         trust.sign("risk", AttestationKind.RISK, r, i, issued_at=NOW, ttl_seconds=30),
@@ -122,9 +126,13 @@ def replay_fuzz(seed: int) -> None:
     store = SQLiteIntentStore(":memory:")
     grant = make_grant(daily_cap="500")
     store.provision_grant(grant, canonical_hash(grant))
-    venue = MockVenue(name="mock-dex", mode=rng.choice(list(MockMode)))
-    trust = HMACTrustStore(KEYS, key_kinds=KEY_KINDS)
-    runtime = FAARRuntime(store, {"mock-dex": venue}, trust, allow_test_time_override=True)
+    trust = Ed25519TrustStore.generate(KEY_KINDS)
+    permit_sig = Ed25519PermitSignature("fuzz-permit")
+    permit_authority = ConstrainedPermitAuthority(store, trust.public_verifier(), permit_sig)
+    permit_verifier = ExecutionPermitVerifier(permit_sig.public_verifier(), store)
+    venue = MockVenue(permit_verifier=permit_verifier, name="mock-dex", mode=rng.choice(list(MockMode)), clock=lambda: NOW)
+    settlement = MockSettlementVerifier(venue)
+    runtime = FAARRuntime(store, {"mock-dex": venue}, trust.public_verifier(), permit_authority, {"mock-dex": settlement}, allow_test_time_override=True)
     i = make_intent(f"fuzz_replay_{seed:04d}_000000000", 25)
     r = make_risk(1)
     aa, ra = signed(trust, i, r)
@@ -141,9 +149,13 @@ def concurrent_budget_fuzz(seed: int) -> None:
     store = SQLiteIntentStore(":memory:")
     grant = make_grant(daily_cap="100")
     store.provision_grant(grant, canonical_hash(grant))
-    venue = MockVenue(name="mock-dex", mode=MockMode.SUCCESS)
-    trust = HMACTrustStore(KEYS, key_kinds=KEY_KINDS)
-    runtime = FAARRuntime(store, {"mock-dex": venue}, trust, allow_test_time_override=True)
+    trust = Ed25519TrustStore.generate(KEY_KINDS)
+    permit_sig = Ed25519PermitSignature("fuzz-permit")
+    permit_authority = ConstrainedPermitAuthority(store, trust.public_verifier(), permit_sig)
+    permit_verifier = ExecutionPermitVerifier(permit_sig.public_verifier(), store)
+    venue = MockVenue(permit_verifier=permit_verifier, name="mock-dex", mode=MockMode.SUCCESS, clock=lambda: NOW)
+    settlement = MockSettlementVerifier(venue)
+    runtime = FAARRuntime(store, {"mock-dex": venue}, trust.public_verifier(), permit_authority, {"mock-dex": settlement}, allow_test_time_override=True)
 
     jobs = []
     for idx in range(8):
@@ -188,7 +200,7 @@ def main() -> None:
         concurrent_budget_fuzz(seed)
 
     print(json.dumps({
-        "suite": "FAAR v0.2 seeded state-machine fuzz",
+        "suite": "FAAR v0.3 seeded state-machine fuzz",
         "replay_seeds": replay_seeds,
         "concurrent_budget_seeds": budget_seeds,
         "total_seed_scenarios": replay_seeds + budget_seeds,

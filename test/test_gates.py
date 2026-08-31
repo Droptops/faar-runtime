@@ -12,6 +12,7 @@ from support import NOW
 class GateTests(unittest.TestCase):
     def test_risk_source_disagreement_fails_closed(self):
         grant = CapabilityGrant(
+            principal_id="principal:test",
             grant_id="g", version=1, actor_id="a", status=GrantStatus.ACTIVE,
             allowed_primitives=frozenset({EconomicPrimitive.BUY}), allowed_venues=frozenset({"v"}),
             allowed_assets=frozenset({"AAA", "USD"}),
@@ -21,6 +22,7 @@ class GateTests(unittest.TestCase):
             ),
         )
         intent = Intent(
+            principal_id="principal:test",
             intent_id="intent_1234567890123456", actor_id="a", grant_id="g", grant_version=1,
             primitive=EconomicPrimitive.BUY, venue="v", created_at=NOW,
             expires_at=NOW + timedelta(minutes=1), payload={"amount_usd": "10"},
@@ -32,6 +34,7 @@ class GateTests(unittest.TestCase):
 
     def test_nonfinite_risk_value_fails_closed(self):
         grant = CapabilityGrant(
+            principal_id="principal:test",
             grant_id="g", version=1, actor_id="a", status=GrantStatus.ACTIVE,
             allowed_primitives=frozenset({EconomicPrimitive.BUY}), allowed_venues=frozenset({"v"}),
             allowed_assets=frozenset({"AAA", "USD"}),
@@ -42,6 +45,7 @@ class GateTests(unittest.TestCase):
             ),
         )
         intent = Intent(
+            principal_id="principal:test",
             intent_id="intent_nonfinite_000001", actor_id="a", grant_id="g", grant_version=1,
             primitive=EconomicPrimitive.BUY, venue="v", created_at=NOW,
             expires_at=NOW + timedelta(seconds=10), payload={"amount_usd": "10"},
@@ -54,6 +58,7 @@ class GateTests(unittest.TestCase):
     def test_money_moving_grant_cannot_be_unbounded(self):
         with self.assertRaisesRegex(ValueError, "max_order_usd"):
             CapabilityGrant(
+                principal_id="principal:test",
                 grant_id="g-unbounded-order", version=1, actor_id="a", status=GrantStatus.ACTIVE,
                 allowed_primitives=frozenset({EconomicPrimitive.BUY}), allowed_venues=frozenset({"v"}),
                 allowed_assets=frozenset({"AAA", "USD"}),
@@ -65,6 +70,7 @@ class GateTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "max_daily_turnover_usd"):
             CapabilityGrant(
+                principal_id="principal:test",
                 grant_id="g-unbounded-daily", version=1, actor_id="a", status=GrantStatus.ACTIVE,
                 allowed_primitives=frozenset({EconomicPrimitive.BUY}), allowed_venues=frozenset({"v"}),
                 allowed_assets=frozenset({"AAA", "USD"}),
@@ -77,6 +83,7 @@ class GateTests(unittest.TestCase):
     def test_grant_requires_explicit_scope_and_velocity(self):
         with self.assertRaisesRegex(ValueError, "allowed_assets"):
             CapabilityGrant(
+                principal_id="principal:test",
                 grant_id="g-no-assets", version=1, actor_id="a", status=GrantStatus.ACTIVE,
                 allowed_primitives=frozenset({EconomicPrimitive.BUY}), allowed_venues=frozenset({"v"}),
                 limits=CapabilityLimits(
@@ -86,6 +93,7 @@ class GateTests(unittest.TestCase):
             )
         with self.assertRaisesRegex(ValueError, "allowed_targets"):
             CapabilityGrant(
+                principal_id="principal:test",
                 grant_id="g-no-targets", version=1, actor_id="a", status=GrantStatus.ACTIVE,
                 allowed_primitives=frozenset({EconomicPrimitive.SWAP}), allowed_venues=frozenset({"v"}),
                 allowed_assets=frozenset({"AAA", "USD"}),
@@ -96,6 +104,7 @@ class GateTests(unittest.TestCase):
             )
         with self.assertRaisesRegex(ValueError, "max_actions_per_window"):
             CapabilityGrant(
+                principal_id="principal:test",
                 grant_id="g-no-velocity", version=1, actor_id="a", status=GrantStatus.ACTIVE,
                 allowed_primitives=frozenset({EconomicPrimitive.BUY}), allowed_venues=frozenset({"v"}),
                 allowed_assets=frozenset({"AAA", "USD"}),

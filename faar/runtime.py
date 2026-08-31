@@ -7,6 +7,8 @@ from typing import Callable, Mapping
 
 from .adapters import AmbiguousExecution, DeterministicFailure, ExecutionAdapter
 from .attestation import AttestationVerifier
+from .permits import ConstrainedPermitAuthority, PermitIssuanceError
+from .settlement import SettlementVerifier
 from .canonical import canonical_hash
 from .gates import evaluate_authority, evaluate_capability, evaluate_risk
 from .models import (
@@ -25,7 +27,7 @@ from .models import (
     Verdict,
     utcnow,
 )
-from .store import EffectConflict, GrantConflict, SQLiteIntentStore, TERMINAL_STATES, UnknownGrant
+from .store import EffectConflict, GrantConflict, IntentBusy, SQLiteIntentStore, TERMINAL_STATES, UnknownGrant
 
 
 @dataclass(frozen=True)
@@ -45,6 +47,8 @@ class FAARRuntime:
         store: SQLiteIntentStore,
         adapters: Mapping[str, ExecutionAdapter],
         trust: AttestationVerifier,
+        permit_authority: ConstrainedPermitAuthority,
+        settlement_verifiers: Mapping[str, SettlementVerifier],
         *,
         clock: Callable[[], datetime] = utcnow,
         allow_test_time_override: bool = False,
@@ -56,10 +60,22 @@ class FAARRuntime:
             if profile is None or not profile.exactly_once_compatible:
                 raise ValueError(
                     f"adapter {name!r} is not exactly-once compatible: "
-                    "stable intent identity, idempotent submission, authoritative reconciliation, "
-                    "and stable effect identity are required"
+                    "stable intent identity, idempotent submission, stable effect identity, "
+                    "permit enforcement, and single-use permit consumption are required"
                 )
+        if getattr(trust, "can_sign", False):
+            raise ValueError("FAAR runtime must receive a verify-only attestation trust store")
         self.trust = trust
+        self.permit_authority = permit_authority
+        self.settlement_verifiers = dict(settlement_verifiers)
+        if set(self.settlement_verifiers) != set(self.adapters):
+            raise ValueError("every execution adapter must have exactly one configured settlement verifier")
+        for name, verifier in self.settlement_verifiers.items():
+            if verifier is self.adapters[name]:
+                raise ValueError(f"settlement verifier {name!r} must be a distinct component from the submitter")
+            profile = getattr(verifier, "security_profile", None)
+            if profile is None or not profile.trusted:
+                raise ValueError(f"settlement verifier {name!r} does not satisfy the trusted verification profile")
         self.clock = clock
         self.allow_test_time_override = allow_test_time_override
 
@@ -72,6 +88,37 @@ class FAARRuntime:
         return self.clock()
 
     def process(
+        self,
+        intent: Intent,
+        authority: AuthorityDecision,
+        grant: CapabilityGrant,
+        risk: RiskSnapshot,
+        *,
+        authority_attestation: Attestation,
+        risk_attestation: Attestation,
+        now: datetime | None = None,
+    ) -> RuntimeResult:
+        # Bind the canonical payload before waiting on the lease. A competing caller
+        # cannot hide a changed payload behind an already-running intent id.
+        stored = self.store.register(intent, canonical_hash(intent))
+        if stored.state in TERMINAL_STATES:
+            return self._stored_result(stored, replayed=True)
+        try:
+            with self.store.intent_guard(intent.intent_id):
+                return self._process_unlocked(
+                    intent, authority, grant, risk,
+                    authority_attestation=authority_attestation,
+                    risk_attestation=risk_attestation, now=now,
+                )
+        except IntentBusy:
+            current = self.store.get(intent.intent_id)
+            return RuntimeResult(
+                intent_id=intent.intent_id, state=current.state, effect_id=current.effect_id,
+                reason_codes=("INTENT_BUSY",), replayed=True,
+                submission_count=current.submission_count,
+            )
+
+    def _process_unlocked(
         self,
         intent: Intent,
         authority: AuthorityDecision,
@@ -100,7 +147,7 @@ class FAARRuntime:
         if existing.state in TERMINAL_STATES:
             return self._stored_result(existing, replayed=True)
 
-        runtime_grant_status = self.store.get_grant_status(grant.grant_id, grant.version)
+        runtime_grant_status = self.store.get_grant_status(grant.principal_id, grant.grant_id, grant.version)
         if runtime_grant_status != "ACTIVE":
             reason = f"GRANT_RUNTIME_{runtime_grant_status}"
             if existing.state == IntentState.PROPOSED:
@@ -311,7 +358,7 @@ class FAARRuntime:
                     )
                 decisions = fresh_decisions
 
-            status = self.store.get_grant_status(grant.grant_id, grant.version)
+            status = self.store.get_grant_status(grant.principal_id, grant.grant_id, grant.version)
             if status != "ACTIVE":
                 return self._stop_execution_state(
                     intent.intent_id,
@@ -348,89 +395,146 @@ class FAARRuntime:
                     _allow_resubmit=reauth is not None,
                 )
 
+            request = ExecutionRequest.from_intent(intent)
+            try:
+                permit = self.permit_authority.issue(
+                    request,
+                    intent=intent,
+                    authority=reauth[0] if reauth else None,  # type: ignore[arg-type]
+                    grant=grant,
+                    risk=reauth[1] if reauth else None,  # type: ignore[arg-type]
+                    authority_attestation=reauth[2] if reauth else None,  # type: ignore[arg-type]
+                    risk_attestation=reauth[3] if reauth else None,  # type: ignore[arg-type]
+                    now=submit_now,
+                )
+            except PermitIssuanceError as exc:
+                reasons = ("EXECUTION_PERMIT_REJECTED",) + exc.reasons
+                self.store.transition(intent.intent_id, IntentState.SUBMITTED, IntentState.FAILED_SAFE, reason_codes=reasons)
+                self.store.release_usage(intent.intent_id)
+                self.store.add_evidence(intent.intent_id, "execution_permit_rejected", {"reason_codes": list(exc.reasons), "attempt": attempt})
+                return self._current_result(intent.intent_id, decisions=decisions, reason_codes=reasons)
+            except Exception as exc:
+                # Permit issuance happens before the adapter sees anything, so an
+                # unexpected signer/store failure is fail-safe rather than economically
+                # ambiguous. No external execution capability was transported.
+                reasons = ("EXECUTION_PERMIT_EXCEPTION",)
+                self.store.transition(intent.intent_id, IntentState.SUBMITTED, IntentState.FAILED_SAFE, reason_codes=reasons)
+                self.store.release_usage(intent.intent_id)
+                self.store.add_evidence(intent.intent_id, "execution_permit_exception", {
+                    "type": type(exc).__name__, "message": str(exc), "attempt": attempt,
+                })
+                return self._current_result(intent.intent_id, decisions=decisions, reason_codes=reasons)
+
             self.store.add_evidence(intent.intent_id, "submission_started", {
                 "venue": intent.venue,
                 "attempt": attempt,
+                "permit_id": permit.permit.permit_id,
+                "permit_hash": canonical_hash(permit),
+                "grant_epoch": permit.permit.grant_epoch,
+                "fence_token": permit.permit.fence_token,
             })
             try:
-                receipt = adapter.execute(ExecutionRequest.from_intent(intent))
+                receipt = adapter.execute(request, permit)
             except AmbiguousExecution as exc:
                 self.store.transition(intent.intent_id, IntentState.SUBMITTED, IntentState.UNKNOWN, reason_codes=("EXECUTION_AMBIGUOUS",))
                 self.store.add_evidence(intent.intent_id, "execution_ambiguous", {"message": str(exc), "attempt": attempt})
                 return self.reconcile(
-                    intent,
-                    grant=grant,
+                    intent, grant=grant,
                     authority=reauth[0] if reauth else None,
                     risk=reauth[1] if reauth else None,
                     authority_attestation=reauth[2] if reauth else None,
                     risk_attestation=reauth[3] if reauth else None,
-                    now=now,
-                    decisions=decisions,
-                    _allow_resubmit=reauth is not None,
+                    now=now, decisions=decisions, _allow_resubmit=reauth is not None,
                 )
             except DeterministicFailure as exc:
-                reasons = ("EXECUTION_DETERMINISTIC_FAILURE",)
-                self.store.transition(intent.intent_id, IntentState.SUBMITTED, IntentState.FAILED_SAFE, reason_codes=reasons)
-                self.store.release_usage(intent.intent_id)
-                self.store.add_evidence(intent.intent_id, "execution_failed_safe", {"message": str(exc), "attempt": attempt})
-                return self._current_result(intent.intent_id, decisions=decisions, reason_codes=reasons)
-            except Exception as exc:  # adapter crash is economically ambiguous
-                reasons = ("ADAPTER_EXECUTION_EXCEPTION",)
-                self.store.transition(intent.intent_id, IntentState.SUBMITTED, IntentState.UNKNOWN, reason_codes=reasons)
-                self.store.add_evidence(intent.intent_id, "adapter_execution_exception", {
-                    "type": type(exc).__name__,
-                    "message": str(exc),
-                    "attempt": attempt,
-                })
-                return self._current_result(intent.intent_id, decisions=decisions, reason_codes=reasons)
-
-        integrity_reason = self._effect_integrity_reason(self.store.get(intent.intent_id).effect_id, receipt.status, receipt.effect_id)
-        if integrity_reason:
-            return self._stop_execution_state(intent.intent_id, (integrity_reason,), decisions, release_usage=False)
-        amount_reason = self._effect_amount_integrity_reason(intent, receipt.status, receipt.amount_usd)
-        if amount_reason:
-            return self._stop_execution_state(intent.intent_id, (amount_reason,), decisions, release_usage=False)
-
-        if receipt.status not in {SettlementStatus.CONFIRMED, SettlementStatus.FINALIZED}:
-            self.store.transition(intent.intent_id, IntentState.SUBMITTED, IntentState.UNKNOWN, reason_codes=("EXECUTION_NOT_SETTLED",))
-            return self.reconcile(
-                intent,
-                grant=grant,
-                authority=reauth[0] if reauth else None,
-                risk=reauth[1] if reauth else None,
-                authority_attestation=reauth[2] if reauth else None,
-                risk_attestation=reauth[3] if reauth else None,
-                now=now,
-                decisions=decisions,
-                _allow_resubmit=reauth is not None,
-            )
-
-        if receipt.status == SettlementStatus.CONFIRMED:
-            try:
-                self.store.transition(intent.intent_id, IntentState.SUBMITTED, IntentState.CONFIRMED, effect_id=receipt.effect_id)
-            except EffectConflict:
-                return self._stop_execution_state(
-                    intent.intent_id, ("EFFECT_ID_ALREADY_CLAIMED",), decisions, release_usage=False
+                # A submitter is not allowed to prove non-execution. Even a
+                # deterministic-looking rejection is independently reconciled before
+                # held budget is released. The verifier may still find an effect.
+                self.store.transition(
+                    intent.intent_id, IntentState.SUBMITTED, IntentState.UNKNOWN,
+                    reason_codes=("EXECUTION_DETERMINISTIC_FAILURE_UNVERIFIED",),
                 )
-            evidence = dict(receipt.evidence)
-            evidence["amount_usd"] = format(receipt.amount_usd, "f") if receipt.amount_usd is not None else None
-            self.store.add_evidence(intent.intent_id, "execution_confirmed", evidence)
-            return self._current_result(intent.intent_id, decisions=decisions, effect_id=receipt.effect_id)
+                self.store.add_evidence(intent.intent_id, "adapter_rejection_untrusted", {
+                    "message": str(exc), "attempt": attempt,
+                })
+                return self.reconcile(
+                    intent, grant=grant,
+                    authority=reauth[0] if reauth else None,
+                    risk=reauth[1] if reauth else None,
+                    authority_attestation=reauth[2] if reauth else None,
+                    risk_attestation=reauth[3] if reauth else None,
+                    now=now, decisions=decisions, _allow_resubmit=False,
+                    _block_reason="EXECUTION_DETERMINISTIC_FAILURE",
+                )
+            except Exception as exc:
+                # Adapter crashes are economically ambiguous. The independent
+                # verifier, never the submitter, decides whether an effect exists.
+                self.store.transition(intent.intent_id, IntentState.SUBMITTED, IntentState.UNKNOWN, reason_codes=("ADAPTER_EXECUTION_EXCEPTION",))
+                self.store.add_evidence(intent.intent_id, "adapter_execution_exception", {
+                    "type": type(exc).__name__, "message": str(exc), "attempt": attempt,
+                })
+                return self.reconcile(
+                    intent, grant=grant,
+                    authority=reauth[0] if reauth else None,
+                    risk=reauth[1] if reauth else None,
+                    authority_attestation=reauth[2] if reauth else None,
+                    risk_attestation=reauth[3] if reauth else None,
+                    now=now, decisions=decisions, _allow_resubmit=reauth is not None,
+                )
 
-        try:
-            self.store.transition(intent.intent_id, IntentState.SUBMITTED, IntentState.CONFIRMED, effect_id=receipt.effect_id)
-            self.store.transition(intent.intent_id, IntentState.CONFIRMED, IntentState.FINALIZED, effect_id=receipt.effect_id)
-        except EffectConflict:
-            return self._stop_execution_state(
-                intent.intent_id, ("EFFECT_ID_ALREADY_CLAIMED",), decisions, release_usage=False
-            )
-        self.store.commit_usage(intent.intent_id)
-        evidence = dict(receipt.evidence)
-        evidence["amount_usd"] = format(receipt.amount_usd, "f") if receipt.amount_usd is not None else None
-        self.store.add_evidence(intent.intent_id, "execution_finalized", evidence)
-        return self._current_result(intent.intent_id, decisions=decisions, effect_id=receipt.effect_id)
+        # A submitter receipt is telemetry, not settlement authority. Never persist
+        # its effect id or amount as economic truth. Only the configured independent
+        # settlement verifier may advance CONFIRMED/FINALIZED.
+        self.store.add_evidence(intent.intent_id, "adapter_receipt_untrusted", {
+            "reported_status": receipt.status.value,
+            "reported_effect_id": receipt.effect_id,
+            "reported_amount_usd": format(receipt.amount_usd, "f") if receipt.amount_usd is not None else None,
+            "evidence": dict(receipt.evidence),
+        })
+        self.store.transition(
+            intent.intent_id, IntentState.SUBMITTED, IntentState.UNKNOWN,
+            reason_codes=("AWAITING_INDEPENDENT_SETTLEMENT",),
+        )
+        return self.reconcile(
+            intent, grant=grant,
+            authority=reauth[0] if reauth else None,
+            risk=reauth[1] if reauth else None,
+            authority_attestation=reauth[2] if reauth else None,
+            risk_attestation=reauth[3] if reauth else None,
+            now=now, decisions=decisions, _allow_resubmit=reauth is not None,
+        )
 
     def reconcile(
+        self,
+        intent: Intent,
+        *,
+        grant: CapabilityGrant,
+        authority: AuthorityDecision | None = None,
+        risk: RiskSnapshot | None = None,
+        authority_attestation: Attestation | None = None,
+        risk_attestation: Attestation | None = None,
+        now: datetime | None = None,
+        decisions: tuple[Decision, ...] = (),
+        _allow_resubmit: bool = True,
+        _block_reason: str | None = None,
+    ) -> RuntimeResult:
+        try:
+            with self.store.intent_guard(intent.intent_id):
+                return self._reconcile_unlocked(
+                    intent, grant=grant, authority=authority, risk=risk,
+                    authority_attestation=authority_attestation, risk_attestation=risk_attestation,
+                    now=now, decisions=decisions, _allow_resubmit=_allow_resubmit,
+                    _block_reason=_block_reason,
+                )
+        except IntentBusy:
+            current = self.store.get(intent.intent_id)
+            return RuntimeResult(
+                intent_id=intent.intent_id, state=current.state, decisions=decisions,
+                effect_id=current.effect_id, reason_codes=("INTENT_BUSY",), replayed=True,
+                submission_count=current.submission_count,
+            )
+
+    def _reconcile_unlocked(
         self,
         intent: Intent,
         *,
@@ -461,9 +565,11 @@ class FAARRuntime:
         elif stored.state != IntentState.RECONCILING:
             return self._stored_result(stored, decisions=decisions, replayed=True)
 
-        adapter = self.adapters[intent.venue]
+        verifier = self.settlement_verifiers[intent.venue]
+        request = ExecutionRequest.from_intent(intent)
+        request_hash = canonical_hash(request)
         try:
-            settlement = adapter.reconcile(ExecutionRequest.from_intent(intent))
+            settlement = verifier.verify(request)
         except Exception as exc:
             reasons = ("RECONCILIATION_EXCEPTION",)
             self.store.transition(intent.intent_id, IntentState.RECONCILING, IntentState.UNKNOWN, reason_codes=reasons)
@@ -478,8 +584,15 @@ class FAARRuntime:
             "effect_id": settlement.effect_id,
             "amount_usd": format(settlement.amount_usd, "f") if settlement.amount_usd is not None else None,
             "authoritative": settlement.authoritative,
+            "verified_request_hash": settlement.verified_request_hash,
             "evidence": dict(settlement.evidence),
         })
+
+        if settlement.authoritative and settlement.verified_request_hash != request_hash:
+            return self._stop_execution_state(
+                intent.intent_id, ("SETTLEMENT_REQUEST_BINDING_MISMATCH",), decisions,
+                effect_id=previous_effect_id, release_usage=False, replayed=True,
+            )
 
         integrity_reason = self._effect_integrity_reason(previous_effect_id, settlement.status, settlement.effect_id)
         if integrity_reason:
@@ -538,9 +651,16 @@ class FAARRuntime:
             # or considering a retry is safe.
             if not _allow_resubmit:
                 reason = _block_reason or "RESUBMISSION_BLOCKED"
-                self.store.transition(intent.intent_id, IntentState.RECONCILING, IntentState.STOPPED, reason_codes=(reason,))
+                target = (
+                    IntentState.FAILED_SAFE
+                    if reason == "EXECUTION_DETERMINISTIC_FAILURE"
+                    else IntentState.STOPPED
+                )
+                self.store.transition(intent.intent_id, IntentState.RECONCILING, target, reason_codes=(reason,))
                 self.store.release_usage(intent.intent_id)
-                self.store.add_evidence(intent.intent_id, "resubmission_blocked", {"reason": reason})
+                self.store.add_evidence(intent.intent_id, "resubmission_blocked", {
+                    "reason": reason, "authoritative_none": True, "terminal_state": target.value,
+                })
                 return self._current_result(intent.intent_id, decisions=decisions, reason_codes=(reason,), replayed=True)
 
             if decision_now > intent.expires_at:
@@ -553,7 +673,7 @@ class FAARRuntime:
                 self.store.transition(intent.intent_id, IntentState.RECONCILING, IntentState.STOPPED, reason_codes=reasons)
                 self.store.release_usage(intent.intent_id)
                 return self._current_result(intent.intent_id, decisions=decisions, reason_codes=reasons, replayed=True)
-            if self.store.get_grant_status(grant.grant_id, grant.version) != "ACTIVE":
+            if self.store.get_grant_status(grant.principal_id, grant.grant_id, grant.version) != "ACTIVE":
                 reasons = ("GRANT_NOT_ACTIVE_BEFORE_RESUBMIT",)
                 self.store.transition(intent.intent_id, IntentState.RECONCILING, IntentState.STOPPED, reason_codes=reasons)
                 self.store.release_usage(intent.intent_id)

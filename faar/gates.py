@@ -134,6 +134,8 @@ def evaluate_capability(intent: Intent, grant: CapabilityGrant, now: datetime) -
     # frozen field here would make a PAUSED grant impossible to resume without
     # mutating its fingerprint.
 
+    if intent.principal_id != grant.principal_id:
+        reasons.append("PRINCIPAL_MISMATCH")
     if intent.actor_id != grant.actor_id:
         reasons.append("ACTOR_MISMATCH")
     if intent.grant_id != grant.grant_id:

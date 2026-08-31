@@ -40,6 +40,19 @@ class CanonicalizationTests(unittest.TestCase):
         from faar.canonical import canonical_json
         with self.assertRaisesRegex(ValueError, "Decimal .* bounds"):
             canonical_json({"amount": Decimal("1e100000000")})
+    def test_deeply_nested_untrusted_data_is_bounded(self):
+        from faar.models import SettlementRecord, SettlementStatus
+        nested = "leaf"
+        for _ in range(30):
+            nested = {"x": nested}
+        with self.assertRaisesRegex(ValueError, "nesting depth"):
+            SettlementRecord(SettlementStatus.UNKNOWN, evidence=nested)
+
+    def test_oversized_untrusted_container_is_bounded(self):
+        from faar.models import SettlementRecord, SettlementStatus
+        with self.assertRaisesRegex(ValueError, "item count"):
+            SettlementRecord(SettlementStatus.UNKNOWN, evidence={str(i): i for i in range(300)})
+
 
 
 if __name__ == "__main__":

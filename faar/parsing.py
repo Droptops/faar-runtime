@@ -6,6 +6,7 @@ from typing import Any
 
 from .models import (
     Attestation,
+    AttestationAlgorithm,
     AttestationKind,
     AuthorityDecision,
     AuthorityPosture,
@@ -71,17 +72,19 @@ def parse_attestation(data: dict[str, Any]) -> Attestation:
     return Attestation(
         kind=AttestationKind(data["kind"]),
         key_id=data["key_id"],
+        algorithm=AttestationAlgorithm(data["algorithm"]),
         subject_hash=data["subject_hash"],
         intent_hash=data["intent_hash"],
         issued_at=_dt(data["issued_at"]),
         expires_at=_dt(data["expires_at"]),
-        mac=data["mac"],
+        signature=data["signature"],
     )
 
 
 def parse_intent(data: dict[str, Any]) -> Intent:
     return Intent(
-        schema_version=data.get("schema_version", "0.2"),
+        schema_version=data.get("schema_version", "0.3"),
+        principal_id=data["principal_id"],
         intent_id=data["intent_id"],
         actor_id=data["actor_id"],
         grant_id=data["grant_id"],
@@ -113,6 +116,7 @@ def parse_grant(data: dict[str, Any]) -> CapabilityGrant:
         max_submission_attempts=_int(raw_limits.get("max_submission_attempts", 2), "max_submission_attempts"),
     )
     return CapabilityGrant(
+        principal_id=data["principal_id"],
         grant_id=data["grant_id"],
         version=_int(data["version"], "grant version"),
         actor_id=data["actor_id"],

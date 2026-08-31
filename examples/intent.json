@@ -1,5 +1,6 @@
 {
-  "schema_version": "0.2",
+  "schema_version": "0.3",
+  "principal_id": "principal:demo",
   "intent_id": "intent_demo_000000000001",
   "actor_id": "agent:meme-quant-01",
   "grant_id": "grant:demo",
@@ -14,5 +15,7 @@
     "amount_usd": "50.00",
     "target": "router:approved-v1"
   },
-  "metadata": {"strategy": "demo"}
+  "metadata": {
+    "strategy": "demo"
+  }
 }

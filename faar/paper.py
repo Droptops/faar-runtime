@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass, field
+from datetime import datetime
 from decimal import Decimal
 from threading import RLock
+from typing import Callable
 
 from .adapters import AdapterSecurityProfile, DeterministicFailure, REFERENCE_SAFE_PROFILE
-from .canonical import canonical_json
-from .models import EconomicPrimitive, ExecutionReceipt, ExecutionRequest, SettlementRecord, SettlementStatus
+from .canonical import canonical_hash, canonical_json
+from .models import EconomicPrimitive, ExecutionReceipt, ExecutionRequest, SettlementRecord, SettlementStatus, SignedExecutionPermit, utcnow
+from .permits import ExecutionPermitVerifier
 
 
 @dataclass
@@ -20,6 +23,8 @@ class PaperTradingVenue:
 
     name: str
     prices_usd: dict[str, Decimal]
+    permit_verifier: ExecutionPermitVerifier
+    clock: Callable[[], datetime] = utcnow
     balances: dict[str, Decimal] = field(default_factory=dict)
     security_profile: AdapterSecurityProfile = REFERENCE_SAFE_PROFILE
 
@@ -49,11 +54,20 @@ class PaperTradingVenue:
     def _credit(self, asset: str, quantity: Decimal) -> None:
         self.balances[asset] = self.balances.get(asset, Decimal("0")) + quantity
 
-    def execute(self, intent: ExecutionRequest) -> ExecutionReceipt:
+    @staticmethod
+    def _key(intent: ExecutionRequest) -> str:
+        return f"{intent.principal_id}\x1f{intent.intent_id}"
+
+    def execute(self, intent: ExecutionRequest, permit: SignedExecutionPermit) -> ExecutionReceipt:
         with self._lock:
-            existing = self._effects.get(intent.intent_id)
+            key = self._key(intent)
+            existing = self._effects.get(key)
             if existing:
                 return existing
+
+            ok, reasons = self.permit_verifier.consume(permit, intent, now=self.clock())
+            if not ok:
+                raise DeterministicFailure("permit rejected:" + ",".join(reasons))
 
             p = intent.payload
             notional = Decimal(str(p.get("amount_usd", p.get("notional_usd", "0"))))
@@ -84,24 +98,35 @@ class PaperTradingVenue:
             else:
                 raise DeterministicFailure(f"primitive {intent.primitive.value} unsupported by paper trading venue")
 
-            effect_id = "paper_" + hashlib.sha256((intent.intent_id + canonical_json(fill)).encode()).hexdigest()[:24]
-            evidence = {"venue": self.name, "intent_id": intent.intent_id, "effect_id": effect_id, "fill": fill}
+            effect_id = "paper_" + hashlib.sha256((intent.principal_id + "\x1f" + intent.intent_id + canonical_json(fill)).encode()).hexdigest()[:24]
+            evidence = {
+                "venue": self.name, "principal_id": intent.principal_id, "intent_id": intent.intent_id,
+                "effect_id": effect_id, "request_hash": canonical_hash(intent), "fill": fill,
+            }
             receipt = ExecutionReceipt(
                 effect_id=effect_id, status=SettlementStatus.FINALIZED, evidence=evidence,
                 amount_usd=None if intent.primitive == EconomicPrimitive.CANCEL_ORDER else notional,
             )
-            self._effects[intent.intent_id] = receipt
+            self._effects[key] = receipt
             return receipt
+
+    def lookup_effect(self, intent: ExecutionRequest) -> ExecutionReceipt | None:
+        with self._lock:
+            return self._effects.get(self._key(intent))
 
     def reconcile(self, intent: ExecutionRequest) -> SettlementRecord:
         with self._lock:
-            receipt = self._effects.get(intent.intent_id)
+            receipt = self._effects.get(self._key(intent))
+            request_hash = canonical_hash(intent)
             if receipt is None:
-                return SettlementRecord(SettlementStatus.NONE, evidence={"venue": self.name}, authoritative=True)
+                return SettlementRecord(
+                    SettlementStatus.NONE, evidence={"venue": self.name}, authoritative=True,
+                    verified_request_hash=request_hash,
+                )
             return SettlementRecord(
                 SettlementStatus.FINALIZED, effect_id=receipt.effect_id, amount_usd=receipt.amount_usd,
-                evidence=receipt.evidence, authoritative=True,
+                evidence=receipt.evidence, authoritative=True, verified_request_hash=request_hash,
             )
 
-    def successful_effect_count(self, intent_id: str) -> int:
-        return 1 if intent_id in self._effects else 0
+    def successful_effect_count(self, intent_id: str, *, principal_id: str = "principal:test") -> int:
+        return 1 if f"{principal_id}\x1f{intent_id}" in self._effects else 0

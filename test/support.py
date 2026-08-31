@@ -4,7 +4,11 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
-from faar.attestation import HMACTrustStore
+from faar.attestation import Ed25519TrustStore, HMACTrustStore
+from faar.permits import ConstrainedPermitAuthority, Ed25519PermitSignature, ExecutionPermitVerifier
+from faar.adapters import MockVenue, MockMode
+from faar.settlement import MockSettlementVerifier
+from faar.runtime import FAARRuntime
 from faar.models import (
     AttestationKind,
     AuthorityDecision,
@@ -18,6 +22,7 @@ from faar.models import (
     RiskSnapshot,
 )
 
+PRINCIPAL = "principal:test"
 NOW = datetime(2026, 8, 30, 18, 0, tzinfo=timezone.utc)
 AUTH = AuthorityDecision(AuthorityPosture.EXECUTE, AuthorityPrimitive.EXECUTE_ACTION, source="test")
 TRUST_KEYS = {
@@ -32,12 +37,17 @@ TRUST_KEY_KINDS = {
 }
 
 
-def trust() -> HMACTrustStore:
-    return HMACTrustStore(TRUST_KEYS, key_kinds=TRUST_KEY_KINDS)
+def trust() -> Ed25519TrustStore:
+    return Ed25519TrustStore.generate(TRUST_KEY_KINDS)
+
+
+def verification_trust(t):
+    return t.public_verifier() if getattr(t, "can_sign", False) and hasattr(t, "public_verifier") else t
 
 
 def intent(**changes):
     base = Intent(
+        principal_id=PRINCIPAL,
         intent_id="intent_test_000000000001",
         actor_id="agent:quant",
         grant_id="grant:test",
@@ -58,6 +68,7 @@ def intent(**changes):
 
 def grant(**changes):
     base = CapabilityGrant(
+        principal_id=PRINCIPAL,
         grant_id="grant:test",
         version=1,
         actor_id="agent:quant",
@@ -105,7 +116,40 @@ def risk(**changes):
     return replace(base, **changes)
 
 
-def attest_pair(t: HMACTrustStore, i: Intent, auth: AuthorityDecision, rs: RiskSnapshot, now: datetime = NOW):
+def attest_pair(t, i: Intent, auth: AuthorityDecision, rs: RiskSnapshot, now: datetime = NOW):
     aa = t.sign("authority-test", AttestationKind.AUTHORITY, auth, i, issued_at=now, ttl_seconds=20)
     ra = t.sign("risk-test", AttestationKind.RISK, rs, i, issued_at=now, ttl_seconds=20)
     return aa, ra
+
+
+PERMIT_KEY = b"permit-test-key-32-bytes-long!!!!!!!"
+
+def permit_stack(store, trust_store=None):
+    trust_store = trust_store or trust()
+    verifier_trust = verification_trust(trust_store)
+    sig = Ed25519PermitSignature("permit-test")
+    authority = ConstrainedPermitAuthority(store, verifier_trust, sig, max_permit_ttl_seconds=5)
+    verifier = ExecutionPermitVerifier(sig.public_verifier(), store)
+    return authority, verifier
+
+
+def build_mock_runtime(
+    store,
+    trust_store=None,
+    *,
+    name="mock-dex",
+    mode=MockMode.SUCCESS,
+    runtime_clock=lambda: NOW,
+    venue_clock=lambda: NOW,
+    allow_test_time_override=True,
+):
+    trust_store = trust_store or trust()
+    verifier_trust = verification_trust(trust_store)
+    permit_authority, permit_verifier = permit_stack(store, trust_store)
+    venue = MockVenue(permit_verifier=permit_verifier, name=name, mode=mode, clock=venue_clock)
+    settlement = MockSettlementVerifier(venue=venue)
+    runtime = FAARRuntime(
+        store, {name: venue}, verifier_trust, permit_authority, {name: settlement},
+        clock=runtime_clock, allow_test_time_override=allow_test_time_override,
+    )
+    return runtime, venue, settlement, permit_authority, permit_verifier

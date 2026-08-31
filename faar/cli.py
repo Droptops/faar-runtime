@@ -5,12 +5,14 @@ import json
 from pathlib import Path
 
 from .adapters import MockMode, MockVenue
-from .attestation import HMACTrustStore
+from .attestation import Ed25519TrustStore
 from .canonical import canonical_hash
 from .gates import evaluate_authority, evaluate_capability, evaluate_risk
 from .models import AttestationKind, utcnow
 from .parsing import parse_authority, parse_grant, parse_intent, parse_risk
 from .runtime import FAARRuntime
+from .permits import ConstrainedPermitAuthority, Ed25519PermitSignature, ExecutionPermitVerifier
+from .settlement import MockSettlementVerifier
 from .store import SQLiteIntentStore
 
 
@@ -23,6 +25,7 @@ _DEMO_KEY_KINDS = {
     "demo-risk": {AttestationKind.RISK},
 }
 _DEMO_EVIDENCE_KEY = b"demo-evidence-key-not-for-production!!"
+_DEMO_PERMIT_KEY = b"demo-permit-key-material-not-production!!"
 
 
 def _reject_duplicate_keys(pairs):
@@ -58,6 +61,7 @@ def main() -> None:
     p_grant.add_argument("--db", required=True)
 
     p_status = sub.add_parser("set-grant-status", help="local reference admin: set ACTIVE/PAUSED/REVOKED runtime status")
+    p_status.add_argument("--principal-id", required=True)
     p_status.add_argument("--grant-id", required=True)
     p_status.add_argument("--grant-version", required=True, type=int)
     p_status.add_argument("--status", required=True, choices=["ACTIVE", "PAUSED", "REVOKED"])
@@ -111,7 +115,7 @@ def main() -> None:
 
     if args.command == "set-grant-status":
         store = SQLiteIntentStore(args.db)
-        store.set_grant_status(args.grant_id, args.grant_version, args.status)
+        store.set_grant_status(args.principal_id, args.grant_id, args.grant_version, args.status)
         print(json.dumps({"grant_id": args.grant_id, "version": args.grant_version, "runtime_status": args.status}, indent=2))
         return
 
@@ -167,11 +171,19 @@ def main() -> None:
     store = SQLiteIntentStore(args.db, evidence_key=_DEMO_EVIDENCE_KEY)
     if args.demo_auto_provision:
         store.provision_grant(grant, canonical_hash(grant))
-    venue = MockVenue(name=intent.venue, mode=MockMode(args.mode))
-    trust = HMACTrustStore(_DEMO_KEYS, key_kinds=_DEMO_KEY_KINDS)
+    trust = Ed25519TrustStore.generate(_DEMO_KEY_KINDS)
+    verifier_trust = trust.public_verifier()
+    permit_sig = Ed25519PermitSignature("demo-permit")
+    permit_authority = ConstrainedPermitAuthority(store, verifier_trust, permit_sig)
+    permit_verifier = ExecutionPermitVerifier(permit_sig.public_verifier(), store)
+    venue = MockVenue(permit_verifier=permit_verifier, name=intent.venue, mode=MockMode(args.mode), clock=lambda: risk.observed_at)
+    settlement = MockSettlementVerifier(venue)
     aa = trust.sign("demo-authority", AttestationKind.AUTHORITY, authority, intent, issued_at=risk.observed_at, ttl_seconds=30)
     ra = trust.sign("demo-risk", AttestationKind.RISK, risk, intent, issued_at=risk.observed_at, ttl_seconds=30)
-    runtime = FAARRuntime(store, {intent.venue: venue}, trust, allow_test_time_override=True)
+    runtime = FAARRuntime(
+        store, {intent.venue: venue}, verifier_trust, permit_authority, {intent.venue: settlement},
+        allow_test_time_override=True,
+    )
     result = runtime.process(
         intent, authority, grant, risk,
         authority_attestation=aa,
@@ -185,7 +197,7 @@ def main() -> None:
         "reason_codes": list(result.reason_codes),
         "replayed": result.replayed,
         "submission_count": result.submission_count,
-        "successful_effect_count": venue.successful_effect_count(intent.intent_id),
+        "successful_effect_count": venue.successful_effect_count(intent.intent_id, principal_id=intent.principal_id),
     }, indent=2))
 
 

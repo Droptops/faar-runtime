@@ -13,7 +13,7 @@ from faar.models import (
     TaskContract,
 )
 from faar.outcomes import verify_attested_task_outcome, verify_task_outcome
-from support import NOW, intent, trust
+from support import NOW, intent, trust, verification_trust
 
 
 class OutcomeTests(unittest.TestCase):
@@ -30,7 +30,7 @@ class OutcomeTests(unittest.TestCase):
             SettlementStatus.FINALIZED,
             effect_id="fx-1",
             evidence={"fill": {"to_quantity": "90"}},
-            authoritative=True,
+            authoritative=True, verified_request_hash="outcome-test-request",
         )
         result = verify_task_outcome(contract, settlement)
         self.assertEqual(OutcomeVerdict.NOT_MET, result.verdict)
@@ -52,11 +52,11 @@ class OutcomeTests(unittest.TestCase):
             SettlementStatus.FINALIZED,
             effect_id="fx-2",
             evidence={"fill": {"to_quantity": "100", "to_asset": "MEME"}},
-            authoritative=True,
+            authoritative=True, verified_request_hash="outcome-test-request",
         )
         t = trust()
         att = t.sign("task-test", AttestationKind.TASK, contract, i, issued_at=NOW, ttl_seconds=30)
-        result = verify_attested_task_outcome(contract, settlement, attestation=att, intent=i, trust=t, now=NOW)
+        result = verify_attested_task_outcome(contract, settlement, attestation=att, intent=i, trust=verification_trust(t), now=NOW)
         self.assertEqual(OutcomeVerdict.MET, result.verdict)
 
     def test_agent_cannot_rewrite_attested_done_criteria(self):
@@ -76,9 +76,9 @@ class OutcomeTests(unittest.TestCase):
             SettlementStatus.FINALIZED,
             effect_id="fx-3",
             evidence={"fill": {"to_quantity": "1"}},
-            authoritative=True,
+            authoritative=True, verified_request_hash="outcome-test-request",
         )
-        result = verify_attested_task_outcome(weakened, settlement, attestation=att, intent=i, trust=t, now=NOW)
+        result = verify_attested_task_outcome(weakened, settlement, attestation=att, intent=i, trust=verification_trust(t), now=NOW)
         self.assertEqual(OutcomeVerdict.UNKNOWN, result.verdict)
         self.assertIn("TASK_ATTESTATION_SUBJECT_MISMATCH", result.reason_codes)
 
@@ -108,7 +108,7 @@ class OutcomeTests(unittest.TestCase):
         )
         settlement = SettlementRecord(
             SettlementStatus.FINALIZED, effect_id="fx-standard", amount_usd=Decimal("50"),
-            evidence={"effect_id": "attacker-shadow-value", "amount_usd": "9999"}, authoritative=True,
+            evidence={"effect_id": "attacker-shadow-value", "amount_usd": "9999"}, authoritative=True, verified_request_hash="outcome-test-request",
         )
         result = verify_task_outcome(contract, settlement)
         self.assertEqual(OutcomeVerdict.MET, result.verdict)
@@ -126,10 +126,10 @@ class OutcomeTests(unittest.TestCase):
         att = t.sign("task-test", AttestationKind.TASK, contract, i, issued_at=NOW, ttl_seconds=3600)
         settlement = SettlementRecord(
             SettlementStatus.FINALIZED, effect_id="fx-old-task", amount_usd=Decimal("50"),
-            authoritative=True,
+            authoritative=True, verified_request_hash="outcome-test-request",
         )
         result = verify_attested_task_outcome(
-            contract, settlement, attestation=att, intent=i, trust=t, now=NOW.replace(minute=2)
+            contract, settlement, attestation=att, intent=i, trust=verification_trust(t), now=NOW.replace(minute=2)
         )
         self.assertEqual(OutcomeVerdict.UNKNOWN, result.verdict)
         self.assertIn("TASK_CONTRACT_EXPIRED", result.reason_codes)
@@ -148,10 +148,10 @@ class OutcomeTests(unittest.TestCase):
         )
         settlement = SettlementRecord(
             SettlementStatus.FINALIZED, effect_id="fx-future-task", amount_usd=Decimal("50"),
-            authoritative=True,
+            authoritative=True, verified_request_hash="outcome-test-request",
         )
         result = verify_attested_task_outcome(
-            contract, settlement, attestation=att, intent=i, trust=t, now=NOW
+            contract, settlement, attestation=att, intent=i, trust=verification_trust(t), now=NOW
         )
         self.assertEqual(OutcomeVerdict.UNKNOWN, result.verdict)
         self.assertIn("TASK_CONTRACT_FROM_FUTURE", result.reason_codes)

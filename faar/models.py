@@ -13,24 +13,40 @@ def _aware(value: datetime) -> bool:
     return value.tzinfo is not None and value.utcoffset() is not None
 
 
-def _deep_freeze(value: Any) -> Any:
-    """Copy untrusted nested data into an immutable JSON-like structure.
+MAX_CANONICAL_DEPTH = 24
+MAX_CANONICAL_CONTAINER_ITEMS = 256
+MAX_CANONICAL_STRING_CHARS = 8192
+MAX_CANONICAL_INT_BITS = 256
 
-    Frozen dataclasses are only shallowly immutable. Without this copy/freeze, a
-    caller retaining the original dict could mutate an already-authorized intent
-    between hashing/gating and adapter submission.
+
+def _deep_freeze(value: Any, _depth: int = 0) -> Any:
+    """Copy untrusted nested data into a bounded immutable JSON-like structure.
+
+    Frozen dataclasses are only shallowly immutable. The explicit depth/container/
+    scalar bounds also stop model, adapter, or verifier data from turning evidence
+    handling and canonical hashing into a trivial memory/recursion denial of service.
     """
+    if _depth > MAX_CANONICAL_DEPTH:
+        raise ValueError("canonical data exceeds maximum nesting depth")
     if isinstance(value, Mapping):
+        if len(value) > MAX_CANONICAL_CONTAINER_ITEMS:
+            raise ValueError("canonical mapping exceeds maximum item count")
         out: dict[str, Any] = {}
         for key, item in value.items():
             if not isinstance(key, str):
                 raise ValueError("mapping keys must be strings")
-            out[key] = _deep_freeze(item)
+            if len(key) > MAX_CANONICAL_STRING_CHARS:
+                raise ValueError("canonical mapping key is too long")
+            out[key] = _deep_freeze(item, _depth + 1)
         return MappingProxyType(out)
     if isinstance(value, (list, tuple)):
-        return tuple(_deep_freeze(v) for v in value)
+        if len(value) > MAX_CANONICAL_CONTAINER_ITEMS:
+            raise ValueError("canonical sequence exceeds maximum item count")
+        return tuple(_deep_freeze(v, _depth + 1) for v in value)
     if isinstance(value, (set, frozenset)):
-        return frozenset(_deep_freeze(v) for v in value)
+        if len(value) > MAX_CANONICAL_CONTAINER_ITEMS:
+            raise ValueError("canonical set exceeds maximum item count")
+        return frozenset(_deep_freeze(v, _depth + 1) for v in value)
     if isinstance(value, Decimal):
         if not value.is_finite():
             raise ValueError("non-finite Decimals are not allowed in canonical data")
@@ -39,7 +55,15 @@ def _deep_freeze(value: Any) -> Any:
         if not isfinite(value):
             raise ValueError("non-finite floats are not allowed in canonical data")
         return value
-    if value is None or isinstance(value, (str, int, bool, datetime, StrEnum)):
+    if isinstance(value, str):
+        if len(value) > MAX_CANONICAL_STRING_CHARS:
+            raise ValueError("canonical string is too long")
+        return value
+    if isinstance(value, bool) or value is None or isinstance(value, (datetime, StrEnum)):
+        return value
+    if isinstance(value, int):
+        if value.bit_length() > MAX_CANONICAL_INT_BITS:
+            raise ValueError("canonical integer exceeds maximum bit length")
         return value
     raise ValueError(f"unsupported canonical value type: {type(value).__name__}")
 
@@ -146,6 +170,16 @@ class AttestationKind(StrEnum):
     TASK = "TASK"
 
 
+class AttestationAlgorithm(StrEnum):
+    HMAC_SHA256 = "HMAC_SHA256"
+    ED25519 = "ED25519"
+
+
+class PermitAlgorithm(StrEnum):
+    HMAC_SHA256 = "HMAC_SHA256"
+    ED25519 = "ED25519"
+
+
 class OutcomeVerdict(StrEnum):
     MET = "MET"
     NOT_MET = "NOT_MET"
@@ -208,6 +242,7 @@ class CapabilityLimits:
 
 @dataclass(frozen=True)
 class CapabilityGrant:
+    principal_id: str
     grant_id: str
     version: int
     actor_id: str
@@ -227,8 +262,8 @@ class CapabilityGrant:
         object.__setattr__(self, "allowed_assets", frozenset(str(v) for v in self.allowed_assets))
         object.__setattr__(self, "allowed_targets", frozenset(str(v) for v in self.allowed_targets))
         object.__setattr__(self, "denied_targets", frozenset(str(v) for v in self.denied_targets))
-        if not self.grant_id or not self.actor_id:
-            raise ValueError("grant_id and actor_id are required")
+        if not self.principal_id or not self.grant_id or not self.actor_id:
+            raise ValueError("principal_id, grant_id and actor_id are required")
         _require_int("grant version", self.version, minimum=1)
         if not self.allowed_primitives:
             raise ValueError("allowed_primitives cannot be empty")
@@ -265,6 +300,7 @@ class CapabilityGrant:
 
 @dataclass(frozen=True)
 class Intent:
+    principal_id: str
     intent_id: str
     actor_id: str
     grant_id: str
@@ -275,14 +311,14 @@ class Intent:
     expires_at: datetime
     payload: Mapping[str, Any]
     metadata: Mapping[str, Any] = field(default_factory=dict)
-    schema_version: str = "0.2"
+    schema_version: str = "0.3"
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "primitive", EconomicPrimitive(self.primitive))
         object.__setattr__(self, "payload", _deep_freeze(self.payload))
         object.__setattr__(self, "metadata", _deep_freeze(self.metadata))
-        if not self.intent_id or not self.actor_id or not self.grant_id or not self.venue:
-            raise ValueError("intent identifiers and venue are required")
+        if not self.principal_id or not self.intent_id or not self.actor_id or not self.grant_id or not self.venue:
+            raise ValueError("principal_id, intent identifiers and venue are required")
         _require_int("grant_version", self.grant_version, minimum=1)
         if not _aware(self.created_at) or not _aware(self.expires_at):
             raise ValueError("intent timestamps must be timezone-aware")
@@ -298,6 +334,7 @@ class ExecutionRequest:
     The adapter gets only the canonical economic primitive that survived FAAR's gates.
     """
 
+    principal_id: str
     intent_id: str
     primitive: EconomicPrimitive
     venue: str
@@ -306,17 +343,71 @@ class ExecutionRequest:
     def __post_init__(self) -> None:
         object.__setattr__(self, "primitive", EconomicPrimitive(self.primitive))
         object.__setattr__(self, "payload", _deep_freeze(self.payload))
-        if not self.intent_id or not self.venue:
-            raise ValueError("execution request identity and venue are required")
+        if not self.principal_id or not self.intent_id or not self.venue:
+            raise ValueError("execution request principal, identity and venue are required")
 
     @classmethod
     def from_intent(cls, intent: Intent) -> "ExecutionRequest":
         return cls(
+            principal_id=intent.principal_id,
             intent_id=intent.intent_id,
             primitive=intent.primitive,
             venue=intent.venue,
             payload=intent.payload,
         )
+
+
+@dataclass(frozen=True)
+class ExecutionPermit:
+    """Signer-issued, narrowly scoped authority for one sanitized execution request.
+
+    A permit is not a generic wallet credential. It binds one principal, intent,
+    request hash, immutable grant envelope, runtime grant epoch, amount ceiling,
+    and short expiry. A venue/gateway that accepts permits can reject any request
+    outside this exact envelope without trusting the calling agent process.
+    """
+
+    permit_id: str
+    principal_id: str
+    intent_id: str
+    grant_id: str
+    grant_version: int
+    grant_hash: str
+    request_hash: str
+    authority_attestation_hash: str
+    risk_attestation_hash: str
+    grant_epoch: int
+    fence_token: int
+    max_amount_usd: Decimal | None
+    issued_at: datetime
+    expires_at: datetime
+
+    def __post_init__(self) -> None:
+        if not all((self.permit_id, self.principal_id, self.intent_id, self.grant_id, self.grant_hash, self.request_hash)):
+            raise ValueError("execution permit identity fields are required")
+        _require_int("grant_version", self.grant_version, minimum=1)
+        _require_int("grant_epoch", self.grant_epoch, minimum=1)
+        _require_int("fence_token", self.fence_token, minimum=1)
+        if self.max_amount_usd is not None:
+            if not isinstance(self.max_amount_usd, Decimal) or not self.max_amount_usd.is_finite() or self.max_amount_usd <= 0:
+                raise ValueError("permit max_amount_usd must be a positive finite Decimal or None")
+        if not _aware(self.issued_at) or not _aware(self.expires_at):
+            raise ValueError("permit timestamps must be timezone-aware")
+        if self.expires_at <= self.issued_at:
+            raise ValueError("permit expires_at must be after issued_at")
+
+
+@dataclass(frozen=True)
+class SignedExecutionPermit:
+    permit: ExecutionPermit
+    signer_id: str
+    algorithm: PermitAlgorithm
+    signature: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "algorithm", PermitAlgorithm(self.algorithm))
+        if not self.signer_id or not self.signature:
+            raise ValueError("signed permit signer_id and signature are required")
 
 
 @dataclass(frozen=True)
@@ -371,14 +462,16 @@ class Decision:
 class Attestation:
     kind: AttestationKind
     key_id: str
+    algorithm: AttestationAlgorithm
     subject_hash: str
     intent_hash: str
     issued_at: datetime
     expires_at: datetime
-    mac: str
+    signature: str
 
     def __post_init__(self) -> None:
-        if not self.key_id or not self.subject_hash or not self.intent_hash or not self.mac:
+        object.__setattr__(self, "algorithm", AttestationAlgorithm(self.algorithm))
+        if not self.key_id or not self.subject_hash or not self.intent_hash or not self.signature:
             raise ValueError("attestation fields cannot be empty")
         if not _aware(self.issued_at) or not _aware(self.expires_at):
             raise ValueError("attestation timestamps must be timezone-aware")
@@ -393,11 +486,14 @@ class SettlementRecord:
     amount_usd: Decimal | None = None
     evidence: Mapping[str, Any] = field(default_factory=dict)
     authoritative: bool = False
+    verified_request_hash: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "status", SettlementStatus(self.status))
         object.__setattr__(self, "evidence", _deep_freeze(self.evidence))
         _require_bool("authoritative", self.authoritative)
+        if self.authoritative and not self.verified_request_hash:
+            raise ValueError("authoritative settlement records require verified_request_hash")
         if self.amount_usd is not None:
             if not isinstance(self.amount_usd, Decimal) or not self.amount_usd.is_finite():
                 raise ValueError("settlement amount_usd must be finite Decimal or None")

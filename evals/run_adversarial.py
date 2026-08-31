@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deterministic adversarial smoke harness for FAAR v0.2.
+"""Deterministic adversarial smoke harness for FAAR v0.3.
 
 This is not a security audit or formal proof. It is an executable regression gate
 for the reference invariants using only local deterministic components.
@@ -14,7 +14,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 from faar.adapters import MockMode, MockVenue
-from faar.attestation import HMACTrustStore
+from faar.attestation import Ed25519TrustStore
 from faar.canonical import canonical_hash
 from faar.models import (
     AttestationKind, AuthorityDecision, AuthorityPosture, AuthorityPrimitive,
@@ -22,6 +22,8 @@ from faar.models import (
     Intent, RiskSnapshot,
 )
 from faar.runtime import FAARRuntime
+from faar.permits import ConstrainedPermitAuthority, Ed25519PermitSignature, ExecutionPermitVerifier
+from faar.settlement import MockSettlementVerifier
 from faar.store import SQLiteIntentStore
 
 
@@ -41,6 +43,7 @@ def main() -> None:
     tmp = tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False); tmp.close()
     store = SQLiteIntentStore(tmp.name, evidence_key=b"adversarial-evidence-key-32-bytes!")
     grant = CapabilityGrant(
+        principal_id="principal:test",
         grant_id="eval-grant", version=1, actor_id="agent:eval", status=GrantStatus.ACTIVE,
         allowed_primitives=frozenset({EconomicPrimitive.SWAP}),
         allowed_venues=frozenset({"mock-dex"}),
@@ -57,9 +60,16 @@ def main() -> None:
         ),
     )
     store.provision_grant(grant, canonical_hash(grant))
-    venue = MockVenue(name="mock-dex")
-    trust = HMACTrustStore(KEYS, key_kinds=KEY_KINDS)
-    runtime = FAARRuntime(store, {"mock-dex": venue}, trust, allow_test_time_override=True)
+    trust = Ed25519TrustStore.generate(KEY_KINDS)
+    permit_sig = Ed25519PermitSignature("eval-permit")
+    permit_authority = ConstrainedPermitAuthority(store, trust.public_verifier(), permit_sig)
+    permit_verifier = ExecutionPermitVerifier(permit_sig.public_verifier(), store)
+    venue = MockVenue(permit_verifier=permit_verifier, name="mock-dex", clock=lambda: NOW)
+    settlement = MockSettlementVerifier(venue)
+    runtime = FAARRuntime(
+        store, {"mock-dex": venue}, trust.public_verifier(), permit_authority, {"mock-dex": settlement},
+        allow_test_time_override=True,
+    )
 
     def rs(version: int = 1, **changes) -> RiskSnapshot:
         base = RiskSnapshot(
@@ -74,6 +84,7 @@ def main() -> None:
         payload = {"from_asset": "USDC", "to_asset": "MEME", "amount_usd": "50", "target": "router:ok"}
         payload.update(payload_overrides)
         return Intent(
+            principal_id="principal:test",
             intent_id=iid, actor_id="agent:eval", grant_id="eval-grant", grant_version=1,
             primitive=EconomicPrimitive.SWAP, venue="mock-dex", created_at=NOW - timedelta(seconds=1),
             expires_at=NOW + timedelta(seconds=14), payload=payload,
@@ -84,7 +95,7 @@ def main() -> None:
         aa = trust.sign("auth", AttestationKind.AUTHORITY, auth, i, issued_at=NOW, ttl_seconds=20)
         ra = trust.sign("risk", AttestationKind.RISK, risk, i, issued_at=NOW, ttl_seconds=20)
         if tamper_auth:
-            aa = replace(aa, mac="00" * 32)
+            aa = replace(aa, signature="invalid-signature")
         return runtime.process(i, auth, grant, risk, authority_attestation=aa, risk_attestation=ra, now=NOW)
 
     unauthorized_effects = 0
@@ -128,7 +139,7 @@ def main() -> None:
     ambiguous_effects = venue.successful_effect_count(ambiguous.intent_id)
 
     report = {
-        "suite": "FAAR v0.2 deterministic adversarial smoke",
+        "suite": "FAAR v0.3 deterministic adversarial smoke",
         "denial_cases": len(denial_cases),
         "forged_attestation_state": forged_result.state.value,
         "unauthorized_economic_effects": unauthorized_effects,

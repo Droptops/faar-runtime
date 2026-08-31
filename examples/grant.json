@@ -1,5 +1,6 @@
 {
-  "schema_version": "0.2",
+  "schema_version": "0.3",
+  "principal_id": "principal:demo",
   "grant_id": "grant:demo",
   "version": 1,
   "actor_id": "agent:meme-quant-01",

@@ -4,10 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "faar-runtime"
-version = "0.2.1"
+version = "0.3.0"
 description = "Financial Agent Authority Router — deterministic authority and economic execution runtime"
 readme = "README.md"
 requires-python = ">=3.11"
+dependencies = ["cryptography>=46,<47"]
 license = {text = "Apache-2.0"}
 authors = [{name = "FAAR contributors"}]
 keywords = ["agents", "authorization", "fintech", "trading", "security"]

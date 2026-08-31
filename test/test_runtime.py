@@ -8,7 +8,7 @@ from dataclasses import replace
 from datetime import timedelta
 from decimal import Decimal
 
-from faar.adapters import AmbiguousExecution, MockMode, MockVenue, REFERENCE_SAFE_PROFILE
+from faar.adapters import AmbiguousExecution, MockMode, MockVenue, REFERENCE_SAFE_PROFILE, AdapterSecurityProfile
 from faar.canonical import canonical_hash
 from faar.models import (
     AttestationKind,
@@ -19,13 +19,31 @@ from faar.models import (
     ExecutionReceipt,
     GrantStatus,
     IntentState,
-    SettlementRecord,
     SettlementStatus,
 )
 from faar.runtime import FAARRuntime
+from faar.settlement import MockSettlementVerifier, SettlementRecord, SettlementSecurityProfile, REFERENCE_SETTLEMENT_PROFILE
+from faar.models import ExecutionRequest
 from faar.store import GrantConflict, IntentConflict, SQLiteIntentStore
 
-from support import AUTH, NOW, attest_pair, grant, intent, risk, trust
+from support import AUTH, NOW, PRINCIPAL, attest_pair, grant, intent, risk, trust, verification_trust, build_mock_runtime, permit_stack
+
+
+class AdapterBackedVerifier:
+    """Test-only verifier shim for adversarial adapter fixtures.
+
+    Production FAAR requires an independent verifier. These fixtures intentionally
+    isolate runtime handling of malformed/contradictory settlement records.
+    """
+    name = "test-adapter-backed-verifier"
+    security_profile = REFERENCE_SETTLEMENT_PROFILE
+
+    def __init__(self, adapter):
+        self.adapter = adapter
+
+    def verify(self, request):
+        return self.adapter.reconcile(request)
+
 
 
 class FAARRuntimeTests(unittest.TestCase):
@@ -33,13 +51,33 @@ class FAARRuntimeTests(unittest.TestCase):
         self.tmp = tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False)
         self.tmp.close()
         self.store = SQLiteIntentStore(self.tmp.name, evidence_key=b"evidence-test-key-32-bytes-long!!!!")
-        self.venue = MockVenue(name="mock-dex")
         self.trust = trust()
-        self.runtime = FAARRuntime(self.store, {"mock-dex": self.venue}, self.trust, allow_test_time_override=True)
+        self.runtime, self.venue, self.settlement, self.permit_authority, self.permit_verifier = build_mock_runtime(
+            self.store, self.trust
+        )
         self.store.provision_grant(grant(), canonical_hash(grant()))
 
     def tearDown(self):
         self.store.close()
+
+    def runtime_for(self, adapter, *, verifier=None, clock=lambda: NOW, allow_test_time_override=True):
+        permit_authority, _ = permit_stack(self.store, self.trust)
+        verifier = verifier or AdapterBackedVerifier(adapter)
+        return FAARRuntime(
+            self.store, {"mock-dex": adapter}, verification_trust(self.trust), permit_authority,
+            {"mock-dex": verifier}, clock=clock, allow_test_time_override=allow_test_time_override,
+        )
+
+    def force_external_effect(self, i, *, g=None, rs=None):
+        g = g or grant()
+        rs = rs or risk()
+        aa, ra = attest_pair(self.trust, i, AUTH, rs, NOW)
+        request = ExecutionRequest.from_intent(i)
+        permit = self.permit_authority.issue(
+            request, intent=i, authority=AUTH, grant=g, risk=rs,
+            authority_attestation=aa, risk_attestation=ra, now=NOW,
+        )
+        return self.venue.execute(request, permit)
 
     def execute_case(self, i, auth=AUTH, g=None, rs=None, *, runtime=None, now=NOW, attestations=None):
         g = g or grant()
@@ -52,6 +90,13 @@ class FAARRuntimeTests(unittest.TestCase):
             risk_attestation=ra,
             now=now,
         )
+
+    def test_runtime_rejects_signing_capable_attestation_store(self):
+        with self.assertRaisesRegex(ValueError, "verify-only attestation"):
+            FAARRuntime(
+                self.store, {"mock-dex": self.venue}, self.trust, self.permit_authority,
+                {"mock-dex": self.settlement},
+            )
 
     def test_happy_path_finalizes_once(self):
         i = intent()
@@ -81,10 +126,10 @@ class FAARRuntimeTests(unittest.TestCase):
     def test_forged_authority_attestation_stops(self):
         i = intent(intent_id="intent_test_000000000023")
         aa, ra = attest_pair(self.trust, i, AUTH, risk())
-        aa = replace(aa, mac="00" * 32)
+        aa = replace(aa, signature="invalid-signature")
         result = self.execute_case(i, attestations=(aa, ra))
         self.assertEqual(IntentState.STOPPED, result.state)
-        self.assertTrue(any("ATTESTATION_MAC_INVALID" in r for r in result.reason_codes))
+        self.assertTrue(any("ATTESTATION_SIGNATURE_INVALID" in r for r in result.reason_codes))
         self.assertEqual(0, self.venue.successful_effect_count(i.intent_id))
 
     def test_risk_attestation_bound_to_intent(self):
@@ -184,7 +229,8 @@ class FAARRuntimeTests(unittest.TestCase):
         aa, ra = attest_pair(self.trust, i, AUTH, rs, NOW)
         times = iter((NOW, NOW + timedelta(seconds=30)))
         runtime = FAARRuntime(
-            self.store, {"mock-dex": self.venue}, self.trust, clock=lambda: next(times)
+            self.store, {"mock-dex": self.venue}, verification_trust(self.trust), self.permit_authority,
+            {"mock-dex": self.settlement}, clock=lambda: next(times)
         )
         result = runtime.process(
             i, AUTH, grant(), rs, authority_attestation=aa, risk_attestation=ra
@@ -222,7 +268,7 @@ class FAARRuntimeTests(unittest.TestCase):
         self.store.transition(i.intent_id, IntentState.PROPOSED, IntentState.AUTHORIZED)
         self.store.transition(i.intent_id, IntentState.AUTHORIZED, IntentState.RESERVED)
         self.store.begin_submission(i.intent_id, [IntentState.RESERVED], max_attempts=2)
-        self.venue.execute(i)
+        self.force_external_effect(i)
         recovered = self.execute_case(i)
         self.assertEqual(IntentState.FINALIZED, recovered.state)
         self.assertEqual(1, self.venue.successful_effect_count(i.intent_id))
@@ -317,37 +363,49 @@ class FAARRuntimeTests(unittest.TestCase):
         self.assertIn("INTENT_CREATED_IN_FUTURE", result.reason_codes)
 
     def test_revocation_is_irreversible_for_same_grant_version(self):
-        self.store.set_grant_status("grant:test", 1, "REVOKED")
+        self.store.set_grant_status(PRINCIPAL, "grant:test", 1, "REVOKED")
         with self.assertRaises(GrantConflict):
-            self.store.set_grant_status("grant:test", 1, "ACTIVE")
+            self.store.set_grant_status(PRINCIPAL, "grant:test", 1, "ACTIVE")
 
     def test_provisioned_paused_grant_can_resume_without_mutating_envelope(self):
         store = SQLiteIntentStore(":memory:", evidence_key=b"paused-grant-evidence-key-32-bytes!!")
-        g = grant(status=GrantStatus.PAUSED)
-        store.provision_grant(g, canonical_hash(g))
-        store.set_grant_status(g.grant_id, g.version, "ACTIVE")
-        venue = MockVenue(name="mock-dex")
-        runtime = FAARRuntime(store, {"mock-dex": venue}, self.trust, allow_test_time_override=True)
-        i = intent(intent_id="intent_test_000000000044")
-        rs = risk()
-        aa, ra = attest_pair(self.trust, i, AUTH, rs, NOW)
-        result = runtime.process(i, AUTH, g, rs, authority_attestation=aa, risk_attestation=ra, now=NOW)
-        self.assertEqual(IntentState.FINALIZED, result.state)
-        self.assertEqual(1, venue.successful_effect_count(i.intent_id))
+        try:
+            g = grant(status=GrantStatus.PAUSED)
+            store.provision_grant(g, canonical_hash(g))
+            store.set_grant_status(g.principal_id, g.grant_id, g.version, "ACTIVE")
+            runtime, venue, _, _, _ = build_mock_runtime(store, self.trust)
+            i = intent(intent_id="intent_test_000000000044")
+            rs = risk()
+            aa, ra = attest_pair(self.trust, i, AUTH, rs, NOW)
+            result = runtime.process(i, AUTH, g, rs, authority_attestation=aa, risk_attestation=ra, now=NOW)
+            self.assertEqual(IntentState.FINALIZED, result.state)
+            self.assertEqual(1, venue.successful_effect_count(i.intent_id))
+        finally:
+            store.close()
 
     def test_confirmed_effect_followed_by_none_stops_without_resubmit(self):
         class LosingAdapter:
             name = "mock-dex"
             security_profile = REFERENCE_SAFE_PROFILE
-            def __init__(self): self.calls = 0
-            def execute(self, i):
+            def __init__(self): self.calls = 0; self.lookups = 0
+            def execute(self, i, permit):
                 self.calls += 1
-                return ExecutionReceipt("effect-known", SettlementStatus.CONFIRMED, {"phase": "confirmed"}, Decimal("50"))
+                return ExecutionReceipt("effect-known", SettlementStatus.CONFIRMED, {"phase": "submitter"}, Decimal("50"))
             def reconcile(self, i):
-                return SettlementRecord(SettlementStatus.NONE, evidence={"phase": "lost"}, authoritative=True)
+                self.lookups += 1
+                if self.lookups == 1:
+                    return SettlementRecord(
+                        SettlementStatus.CONFIRMED, effect_id="effect-known", amount_usd=Decimal("50"),
+                        evidence={"phase": "independent-confirmed"}, authoritative=True,
+                        verified_request_hash=canonical_hash(i),
+                    )
+                return SettlementRecord(
+                    SettlementStatus.NONE, evidence={"phase": "lost"}, authoritative=True,
+                    verified_request_hash=canonical_hash(i),
+                )
 
         adapter = LosingAdapter()
-        runtime = FAARRuntime(self.store, {"mock-dex": adapter}, self.trust, allow_test_time_override=True)
+        runtime = self.runtime_for(adapter)
         i = intent(intent_id="intent_test_000000000022")
         first = self.execute_case(i, runtime=runtime)
         self.assertEqual(IntentState.CONFIRMED, first.state)
@@ -360,12 +418,15 @@ class FAARRuntimeTests(unittest.TestCase):
         class BadAdapter:
             name = "mock-dex"
             security_profile = REFERENCE_SAFE_PROFILE
-            def execute(self, i):
+            def execute(self, i, permit):
                 return ExecutionReceipt("", SettlementStatus.FINALIZED, {"bad": True})
             def reconcile(self, i):
-                return SettlementRecord(SettlementStatus.UNKNOWN)
+                return SettlementRecord(
+                    SettlementStatus.FINALIZED, effect_id=None, amount_usd=Decimal("50"),
+                    evidence={"bad": True}, authoritative=True, verified_request_hash=canonical_hash(i),
+                )
 
-        runtime = FAARRuntime(self.store, {"mock-dex": BadAdapter()}, self.trust, allow_test_time_override=True)
+        runtime = self.runtime_for(BadAdapter())
         i = intent(intent_id="intent_test_000000000031")
         result = self.execute_case(i, runtime=runtime)
         self.assertEqual(IntentState.STOPPED, result.state)
@@ -375,12 +436,19 @@ class FAARRuntimeTests(unittest.TestCase):
         class SwappingAdapter:
             name = "mock-dex"
             security_profile = REFERENCE_SAFE_PROFILE
-            def execute(self, i):
-                return ExecutionReceipt("effect-A", SettlementStatus.CONFIRMED, {"phase": "a"}, Decimal("50"))
+            def __init__(self): self.lookups = 0
+            def execute(self, i, permit):
+                return ExecutionReceipt("effect-A", SettlementStatus.CONFIRMED, {"phase": "submitter"}, Decimal("50"))
             def reconcile(self, i):
-                return SettlementRecord(SettlementStatus.FINALIZED, effect_id="effect-B", amount_usd=Decimal("50"), evidence={"phase": "b"}, authoritative=True)
+                self.lookups += 1
+                effect = "effect-A" if self.lookups == 1 else "effect-B"
+                status = SettlementStatus.CONFIRMED if self.lookups == 1 else SettlementStatus.FINALIZED
+                return SettlementRecord(
+                    status, effect_id=effect, amount_usd=Decimal("50"), evidence={"phase": str(self.lookups)},
+                    authoritative=True, verified_request_hash=canonical_hash(i),
+                )
 
-        runtime = FAARRuntime(self.store, {"mock-dex": SwappingAdapter()}, self.trust, allow_test_time_override=True)
+        runtime = self.runtime_for(SwappingAdapter())
         i = intent(intent_id="intent_test_000000000032")
         self.assertEqual(IntentState.CONFIRMED, self.execute_case(i, runtime=runtime).state)
         result = self.execute_case(i, runtime=runtime)
@@ -391,12 +459,15 @@ class FAARRuntimeTests(unittest.TestCase):
         class DuplicateAdapter:
             name = "mock-dex"
             security_profile = REFERENCE_SAFE_PROFILE
-            def execute(self, i):
+            def execute(self, i, permit):
                 return ExecutionReceipt("same-effect", SettlementStatus.FINALIZED, {"intent": i.intent_id}, Decimal("50"))
             def reconcile(self, i):
-                return SettlementRecord(SettlementStatus.UNKNOWN)
+                return SettlementRecord(
+                    SettlementStatus.FINALIZED, effect_id="same-effect", amount_usd=Decimal("50"),
+                    evidence={"intent": i.intent_id}, authoritative=True, verified_request_hash=canonical_hash(i),
+                )
 
-        runtime = FAARRuntime(self.store, {"mock-dex": DuplicateAdapter()}, self.trust, allow_test_time_override=True)
+        runtime = self.runtime_for(DuplicateAdapter())
         i1 = intent(intent_id="intent_test_000000000033")
         i2 = intent(intent_id="intent_test_000000000034")
         self.assertEqual(IntentState.FINALIZED, self.execute_case(i1, runtime=runtime).state)
@@ -409,14 +480,14 @@ class FAARRuntimeTests(unittest.TestCase):
             name = "mock-dex"
             security_profile = REFERENCE_SAFE_PROFILE
             def __init__(self): self.calls = 0
-            def execute(self, i):
+            def execute(self, i, permit):
                 self.calls += 1
                 raise AmbiguousExecution("timeout")
             def reconcile(self, i):
                 return SettlementRecord(SettlementStatus.NONE, evidence={"rpc": "not found"}, authoritative=False)
 
         adapter = WeakLookupAdapter()
-        runtime = FAARRuntime(self.store, {"mock-dex": adapter}, self.trust, allow_test_time_override=True)
+        runtime = self.runtime_for(adapter)
         i = intent(intent_id="intent_test_000000000035")
         result = self.execute_case(i, runtime=runtime)
         self.assertEqual(IntentState.UNKNOWN, result.state)
@@ -454,7 +525,7 @@ class FAARRuntimeTests(unittest.TestCase):
 
     def test_runtime_revocation_stops_new_execution(self):
         i = intent(intent_id="intent_test_000000000019")
-        self.store.set_grant_status("grant:test", 1, "REVOKED")
+        self.store.set_grant_status(PRINCIPAL, "grant:test", 1, "REVOKED")
         result = self.execute_case(i)
         self.assertEqual(IntentState.STOPPED, result.state)
         self.assertIn("GRANT_RUNTIME_REVOKED", result.reason_codes)
@@ -466,7 +537,7 @@ class FAARRuntimeTests(unittest.TestCase):
         self.store.transition(i.intent_id, IntentState.PROPOSED, IntentState.AUTHORIZED)
         self.store.transition(i.intent_id, IntentState.AUTHORIZED, IntentState.RESERVED)
         self.store.begin_submission(i.intent_id, [IntentState.RESERVED], max_attempts=2)
-        self.store.set_grant_status("grant:test", 1, "REVOKED")
+        self.store.set_grant_status(PRINCIPAL, "grant:test", 1, "REVOKED")
         result = self.execute_case(i)
         self.assertEqual(IntentState.STOPPED, result.state)
         self.assertIn("GRANT_RUNTIME_REVOKED", result.reason_codes)
@@ -481,8 +552,8 @@ class FAARRuntimeTests(unittest.TestCase):
         self.store.transition(i.intent_id, IntentState.PROPOSED, IntentState.AUTHORIZED)
         self.store.transition(i.intent_id, IntentState.AUTHORIZED, IntentState.RESERVED)
         self.store.begin_submission(i.intent_id, [IntentState.RESERVED], max_attempts=2)
-        self.venue.execute(i)
-        self.store.set_grant_status("grant:test", 1, "REVOKED")
+        self.force_external_effect(i)
+        self.store.set_grant_status(PRINCIPAL, "grant:test", 1, "REVOKED")
         result = self.execute_case(i)
         self.assertEqual(IntentState.FINALIZED, result.state)
         self.assertEqual(1, self.venue.successful_effect_count(i.intent_id))
@@ -495,16 +566,19 @@ class FAARRuntimeTests(unittest.TestCase):
             name = "mock-dex"
             security_profile = REFERENCE_SAFE_PROFILE
             def __init__(self): self.effects = 0
-            def execute(self, i):
+            def execute(self, i, permit):
                 entered.set()
                 release.wait(timeout=2)
                 self.effects += 1
                 return ExecutionReceipt("blocked-effect", SettlementStatus.FINALIZED, {"ok": True}, Decimal("50"))
             def reconcile(self, i):
-                return SettlementRecord(SettlementStatus.UNKNOWN)
+                return SettlementRecord(
+                    SettlementStatus.FINALIZED, effect_id="blocked-effect", amount_usd=Decimal("50"),
+                    evidence={"ok": True}, authoritative=True, verified_request_hash=canonical_hash(i),
+                )
 
         adapter = BlockingAdapter()
-        runtime = FAARRuntime(self.store, {"mock-dex": adapter}, self.trust, allow_test_time_override=True)
+        runtime = self.runtime_for(adapter)
         i = intent(intent_id="intent_test_000000000038")
         result_box = []
         revoke_done = threading.Event()
@@ -513,7 +587,7 @@ class FAARRuntimeTests(unittest.TestCase):
         t_exec.start(); self.assertTrue(entered.wait(timeout=1))
 
         def revoke():
-            self.store.set_grant_status("grant:test", 1, "REVOKED")
+            self.store.set_grant_status(PRINCIPAL, "grant:test", 1, "REVOKED")
             revoke_done.set()
 
         t_rev = threading.Thread(target=revoke); t_rev.start()
@@ -575,7 +649,7 @@ class FAARRuntimeTests(unittest.TestCase):
         runtime = FAARRuntime(
             self.store,
             {"mock-dex": self.venue},
-            self.trust,
+            verification_trust(self.trust), self.permit_authority, {"mock-dex": self.settlement},
             clock=lambda: NOW,
         )
         # Passing an old `now` is ignored unless the runtime was explicitly created
@@ -593,30 +667,51 @@ class FAARRuntimeTests(unittest.TestCase):
         self.assertIn("INTENT_EXPIRED", result.reason_codes)
         self.assertEqual(0, self.venue.execute_call_count(i.intent_id))
 
+    def test_settlement_verifier_cannot_be_submitter_object(self):
+        class DualProfile:
+            exactly_once_compatible = True
+            trusted = True
+        class DualRole:
+            name = "mock-dex"
+            security_profile = DualProfile()
+            def execute(self, request, permit):
+                raise AssertionError("should not execute")
+            def verify(self, request):
+                return SettlementRecord(
+                    SettlementStatus.NONE, authoritative=True,
+                    verified_request_hash=canonical_hash(request),
+                )
+        dual = DualRole()
+        with self.assertRaisesRegex(ValueError, "distinct component"):
+            FAARRuntime(
+                self.store, {"mock-dex": dual}, verification_trust(self.trust),
+                self.permit_authority, {"mock-dex": dual},
+            )
+
     def test_adapter_without_exactly_once_contract_is_rejected(self):
         class UnsafeAdapter:
             name = "mock-dex"
-            def execute(self, i):
+            def execute(self, i, permit):
                 return ExecutionReceipt("x", SettlementStatus.FINALIZED, {})
             def reconcile(self, i):
-                return SettlementRecord(SettlementStatus.NONE, authoritative=True)
+                return SettlementRecord(SettlementStatus.NONE, authoritative=True, verified_request_hash=canonical_hash(request))
 
         with self.assertRaises(ValueError):
-            FAARRuntime(self.store, {"mock-dex": UnsafeAdapter()}, self.trust)
+            FAARRuntime(self.store, {"mock-dex": UnsafeAdapter()}, verification_trust(self.trust), self.permit_authority, {"mock-dex": self.settlement})
 
     def test_adapter_receives_sanitized_execution_request_not_model_metadata(self):
         class InspectingAdapter:
             name = "mock-dex"
             security_profile = REFERENCE_SAFE_PROFILE
             saw_metadata = None
-            def execute(self, request):
+            def execute(self, request, permit):
                 self.saw_metadata = hasattr(request, "metadata")
                 return ExecutionReceipt("sanitized-effect", SettlementStatus.FINALIZED, {"ok": True}, Decimal("50"))
             def reconcile(self, request):
-                return SettlementRecord(SettlementStatus.FINALIZED, effect_id="sanitized-effect", amount_usd=Decimal("50"), evidence={"ok": True}, authoritative=True)
+                return SettlementRecord(SettlementStatus.FINALIZED, effect_id="sanitized-effect", amount_usd=Decimal("50"), evidence={"ok": True}, authoritative=True, verified_request_hash=canonical_hash(request))
 
         adapter = InspectingAdapter()
-        runtime = FAARRuntime(self.store, {"mock-dex": adapter}, self.trust, allow_test_time_override=True)
+        runtime = self.runtime_for(adapter)
         i = intent(
             intent_id="intent_test_000000000045",
             metadata={"recipient_override": "wallet:attacker", "raw_calldata": "0xdeadbeef"},
@@ -629,7 +724,7 @@ class FAARRuntimeTests(unittest.TestCase):
         class WeakPositiveAdapter:
             name = "mock-dex"
             security_profile = REFERENCE_SAFE_PROFILE
-            def execute(self, request):
+            def execute(self, request, permit):
                 raise AmbiguousExecution("transport ambiguity")
             def reconcile(self, request):
                 return SettlementRecord(
@@ -637,7 +732,7 @@ class FAARRuntimeTests(unittest.TestCase):
                     evidence={"source": "single-untrusted-rpc"}, authoritative=False,
                 )
 
-        runtime = FAARRuntime(self.store, {"mock-dex": WeakPositiveAdapter()}, self.trust, allow_test_time_override=True)
+        runtime = self.runtime_for(WeakPositiveAdapter())
         i = intent(intent_id="intent_test_000000000046")
         result = self.execute_case(i, runtime=runtime)
         self.assertEqual(IntentState.UNKNOWN, result.state)
@@ -650,14 +745,18 @@ class FAARRuntimeTests(unittest.TestCase):
         class OverfillAdapter:
             name = "mock-dex"
             security_profile = REFERENCE_SAFE_PROFILE
-            def execute(self, request):
+            def execute(self, request, permit):
                 return ExecutionReceipt(
                     "overfill-effect", SettlementStatus.FINALIZED, {"reported": "overfill"}, Decimal("500")
                 )
             def reconcile(self, request):
-                return SettlementRecord(SettlementStatus.UNKNOWN, authoritative=False)
+                return SettlementRecord(
+                    SettlementStatus.FINALIZED, effect_id="overfill-effect", amount_usd=Decimal("500"),
+                    evidence={"source": "independent"}, authoritative=True,
+                    verified_request_hash=canonical_hash(request),
+                )
 
-        runtime = FAARRuntime(self.store, {"mock-dex": OverfillAdapter()}, self.trust, allow_test_time_override=True)
+        runtime = self.runtime_for(OverfillAdapter())
         i = intent(intent_id="intent_test_000000000047")
         result = self.execute_case(i, runtime=runtime)
         self.assertEqual(IntentState.STOPPED, result.state)
@@ -669,16 +768,102 @@ class FAARRuntimeTests(unittest.TestCase):
         class MissingAmountAdapter:
             name = "mock-dex"
             security_profile = REFERENCE_SAFE_PROFILE
-            def execute(self, request):
+            def execute(self, request, permit):
                 return ExecutionReceipt("missing-amount-effect", SettlementStatus.FINALIZED, {"ok": False})
             def reconcile(self, request):
-                return SettlementRecord(SettlementStatus.UNKNOWN, authoritative=False)
+                return SettlementRecord(
+                    SettlementStatus.FINALIZED, effect_id="missing-amount-effect", amount_usd=None,
+                    evidence={"source": "independent"}, authoritative=True,
+                    verified_request_hash=canonical_hash(request),
+                )
 
-        runtime = FAARRuntime(self.store, {"mock-dex": MissingAmountAdapter()}, self.trust, allow_test_time_override=True)
+        runtime = self.runtime_for(MissingAmountAdapter())
         i = intent(intent_id="intent_test_000000000048")
         result = self.execute_case(i, runtime=runtime)
         self.assertEqual(IntentState.STOPPED, result.state)
         self.assertIn("SETTLED_AMOUNT_REQUIRED", result.reason_codes)
+
+    def test_submitter_receipt_cannot_override_independent_settlement(self):
+        class LyingSubmitter:
+            name = "mock-dex"
+            security_profile = REFERENCE_SAFE_PROFILE
+            def execute(self, request, permit):
+                return ExecutionReceipt(
+                    "submitter-lie", SettlementStatus.FINALIZED, {"source": "submitter"}, Decimal("500")
+                )
+            def reconcile(self, request):
+                return SettlementRecord(
+                    SettlementStatus.FINALIZED, effect_id="independent-truth", amount_usd=Decimal("50"),
+                    evidence={"source": "independent"}, authoritative=True,
+                    verified_request_hash=canonical_hash(request),
+                )
+
+        runtime = self.runtime_for(LyingSubmitter())
+        i = intent(intent_id="intent_test_000000000052")
+        result = self.execute_case(i, runtime=runtime)
+        self.assertEqual(IntentState.FINALIZED, result.state)
+        self.assertEqual("independent-truth", result.effect_id)
+        self.assertEqual("independent-truth", self.store.get(i.intent_id).effect_id)
+
+    def test_settlement_for_different_request_hash_stops(self):
+        class Submitter:
+            name = "mock-dex"
+            security_profile = REFERENCE_SAFE_PROFILE
+            def execute(self, request, permit):
+                return ExecutionReceipt("reported", SettlementStatus.FINALIZED, {}, Decimal("50"))
+
+        class MismatchedVerifier:
+            name = "mismatched-verifier"
+            security_profile = REFERENCE_SETTLEMENT_PROFILE
+            def verify(self, request):
+                return SettlementRecord(
+                    SettlementStatus.FINALIZED, effect_id="wrong-binding", amount_usd=Decimal("50"),
+                    authoritative=True, verified_request_hash="deadbeef",
+                )
+
+        runtime = self.runtime_for(Submitter(), verifier=MismatchedVerifier())
+        i = intent(intent_id="intent_test_000000000053")
+        result = self.execute_case(i, runtime=runtime)
+        self.assertEqual(IntentState.STOPPED, result.state)
+        self.assertIn("SETTLEMENT_REQUEST_BINDING_MISMATCH", result.reason_codes)
+        self.assertIsNone(self.store.get(i.intent_id).effect_id)
+
+    def test_unexpected_permit_issuance_exception_fails_before_adapter(self):
+        class BrokenPermitAuthority:
+            def issue(self, *args, **kwargs):
+                raise RuntimeError("signer datastore unavailable")
+
+        runtime = FAARRuntime(
+            self.store, {"mock-dex": self.venue}, verification_trust(self.trust), BrokenPermitAuthority(),
+            {"mock-dex": self.settlement}, clock=lambda: NOW, allow_test_time_override=True,
+        )
+        i = intent(intent_id="intent_test_000000000054")
+        result = self.execute_case(i, runtime=runtime)
+        self.assertEqual(IntentState.FAILED_SAFE, result.state)
+        self.assertIn("EXECUTION_PERMIT_EXCEPTION", result.reason_codes)
+        self.assertEqual(0, self.venue.execute_call_count(i.intent_id))
+
+    def test_submitter_failure_cannot_hide_independently_observed_effect(self):
+        class RejectingSubmitter:
+            name = "mock-dex"
+            security_profile = REFERENCE_SAFE_PROFILE
+            def execute(self, request, permit):
+                raise DeterministicFailure("claimed pre-execution rejection")
+
+        class PositiveVerifier:
+            name = "positive-independent-verifier"
+            security_profile = REFERENCE_SETTLEMENT_PROFILE
+            def verify(self, request):
+                return SettlementRecord(
+                    SettlementStatus.FINALIZED, effect_id="effect-despite-rejection", amount_usd=Decimal("50"),
+                    authoritative=True, verified_request_hash=canonical_hash(request),
+                )
+
+        runtime = self.runtime_for(RejectingSubmitter(), verifier=PositiveVerifier())
+        i = intent(intent_id="intent_test_000000000055")
+        result = self.execute_case(i, runtime=runtime)
+        self.assertEqual(IntentState.FINALIZED, result.state)
+        self.assertEqual("effect-despite-rejection", result.effect_id)
 
     def test_payment_settlement_amount_must_match_exactly(self):
         pay = intent(
