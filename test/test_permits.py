@@ -11,10 +11,12 @@ from faar.models import ExecutionRequest
 from faar.permits import (
     ConstrainedPermitAuthority,
     Ed25519PermitSignature,
+    Ed25519PermitVerifier,
     ExecutionPermitVerifier,
     HMACPermitSignature,
     PermitIssuanceError,
 )
+from faar.attestation import has_signing_api
 from faar.store import SQLiteIntentStore
 
 from support import AUTH, NOW, PRINCIPAL, attest_pair, grant, intent, risk, trust, verification_trust
@@ -164,9 +166,60 @@ class PermitBoundaryTests(unittest.TestCase):
         payload = b"FAAR permit test"
         signature = signer.sign(payload)
         self.assertTrue(verifier.verify(payload, signature))
-        with self.assertRaises(PermissionError):
-            verifier.sign(payload)
+        self.assertIsInstance(verifier, Ed25519PermitVerifier)
+        self.assertFalse(has_signing_api(verifier))
+        self.assertFalse(hasattr(verifier, "sign"))
         self.assertFalse(verifier.verify(payload + b"tampered", signature))
+
+    def test_signer_creates_artifact_accepted_by_verifier(self):
+        i, req, permit = self.issue(i=intent(intent_id="permit_accept_00000000001"), rs=risk(state_version=40))
+        ok, reasons = self.verifier.verify(permit, req, now=NOW)
+        self.assertTrue(ok, reasons)
+
+    def test_verifier_has_no_minting_api_and_cannot_issue(self):
+        backend = self.sig.public_verifier()
+        self.assertFalse(has_signing_api(backend))
+        with self.assertRaisesRegex(ValueError, "signing-capable private backend"):
+            ConstrainedPermitAuthority(self.store, verification_trust(self.trust), backend)
+        with self.assertRaisesRegex(ValueError, "verify-only"):
+            ExecutionPermitVerifier(self.sig, self.store)
+
+    def test_permit_verifier_rejects_private_key_material(self):
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+        with self.assertRaisesRegex(ValueError, "signing-capable"):
+            Ed25519PermitVerifier("permit-test", Ed25519PrivateKey.generate())
+
+    def test_tampered_permit_signature_fails(self):
+        i, req, permit = self.issue(i=intent(intent_id="permit_tamper_sig_00000001"), rs=risk(state_version=41))
+        tampered = replace(permit, signature=permit.signature[:-4] + "AAAA")
+        ok, reasons = self.verifier.verify(tampered, req, now=NOW)
+        self.assertFalse(ok)
+        self.assertIn("PERMIT_SIGNATURE_INVALID", reasons)
+
+    def test_tampered_permit_body_fails(self):
+        i, req, permit = self.issue(i=intent(intent_id="permit_tamper_body_0000001"), rs=risk(state_version=42))
+        mutated = replace(permit.permit, intent_id="intent_forged_000000000001")
+        tampered = replace(permit, permit=mutated)
+        ok, reasons = self.verifier.verify(tampered, req, now=NOW)
+        self.assertFalse(ok)
+        self.assertIn("PERMIT_SIGNATURE_INVALID", reasons)
+
+    def test_untrusted_permit_signer_fails(self):
+        i, req, permit = self.issue(i=intent(intent_id="permit_untrusted_000000001"), rs=risk(state_version=43))
+        other = Ed25519PermitSignature("untrusted-permit")
+        other_verifier = ExecutionPermitVerifier(other.public_verifier(), self.store)
+        ok, reasons = other_verifier.verify(permit, req, now=NOW)
+        self.assertFalse(ok)
+        self.assertIn("PERMIT_SIGNER_UNKNOWN", reasons)
+        self.assertIn("PERMIT_SIGNATURE_INVALID", reasons)
+
+    def test_intent_grant_binding_remains_enforced(self):
+        i, req, permit = self.issue(i=intent(intent_id="permit_binding_00000000001"), rs=risk(state_version=44))
+        other_req = ExecutionRequest.from_intent(intent(intent_id="intent_other_000000000001"))
+        ok, reasons = self.verifier.verify(permit, other_req, now=NOW)
+        self.assertFalse(ok)
+        self.assertIn("PERMIT_REQUEST_HASH_MISMATCH", reasons)
+        self.assertIn("PERMIT_REQUEST_IDENTITY_MISMATCH", reasons)
 
 
 if __name__ == "__main__":
