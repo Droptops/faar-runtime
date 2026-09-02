@@ -1,5 +1,52 @@
 # Changelog
 
+## 0.4.0 — 2026-09-02
+
+Third adversarial pass over v0.3.1 plus the operator controls a first bounded deployment needs. Still **pre-alpha and not approved for live funds or production credentials**. See [`docs/RED_TEAM_REPORT.md`](docs/RED_TEAM_REPORT.md) findings RT-42..RT-65 and [`docs/GO_LIVE_CHECKLIST.md`](docs/GO_LIVE_CHECKLIST.md).
+
+**Exactly-once and recovery**
+
+- Permit-bounded ambiguity window (RT-42): an ambiguous or timed-out attempt records its permit expiry; an authoritative `NONE` inside that window is not trusted (`SETTLEMENT_NONE_WITHIN_PERMIT_WINDOW`) and no retry is issued until the venue can no longer consume the permit. The bounded model shows duplicate effects are reachable without this rule.
+- Non-authoritative settlement observations never STOP an intent or invalidate a recorded effect (RT-43).
+- The deterministic-failure resubmission block is durable across calls and workers (RT-44).
+- Settlement verification and retries run outside the per-grant revocation fence; `FAARRuntime(adapter_deadline_seconds=...)` bounds the adapter call (RT-45).
+- Every terminal decision is recorded in the evidence chain; recovered authorizations record the `authorized` event (RT-61).
+- Terminalize-and-release is one transaction; replaying a terminal never-submitted intent releases an orphaned hold (RT-59).
+
+**Emergency controls, restore safety, key lifecycle**
+
+- `halt(scope)` / `resume(scope)` (global or per principal) advance every affected grant epoch so outstanding permits die immediately and stay dead after resume; effective status `HALTED` (RT-63).
+- `AuthorityAnchor` (`faar/anchor.py`): an external high-water mark of grant epoch and fence counter. A restored backup whose authority state regressed reports `REGRESSED`, refuses permit issuance and consumption, and is recovered only by `revoke_after_restore` (RT-62). `checkpoint()` for WAL-mode backups.
+- `KeyValidity(not_before, not_after, revoked)` for attestation keys and permit signers; the permit gateway accepts several signer ids for overlap-window rotation and rejects unknown, revoked, or out-of-window signers (RT-64).
+- Operator CLI: `halt`, `resume`, `controls`, `list-grants`, `list-intents`, `held-usage`, `list-leases`, `clear-lease`, `rebuild-evidence-head`, `revoke-after-restore`, `checkpoint`; `verify-evidence` takes the MAC key from an environment variable; `--anchor` opens the store with a file anchor. Runbook in `docs/OPERATIONS.md`.
+
+**Trust boundaries**
+
+- One bounded amount parser (plain ASCII decimal grammar, canonical precision/exponent bounds) shared by gates, usage reservation, permit signer, settlement integrity and reference venues; `1e-999999999` could previously make the store allocate gigabytes (RT-50).
+- Attestation expiry is exact; permits never outlive the attestations they derive from (RT-46). Ed25519 signatures accept one canonical encoding (RT-47). Permit signatures cover signer id and algorithm (RT-48). The permit verifier returns `PERMIT_MALFORMED` instead of raising.
+- Parsers reject unknown document/limit keys and falsy timestamps (RT-49); payloads must be JSON objects; identifiers are bounded (`intent_id` 16..128); `schema_version` must be `0.3`; `Attestation.kind` is coerced; naive datetimes and oversized ints fail at construction; effect ids are validated at the trust boundary (RT-52).
+- BUY/SELL/PLACE_ORDER payloads with both `amount_usd` and `notional_usd` are denied (RT-51); `target` is the only counterparty key; SWAP identical-asset check uses normalized presence; proven risk-limit breaches DENY while missing/stale data DEFERs.
+- Quorum settlement votes numerically, tolerates a raising minority source, and carries agreeing evidence forward (RT-54); paper venue reconcile binds the effect to the executing request.
+- The attested outcome verifier binds the settlement to this intent's execution request (RT-53); `eq` compares numbers numerically without conflating booleans; issuance tolerates clock skew.
+
+**Store**
+
+- v0.3.0 databases open again (velocity index created after migration); migration is transactional with busy retry (RT-55).
+- Daily turnover is a trailing 24 h window (RT-56). Effect ids are unique per `(venue, effect_id)` (RT-58).
+- Evidence: appends refuse to re-commit the head over a truncated chain, verification is single-transaction and fails closed for unknown or deleted chains, every chain starts at registration, `rebuild_evidence_head` is an explicit operator migration (RT-57).
+- `intent_guard` honours `wait_seconds` in-process; per-intent locks are reference-counted; execution fences are shared per database path (RT-60). `reserve_usage` rejects malformed amounts on monetary primitives; the monotonic risk ceiling spans both ledgers. `UnknownIntent` is a typed `KeyError`.
+
+**Evidence and packaging**
+
+- `evals/run_redteam.py` maps every attack class to named unit tests, loads the suite in-process, and fails on unmapped tests (86 classes, 104 tests). `run_adversarial.py` measures adapter calls and permits issued/consumed. `run_state_fuzz.py` advances a shared clock. The model checker models two permits, in-flight submission, expiry, halt and resume, and reports the without-rule counterexample.
+- New test modules: `test_store_hardening`, `test_runtime_hardening`, `test_boundary_hardening`, `test_mutation_gaps` (kills the 17 mutants that previously survived), `test_controls`, `test_key_lifecycle`, `test_schemas`, plus a cross-process revocation test. 237 unit tests.
+- Schemas describe 0.3 documents (`principal_id`, `algorithm`+`signature`); examples validate in the unit suite when `jsonschema` is installed (`pip install -e ".[dev]"`). CI job timeout; Python 3.12/3.13 classifiers; full Apache-2.0 license text.
+- Documentation rewritten to match the code: architecture, trust and threat models, adapter/verifier contract, recovery table, invariants I-1..I-34, execution permits, operations runbook, go-live checklist; stale v0.2/HMAC statements removed.
+
+Unreleased in 0.3.1 but merged before it (PR #3): permit signing and verification split into `PermitSigner`/`PermitVerifier` and `Ed25519AttestationVerifier`, with the runtime, permit authority and gateway rejecting signing-capable trust.
+
+These are regression results, not formal verification, an independent audit, or a production-safety claim.
+
 ## 0.3.1 — 2026-08-31
 
 Red-team patch over v0.3.0 from a second adversarial review pass. Still **pre-alpha and not approved for live funds or production credentials**. See [`docs/RED_TEAM_REPORT.md`](docs/RED_TEAM_REPORT.md) findings RT-36..RT-41.

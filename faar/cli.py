@@ -232,7 +232,9 @@ def main(argv=None) -> None:
     if command == "clear-lease":
         cleared = SQLiteIntentStore(args.db).clear_stale_intent_lease(args.intent_id, expected_owner_token=args.owner_token)
         _emit({"intent_id": args.intent_id, "cleared": cleared})
-        raise SystemExit(0 if cleared else 2)
+        if not cleared:
+            raise SystemExit(2)
+        return
 
     if command == "halt":
         store = _open_store(args)

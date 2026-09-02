@@ -4,26 +4,82 @@
   "title": "FAAR Definition-of-Done Task Contract",
   "type": "object",
   "additionalProperties": false,
-  "required": ["task_id", "intent_id", "objective", "criteria", "issued_at", "expires_at"],
+  "required": [
+    "task_id",
+    "intent_id",
+    "objective",
+    "criteria",
+    "issued_at",
+    "expires_at"
+  ],
   "properties": {
-    "task_id": {"type": "string", "minLength": 1, "maxLength": 128},
-    "intent_id": {"type": "string", "minLength": 16, "maxLength": 128},
-    "objective": {"type": "string", "minLength": 1, "maxLength": 2048},
+    "task_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "intent_id": {
+      "type": "string",
+      "minLength": 16,
+      "maxLength": 128
+    },
+    "objective": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 2048
+    },
     "criteria": {
       "type": "array",
       "minItems": 1,
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["path", "op"],
+        "required": [
+          "path",
+          "op"
+        ],
         "properties": {
-          "path": {"type": "string", "minLength": 1},
-          "op": {"enum": ["present", "eq", "gte", "lte"]},
+          "path": {
+            "type": "string",
+            "minLength": 1
+          },
+          "op": {
+            "enum": [
+              "present",
+              "eq",
+              "gte",
+              "lte"
+            ]
+          },
           "value": {}
-        }
+        },
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "op": {
+                  "const": "present"
+                }
+              }
+            },
+            "then": {
+              "not": {
+                "required": [
+                  "value"
+                ]
+              }
+            }
+          }
+        ]
       }
     },
-    "issued_at": {"type": "string", "format": "date-time"},
-    "expires_at": {"type": "string", "format": "date-time"}
+    "issued_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "expires_at": {
+      "type": "string",
+      "format": "date-time"
+    }
   }
 }

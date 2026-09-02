@@ -1,10 +1,10 @@
-# FAAR v0.2 Red-Team Report
+# FAAR Red-Team Report
 
 ## Scope
 
-Baseline target: the v0.1 reference runtime. This report records failures found while hardening it into v0.2 under a deliberately hostile assumption: the model and ordinary coordination layer may be malicious, buggy, replaying stale state, racing workers, or experiencing ambiguous external I/O.
+This report records failures found while hardening the reference runtime under a deliberately hostile assumption: the model and ordinary coordination layer may be malicious, buggy, replaying stale state, racing workers, or experiencing ambiguous external I/O. It accumulates across releases; the v0.2 and v0.3.1 sections are kept as history.
 
-Method: source review, state-machine analysis, concurrency fault reasoning, deterministic adversarial adapters, mutation cases, and seeded replay/concurrency fuzzing.
+Method: source review, state-machine analysis, concurrency fault reasoning, deterministic adversarial adapters, mutation cases, seeded replay/concurrency fuzzing and, since v0.4.0, a mutation sweep of security-relevant checks against the unit suite with end-to-end confirmation of every surviving mutant.
 
 **This is self-red-team regression evidence, not an independent audit or formal proof.**
 
@@ -21,7 +21,7 @@ Method: source review, state-machine analysis, concurrency fault reasoning, dete
 | RT-07 | Concurrent different intents could oversubscribe turnover | High | Transactional usage reservation |
 | RT-08 | Different intents could reuse one apparently-safe portfolio snapshot | High | Single-consumption monotonic risk-state claims |
 | RT-09 | Retry limit could reset across invocations | Medium | Persisted submission count |
-| RT-10 | One external effect ID could be attributed to multiple intents | High | Global effect-ID uniqueness + STOP |
+| RT-10 | One external effect ID could be attributed to multiple intents | High | Effect-ID uniqueness + STOP |
 | RT-11 | NaN/infinity/time anomalies could crash or bypass comparisons | Medium | Strict finite/time validation |
 | RT-12 | Model could smuggle low-level execution authority | High | Forbidden raw/signing fields |
 | RT-13 | Database hash chain alone did not authenticate rewritten events | Medium | Optional event HMAC |
@@ -50,59 +50,88 @@ Method: source review, state-machine analysis, concurrency fault reasoning, dete
 
 ## Findings fixed in v0.3.1
 
-A second adversarial review pass (source review plus a fan-out of independent per-dimension reviewers, each finding adversarially re-verified) surfaced the following code-level gaps over v0.3.0. Each was reproduced against the real modules before fixing and now has regression coverage.
-
 | ID | Finding | Severity in reference model | v0.3.1 response |
 |---|---|---:|---|
-| RT-36 | `QuorumSettlementVerifier` resolved a genuine source disagreement by iteration order: when two distinct authoritative facts each reached quorum (e.g. a 2-2 split at quorum=2) it returned the first, not a contradiction | High | Multiple facts reaching quorum now return `CONTRADICTORY` (fail closed) |
-| RT-37 | `allowed_assets` allowlist was skipped for a falsy-but-present asset value (integer `0`, `false`) because asset extraction used truthiness, not presence | Low | Asset extraction uses presence (`not in (None, "")`), so falsy values are validated |
-| RT-38 | `denied_targets` / `TARGET_REQUIRED` were skipped for a falsy-but-present target because target resolution used `a or b or c` | Low | Target resolution coalesces on presence (`is None`), not truthiness |
-| RT-39 | Action-velocity reservation used a fixed tumbling bucket (`timestamp // window`), allowing up to 2x the limit to fire across a bucket boundary | Low / Medium | Sliding window over the trailing `action_window_seconds` |
-| RT-40 | The evidence hash chain could not detect tail-truncation or whole-chain deletion (a deleted suffix leaves an internally consistent prefix), despite the store claiming to detect database-only rewriting | Medium | Signed per-intent head commitment (seq + head hash under the evidence MAC) detects truncation/deletion in keyed mode |
-| RT-41 | CI actions pinned to mutable `@v4`/`@v5` tags; `cryptography` pinned to an over-tight `>=46,<47` that blocked installs and security updates | Low | Actions pinned to commit SHAs; dependency range loosened |
+| RT-36 | `QuorumSettlementVerifier` resolved a genuine source disagreement by iteration order | High | Multiple facts reaching quorum now return `CONTRADICTORY` |
+| RT-37 | `allowed_assets` allowlist was skipped for a falsy-but-present asset value | Low | Asset extraction uses presence, not truthiness |
+| RT-38 | `denied_targets` / `TARGET_REQUIRED` were skipped for a falsy-but-present target | Low | Target resolution coalesces on presence |
+| RT-39 | Action-velocity reservation used a fixed tumbling bucket allowing 2x the limit across a boundary | Low / Medium | Sliding window over the trailing `action_window_seconds` |
+| RT-40 | Evidence hash chain could not detect tail-truncation or whole-chain deletion | Medium | Signed per-intent head commitment |
+| RT-41 | CI actions pinned to mutable tags; `cryptography` pinned to an over-tight range | Low | Actions pinned to commit SHAs; dependency range loosened |
 
-Residual, by design: RT-40's head commitment is only meaningful when an evidence key is configured — without a key a database-level attacker can rewrite the head row too, so the chain-only guarantees remain the ceiling (see R-07). RT-36 still accepts a quorum-reaching fact when the dissent is below quorum; that is the intended tolerance of a quorum configuration, not unanimity.
+## Findings fixed in v0.4.0
+
+A third adversarial pass ran eight independent reviewers over the store, runtime, cryptographic boundary, gates/parsing, settlement/outcomes, documentation, test coverage and the go-live gates, then reproduced every code-level finding against the real modules before fixing it. A 51-mutant sweep of security-relevant checks found 17 mutants that passed the whole suite while permitting an unauthorized or duplicate effect end to end; each now has a killing test (`test/test_mutation_gaps.py`).
+
+| ID | Finding | Severity in reference model | v0.4.0 response |
+|---|---|---:|---|
+| RT-42 | An authoritative `NONE` while the previous attempt was still in flight (timeout, exception) authorized a retry; the venue could later execute both permits | High | Permit-bounded ambiguity window: absence is not trusted and no retry is issued until the last permit has expired plus clock skew (`SETTLEMENT_NONE_WITHIN_PERMIT_WINDOW`); bounded model demonstrates the duplicate without the rule |
+| RT-43 | A non-authoritative observation after a CONFIRMED effect terminally STOPPED the intent (`SETTLEMENT_LOST_PREVIOUS_EFFECT`), stranding a real effect and its budget | Medium | Continuity and amount checks apply to authoritative records only; weak observations stay UNKNOWN |
+| RT-44 | The deterministic-failure resubmission block was call-local; a later worker resubmitted | Low | Block derived from persisted reason codes, carried through every non-terminal transition |
+| RT-45 | Settlement verification and retries ran inside the per-grant revocation fence on exception paths; a revoke queued behind a verifier and a retry executed first | Low | Only the adapter call is fenced; `adapter_deadline_seconds` bounds it |
+| RT-46 | `attestation.expires_at + skew` extended signed authority; permits were not bounded by attestation expiry | Medium | Expiry exact; permit expiry is the minimum of intent, grant and both attestation expiries |
+| RT-47 | Ed25519 signature strings had many accepted encodings (padding, junk suffix, alternate alphabet, trailing bits) | Low | One canonical encoding accepted |
+| RT-48 | Permit signature did not cover `signer_id`/`algorithm` | Info | Envelope signed; multi-signer gateway with key lifecycle |
+| RT-49 | `parse_grant` ignored unknown/misspelled keys: a typo'd optional limit became "not enforced" inside a valid fingerprint | Medium | Strict key allowlists for every document |
+| RT-50 | Amount grammar: `1e-999999999` passed the gate and made the store allocate gigabytes; whitespace/Unicode/exponent strings were forwarded to adapters | High (availability) | One bounded ASCII decimal parser shared by every amount consumer |
+| RT-51 | BUY/SELL/PLACE_ORDER accepted both `amount_usd` and `notional_usd` with different values; the ceiling applied to one, the adapter saw both | Medium | `AMOUNT_FIELDS_AMBIGUOUS` deny |
+| RT-52 | Non-Mapping payload, `Attestation.kind` as a plain string, bytes effect ids, oversized ints, naive datetimes, 5 MB identifiers escaped `process()` as raw exceptions or were accepted | Medium | Construction-time validation; identifier bounds; `SETTLED_EFFECT_ID_INVALID` |
+| RT-53 | Outcome verifier never bound the settlement record to the contract's intent; another intent's FINALIZED record yielded MET | Medium | `TASK_SETTLEMENT_INTENT_MISMATCH` |
+| RT-54 | Quorum split honest sources on Decimal scale (`50` vs `50.00`) and one raising source wedged the quorum forever | Medium (availability) | Numeric vote; raising source counts as non-authoritative UNKNOWN |
+| RT-55 | A v0.3.0 database could not be opened by v0.3.1 (index created before migration); concurrent workers raced the migration | High (availability) | Indexes after migration; transactional migration; busy retry |
+| RT-56 | Daily turnover was a UTC calendar bucket: 2x the cap across midnight | Medium | Trailing 24 h window |
+| RT-57 | The next legitimate append re-committed the evidence head over a truncated chain, laundering RT-40 tampering; verification of unknown intents returned true; reads raced appends | Medium | Append refuses on head mismatch; fail closed for unknown/deleted chains; single-transaction verification; chains start at registration |
+| RT-58 | Global effect-id uniqueness across venues recorded a genuine second-venue effect as STOPPED | Medium | Uniqueness per (venue, effect_id) |
+| RT-59 | Terminalize + release ran as two statements; a crash between them stranded HELD budget forever; `reserve_usage` coerced malformed amounts to a zero-cost reservation; the two risk ledgers disagreed on "stale" | Low | Atomic `transition(release_usage=True)`; orphan release on replay; fail-closed amounts; shared monotonic ceiling |
+| RT-60 | `intent_guard` ignored `wait_seconds` in-process; fences were per store instance; lock registry grew unbounded | Low | Timed acquire; fences shared per database path; reference counting |
+| RT-61 | Terminal STOPs for grant substitution, paused grants and recovered authorizations left no evidence; recovered authorizations lacked the `authorized` event | Low | Every terminal decision recorded |
+| RT-62 | Backup restore resurrected revoked grants, consumed permits and spent risk states (gate 2) | High | External `AuthorityAnchor`; `REGRESSED` status; `revoke_after_restore` |
+| RT-63 | No kill switch: an incident required revoking N grant versions one by one while workers kept minting permits (gate 9) | High | `halt(scope)` / `resume(scope)` with epoch fencing |
+| RT-64 | No key rotation or revocation; the gateway trusted exactly one signer id (gate 1) | Medium | `KeyValidity`; multi-signer gateway |
+| RT-65 | 17 security checks had no killing test: capability scope (venue/primitive/actor), every risk limit, authority primitive, pause/resume epoch fence, Ed25519 role scope, grant auto-provisioning, future attestations, permit expiry, risk monotonicity, PAY runtime path, settlement profile gate, outcome prerequisites | High (assurance) | `test_mutation_gaps.py`; red-team matrix now maps classes to tests and fails on unmapped ones |
+
+Residual, by design: RT-42's window is only as accurate as the venue's permit expiry check; a venue that ignores permits is outside the model. RT-62's anchor detects nothing if restored together with the database. RT-45's deadline cannot cancel a Python call; the orphaned call is bounded by RT-42.
 
 ## Executable regression matrix
 
-The findings table above records the v0.2 hardening work. The matrix below is the current `make check` result for v0.3.0:
+Current `make check` result for v0.4.0:
 
 ```text
-105 unit/invariant tests -> PASS
-59 targeted red-team attack classes -> PASS
-160 deterministic denial mutations -> 0 unauthorized economic effects
-100 retries of one logical intent -> 1 successful effect
-ambiguous timeout-after-effect recovery -> 1 successful effect
-96 seeded replay/concurrency state-machine scenarios -> 0 duplicate-effect violations
+237 unit/invariant tests -> PASS
+86 targeted red-team attack classes, each mapped to named tests (104 tests) -> PASS, 0 unmapped
+160 deterministic denial mutations -> 0 unauthorized economic effects, 0 adapter calls
+100 retries of one logical intent -> 1 successful effect, 1 adapter call, 1 permit issued and consumed
+ambiguous timeout-after-effect recovery -> 1 successful effect, 1 adapter call
+96 seeded replay/concurrency state-machine scenarios (clock advancing) -> 0 duplicate-effect violations
 96 seeded replay/concurrency state-machine scenarios -> 0 aggregate-budget violations
-CLI end-to-end mock execution -> FINALIZED once
-evidence chain verification -> valid
-bounded permit protocol model -> 0 invariant violations; stale permit consumable after revoke = false
+CLI end-to-end mock execution -> FINALIZED once; keyed evidence chain + head -> valid
+bounded permit protocol model (2 permits, in-flight, expiry, halt) -> 1766 states, 4304 transitions, 0 invariant violations
+same model without the permit-window rule -> 187 violations (first: issue, issue, submit0, consume0, submit1, consume1)
 ```
 
-The deterministic denial count covers attacks stopped **before the trusted adapter is permitted to create an effect**. A malicious adapter remains part of the TCB; post-effect amount checks can detect a bad effect report but cannot magically undo a venue action the adapter already performed.
+The deterministic denial count covers attacks stopped **before the trusted adapter is permitted to create an effect**. A malicious adapter remains part of the TCB until the venue verifies permits; post-effect amount checks can detect a bad effect report but cannot undo a venue action the adapter already performed.
 
 ## Residual risks / non-claims
 
 ### R-01 — Risk signer semantic correctness
 
-FAAR enforces authenticated, fresh, single-consumption risk versions. It cannot prove that the trusted risk service computed position, P&L, liquidity, or market state correctly.
+FAAR enforces authenticated, fresh, single-consumption, monotonic risk versions. It cannot prove that the trusted risk service computed position, P&L, liquidity, or market state correctly.
 
 ### R-02 — Distributed revocation fence
 
-The reference lock is process-local. Multi-node production requires a datastore/lease fencing token or lower-level credential/capability revocation with equivalent ordering.
+The durable fence is the grant epoch re-checked at permit consumption in the shared store, plus the kill switch. Its strength equals the store's transactional guarantee and the venue's willingness to verify permits. Multi-node production needs a store with equivalent semantics and a permit-verifying venue or gateway.
 
-### R-03 — HMAC is reference trust
+### R-03 — Key custody
 
-The reference verifier holds symmetric key material and can therefore sign within permitted roles. Production should use asymmetric/KMS/HSM-backed verification with signer/verifier separation.
+Signer and verifier roles are separated and keys can be rotated and revoked, but private keys are held by Python objects. Production needs KMS/HSM custody and process isolation for the authority, risk, task and permit signers.
 
 ### R-04 — Adapter is still in the trusted computing base
 
-The minimized `ExecutionRequest` reduces confused-deputy surface and amount/effect checks detect several classes of misreporting. But code that actually controls a broad venue credential can still perform a broader action before FAAR observes the result. A live deployment needs key isolation and, where possible, lower-level account/contract limits that make policy escape physically impossible.
+The minimized `ExecutionRequest` plus permit reduces confused-deputy surface and amount/effect checks detect several classes of misreporting. But code that controls a broad venue credential can still perform a broader action before FAAR observes the result. A live deployment needs venue-side permit verification or lower-level account/contract limits.
 
 ### R-05 — Adapter security profile is a declaration
 
-`AdapterSecurityProfile` prevents accidental integration of an adapter that admits incompatible semantics. It does not prove idempotency or authoritative lookup. Those properties require venue-specific tests and review.
+`AdapterSecurityProfile` prevents accidental integration of an adapter that admits incompatible semantics. It does not prove idempotency or authoritative lookup.
 
 ### R-06 — Credential authority
 
@@ -110,32 +139,40 @@ If a trading key can withdraw, transfer, bridge, or administer the account outsi
 
 ### R-07 — Evidence host/key compromise
 
-An attacker with runtime and event-MAC key access can rewrite a consistent local evidence history. Production may require remote append-only logs, signed checkpoints, or transparency anchoring.
+An attacker with runtime and evidence-key access can rewrite a consistent local evidence history. Whole-database rollback to an older valid snapshot is invisible to the chain. Production may require remote append-only logs, signed checkpoints, or transparency anchoring.
 
 ### R-08 — Venue semantics
 
 Universal exactly-once effects are impossible to claim for external systems without stable logical identity and authoritative reconciliation. FAAR must refuse unattended execution where those semantics cannot be established.
 
-### R-09 — Hung adapter calls can delay local revocation
+### R-09 — Hung adapter calls
 
-The reference implementation holds the grant fence across submission. A stuck venue call can delay revocation completion. Production needs bounded network deadlines plus an external revocation/fencing mechanism that does not depend on a Python call returning.
+Bounded by `adapter_deadline_seconds` and the kill switch in-repo; the abandoned Python call cannot be cancelled and is bounded only by the permit window and the venue honouring expiry.
 
 ### R-10 — Intent namespace denial of service
 
-If public unauthenticated ingress can choose `intent_id`, it can squat predictable IDs. Production ingress must authenticate the principal and server-mint or cryptographically namespace durable economic intent IDs.
+Ids are principal-namespaced and length-bounded, but first-writer-wins: unauthenticated ingress that can choose ids can still squat predictable ids inside a principal. Production ingress must authenticate the principal and server-mint or cryptographically namespace ids.
 
 ### R-11 — Trusted clock / host compromise
 
-Caller-provided time cannot roll the security clock backwards, but a compromised host clock/runtime can. Production time-sensitive deployments should use hardened time sources and operational monitoring appropriate to the threat model.
+Caller-provided time cannot roll the security clock backwards, but a compromised host clock/runtime can. The permit window assumes runtime and venue clocks agree within the grant's skew allowance.
 
-### R-12 — No independent settlement verifier yet
+### R-12 — Reference settlement verifier shares ground truth with the mock venue
 
-v0.2 uses the adapter's authoritative reconciliation interface. A stronger live architecture should separate **execution** from **independent effect verification** so the component holding execution credentials is not the sole source of truth about what it did.
+The runtime enforces a distinct, trusted verifier per adapter, but `MockSettlementVerifier` reads the same in-memory ledger as `MockVenue`; independence in the reference is structural, not evidential. Live venues need an independently authenticated read path or a quorum.
+
+### R-13 — Anchor placement
+
+The authority anchor is only meaningful on storage that is not restored with the database. This is an operational property the library cannot enforce.
+
+### R-14 — Partial fills and cancellation
+
+The reference commits the authorized notional on any authoritative FINALIZED at or below it and has no cancel/late-fill linkage. Order venues need this modelled before live use.
 
 ## Claim boundary
 
 The strongest supportable claim is narrow:
 
-> Under the current deterministic mock/paper adapter model and the encoded fault classes, FAAR v0.3.0 preserves the tested authorization, bounded-capability, replay/recovery, aggregate-usage, and settlement-integrity invariants.
+> Under the current deterministic mock/paper adapter model and the encoded fault classes, FAAR v0.4.0 preserves the tested authorization, bounded-capability, replay/recovery, permit-fencing, aggregate-usage, settlement-integrity, restore-safety and key-lifecycle invariants.
 
 It is **not** a production-security claim, live-venue claim, custody claim, or proof that a compromised trusted adapter cannot move funds incorrectly.

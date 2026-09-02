@@ -1,4 +1,6 @@
-# FAAR v0 Build Spec
+# FAAR v0 Build Spec (historical)
+
+> This is the original v0 plan, kept for the record. Model and mock-mode names have since changed (`ExecutionReceipt`/`ExecutionRequest`/`ExecutionPermit`/`SettlementRecord`; `MockMode` has SUCCESS, TIMEOUT_BEFORE_EFFECT, TIMEOUT_AFTER_EFFECT, AMBIGUOUS). Current architecture: `docs/ARCHITECTURE.md`; current gate status: `docs/GO_LIVE_CHECKLIST.md`.
 
 ## Objective
 

@@ -8,7 +8,7 @@ Binding only to `grant_id + version` is insufficient if a coordinator can presen
 (grant_id, version) -> SHA256(canonical_grant)
 ```
 
-and verifies the full fingerprint on every execution path.
+and verifies the full fingerprint on every execution path. The parser rejects unknown top-level and `limits` keys, so a misspelled optional limit is a provisioning error rather than an unenforced control hiding inside a valid fingerprint.
 
 
 ## Bounded-by-construction grant rules
@@ -51,8 +51,17 @@ Revocation cannot undo an effect that already happened. FAAR may continue reconc
 
 ## Fencing
 
-The reference runtime serializes local submission and status mutation with a per-grant execution guard. Its precise local guarantee is:
+Two mechanisms:
 
-> after `REVOKED` returns, no later adapter submission under that grant version can begin in that process.
+1. **In-process guard.** Submission and status mutation serialize on a per-grant guard shared by every store instance opened on the same database file in one process: after `REVOKED` returns, no later adapter submission under that grant version can begin in that process.
+2. **Durable epoch.** Every lifecycle change (pause, resume, revoke, halt) advances the grant's `runtime_epoch`. Each execution permit carries the epoch it was issued under, and permit consumption re-checks it in the same store transaction. An in-flight attempt in another process is therefore refused at the venue (`PERMIT_GRANT_EPOCH_STALE`) even though the in-process guard could not stop it.
 
-This is not a distributed guarantee. Production multi-node systems require a fencing token/lease/serializable authority mechanism or venue-level capability revocation.
+The durable fence is as strong as the store's transactional guarantee and as the venue's permit verification; a venue that ignores permits cannot be fenced from outside.
+
+## Emergency halt
+
+`halt(scope, reason)` with scope `global` or `principal:<id>` marks the scope halted and advances every affected grant epoch in one transaction; the effective grant status becomes `HALTED`, new intents stop with `GRANT_RUNTIME_HALTED`, and permits issued before the halt stay dead after `resume`. A halt does not wait for in-flight adapter calls. See `OPERATIONS.md` §1.
+
+## Restore safety
+
+With an `AuthorityAnchor` configured outside the backup set, a grant version whose `(runtime_epoch, fence_counter)` is older than the anchor is `REGRESSED`: nothing is issued or consumed under it and its lifecycle can only be closed with `revoke_after_restore`. See `OPERATIONS.md` §5.

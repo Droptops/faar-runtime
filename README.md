@@ -2,7 +2,7 @@
 
 > **Models propose. FAAR authorizes. Deterministic executors act.**
 
-FAAR is a runtime authority layer for autonomous financial agents. It converts an agent's proposed economic action into a canonical intent, checks that action against deterministic capability and risk constraints, and only then permits an executor to create an economic effect.
+FAAR is a runtime authority layer for autonomous financial agents. It converts an agent's proposed economic action into a canonical intent, checks that action against deterministic capability and risk constraints, mints a narrowly scoped signed execution permit, and only then lets an executor create an economic effect that an independent verifier must confirm.
 
 FAAR is intentionally separate from model reasoning. A model may recommend or request an action; it does not get to expand its own authority, bypass limits, or decide that an ambiguous state is safe enough to execute.
 
@@ -13,8 +13,9 @@ Agent wallets and spending limits solve only part of the problem. Autonomous sys
 - **What work is this agent authorized to perform?**
 - **Which economic primitive is permitted?**
 - **Under what asset, venue, amount, counterparty, time, and risk limits?**
-- **Has this logical intent already produced an economic effect?**
+- **Has this logical intent already produced an economic effect, or might it still?**
 - **What evidence proves what actually settled?**
+- **How do we stop everything, and what survives a restore from backup?**
 
 FAAR treats those as runtime invariants rather than prompt instructions.
 
@@ -37,14 +38,16 @@ ConstraintGate / AAR
                  │
           ALLOW | DENY
                  │
+        signed execution permit
+                 │
        deterministic executor
                  │
-         settlement evidence
+   independent settlement evidence
 ```
 
 AAR answers: **is EXECUTE the licensed work primitive?**
 
-FAAR answers: **is this specific economic execution within the granted capability envelope?**
+FAAR answers: **is this specific economic execution within the granted capability envelope, and did it happen exactly once?**
 
 Both must pass before money moves.
 
@@ -54,21 +57,21 @@ FAAR is built around five non-negotiable properties:
 
 1. **Exactly-once economic intent**
    - For every logical `intent_id`, successful economic effects must be `<= 1`.
-   - Retries, crashes, timeouts, concurrent workers, duplicate messages, and ambiguous RPC responses must not create a second valid execution.
+   - Retries, crashes, timeouts, concurrent workers, duplicate messages, and ambiguous RPC responses must not create a second valid execution. A retry is never issued while a venue can still act on a previous attempt's permit.
 
 2. **Unauthorized means no economic effect**
-   - If authority, capability, or risk evaluation denies an intent, the executor must be unable to create the requested effect.
+   - If authority, capability, or risk evaluation denies an intent, the executor must be unable to create the requested effect: no permit is minted, and a permit-verifying venue refuses unsigned requests.
 
 3. **Authority is non-self-escalating**
-   - An agent cannot modify its own capability grant, limits, approved assets, approved venues, or circuit breakers.
+   - An agent cannot modify its own capability grant, limits, approved assets, approved venues, or circuit breakers. The runtime cannot provision grants or change their lifecycle.
 
 4. **Ambiguity fails closed**
    - Stale market data, contradictory settlement evidence, unknown contracts, RPC disagreement, and unresolved prior execution state route to `DEFER` or `STOP`, never optimistic execution.
 
 5. **Settlement is evidence-driven**
-   - API success is not settlement. The system records and verifies external execution evidence appropriate to the venue or chain.
+   - API success is not settlement. Submitter receipts are telemetry; only an independent verifier's authoritative, request-bound record advances an intent.
 
-See [`docs/INVARIANTS.md`](docs/INVARIANTS.md).
+See [`docs/INVARIANTS.md`](docs/INVARIANTS.md) (I-1..I-34).
 
 ## First vertical: autonomous trading
 
@@ -102,92 +105,94 @@ prohibited:
 
 The model may propose a trade outside that envelope. FAAR must still deny it deterministically.
 
-## Initial architecture
+## Architecture
 
 ```text
-Strategy / LLM
+Strategy / LLM                      (untrusted)
       │
       ▼
-Authority Router (AAR semantics)
+Authority Router (AAR semantics)    Ed25519-signed authority attestation
       │
       ▼
-Canonical Intent + intent_id
+Canonical Intent + intent_id        principal-namespaced, schema 0.3
       │
       ▼
-Capability Gate
+Capability Gate ── Risk Gate        deterministic, machine-readable reason codes
       │
       ▼
-Risk Gate
+Intent Reservation / Replay Guard   atomic turnover + velocity, risk-state claim, durable lease
       │
       ▼
-Intent Reservation / Replay Guard
+Constrained Permit Authority        independent re-check, signed single-use permit
       │
       ▼
-Deterministic Executor
+Deterministic Executor ──► venue / gateway verifies & consumes the permit
+      │                     (grant epoch, halt, authority anchor)
+      ▼
+Independent Settlement Verifier     authoritative, request-bound; permit-bounded ambiguity window
       │
       ▼
-Settlement Verifier
-      │
-      ▼
-Evidence Log
+Evidence Log                        hash chain + MAC + signed head
 ```
 
-See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and [`docs/EXECUTION_PERMITS.md`](docs/EXECUTION_PERMITS.md).
 
 ## Repository layout
 
 ```text
 faar/
-  runtime.py          # authority/risk/execution state machine
+  runtime.py          # authority/risk/execution state machine, ambiguity window, adapter deadline
   gates.py            # deterministic policy gates
-  attestation.py      # scoped signed attestations
-  store.py            # durable SQLite reference store
-  adapters.py         # execution/reconciliation contract
+  models.py           # typed domain model, construction-time validation, KeyValidity
+  parsing.py          # strict JSON document parsers
+  canonical.py        # canonical serialization, hashing, bounded amount grammar
+  attestation.py      # Ed25519 role-scoped attestations, signer/verifier split, key lifecycle
+  permits.py          # constrained permit authority and permit-verifying gateway
+  store.py            # durable SQLite reference store: intents, usage, permits, evidence, halt
+  anchor.py           # external authority high-water mark (restore safety)
+  adapters.py         # execution adapter contract and deterministic mock venue
+  settlement.py       # independent settlement verifiers (mock, quorum)
   paper.py            # safe paper-trading adapter
   outcomes.py         # definition-of-done verification
+  cli.py              # demo, provisioning, and operator commands
 
 docs/
-  ARCHITECTURE.md
-  INVARIANTS.md
-  THREAT_MODEL.md
-  TRUST_MODEL.md
-  RISK_ENGINE_CONTRACT.md
-  ADAPTER_CONTRACT.md
-  RED_TEAM_REPORT.md
-  DEFINITION_OF_DONE.md
-  UNPLUG_TEST.md
-  V0_3_RELEASE.md
-  V0_2_RELEASE_GATES.md
+  ARCHITECTURE.md         EXECUTION_PERMITS.md     OPERATIONS.md
+  INVARIANTS.md           THREAT_MODEL.md          TRUST_MODEL.md
+  RISK_ENGINE_CONTRACT.md ADAPTER_CONTRACT.md      RECOVERY.md
+  GRANT_PROVISIONING.md   DEFINITION_OF_DONE.md    UNPLUG_TEST.md
+  RED_TEAM_REPORT.md      GO_LIVE_CHECKLIST.md     V0_4_RELEASE.md
+  V0_2_RELEASE_GATES.md   V0_3_RELEASE.md (historical)
 
-schemas/              # intent, grant, risk, attestation, task contracts
-evals/                 # adversarial, red-team, fuzz, and bounded-model harnesses
-test/                  # deterministic unit/invariant suite
-examples/              # non-production fixtures
+schemas/              # intent, grant, risk, attestation, task contract (0.3 documents)
+evals/                # adversarial, mapped red-team matrix, fuzz, bounded-model harnesses
+test/                 # deterministic unit/invariant suite
+examples/             # non-production fixtures
 ```
 
-## MVP sequence
+## Running it
 
-1. Freeze canonical `Intent` and `CapabilityGrant` schemas.
-2. Build deterministic capability evaluation with explicit reason codes.
-3. Build a durable intent state machine with a unique `intent_id` constraint.
-4. Add an execution adapter interface and a fully deterministic mock venue.
-5. Add adversarial tests for retries, races, crashes, stale data, prompt injection, and contradictory settlement evidence.
-6. Add one real low-risk adapter only after the invariant suite is green.
-7. Integrate AAR/ConstraintGate as an upstream authority signal without making model output a security boundary.
+```bash
+python -m venv .venv && . .venv/bin/activate
+python -m pip install -e ".[dev]"
+make check      # unit tests, adversarial, red-team matrix, fuzz, demo, bounded model
+```
+
+Operator commands (`python -m faar.cli --help`): `provision-grant`, `set-grant-status`, `halt`, `resume`, `controls`, `list-grants`, `list-intents`, `held-usage`, `list-leases`, `clear-lease`, `inspect`, `verify-evidence`, `rebuild-evidence-head`, `revoke-after-restore`, `checkpoint`, `evaluate`, `mock-run`. Procedures: [`docs/OPERATIONS.md`](docs/OPERATIONS.md).
 
 ## Status
 
-**v0.3.1 pre-alpha reference runtime. Not approved for live funds or production credentials.**
+**v0.4.0 pre-alpha reference runtime. Not approved for live funds or production credentials.**
 
-See [`docs/V0_3_RELEASE.md`](docs/V0_3_RELEASE.md). The current deterministic release gate (`make check`) includes unit tests, adversarial denial/replay checks, targeted red-team classes, seeded state-machine fuzz, the demo CLI path, and the bounded permit protocol model checker. Headline results:
+See [`docs/V0_4_RELEASE.md`](docs/V0_4_RELEASE.md). The deterministic release gate (`make check`) includes unit tests, adversarial denial/replay checks with adapter-call and permit-consumption metrics, a red-team matrix in which every attack class is mapped to named tests, seeded state-machine fuzz with an advancing clock, the demo CLI path with keyed evidence verification, and the bounded permit protocol model checker. Headline results:
 
-- 125/125 unit/invariant tests
-- 59 targeted red-team attack classes
-- 160 adversarial denial cases with 0 unauthorized economic effects
-- 100 same-intent replay attempts with 1 valid economic effect
+- 237/237 unit/invariant tests
+- 86 targeted red-team attack classes mapped to 104 named tests, 0 unmapped
+- 160 adversarial denial cases with 0 unauthorized economic effects and 0 adapter calls
+- 100 same-intent replay attempts with 1 economic effect, 1 adapter call, 1 permit issued and consumed
 - 96 seeded fuzz scenarios with 0 duplicate-effect and 0 aggregate-budget violations
-- bounded permit model: max depth 10, 12 unique states, 15 transitions, 0 invariant violations, stale permit consumable after revoke = false
+- bounded permit model: 1766 states, 4304 transitions, 0 invariant violations; stale permits unconsumable after revoke and after halt/resume; 187 violations when the permit-window rule is removed
 
-These are deterministic regression, adversarial, fuzz, and bounded-model results. They are not formal verification, an independent security audit, or a production-safety claim.
+These are deterministic regression, adversarial, fuzz, mutation-derived, and bounded-model results. They are not formal verification, an independent security audit, or a production-safety claim.
 
-Before any live-money adapter, the repository still requires the production gates in [`docs/V0_2_RELEASE_GATES.md`](docs/V0_2_RELEASE_GATES.md), including production signing/key isolation, distributed datastore fencing, authoritative risk-state semantics, reviewed venue reconciliation, authenticated ingress, failure injection, and independent security review.
+Before any live-money adapter, the repository still requires the gates in [`docs/V0_2_RELEASE_GATES.md`](docs/V0_2_RELEASE_GATES.md); [`docs/GO_LIVE_CHECKLIST.md`](docs/GO_LIVE_CHECKLIST.md) records which are closed in-repo (key rotation, cross-process fencing, restore safety, kill switch, bounded deadlines, ambiguity window), which belong to a deployment (key custody, venue-side permit verification, credential scoping, authenticated ingress, anchor placement, capped exposure), and which remain open (partial-fill/cancel semantics, datastore failover, independent security review). Do not add a real-money adapter until every row is closed and independently reviewed.

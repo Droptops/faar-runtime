@@ -4,26 +4,32 @@
 
 Suppose a portfolio has $100 of remaining daily/position capacity. Two workers read the same snapshot and independently authorize $75 trades. Both per-intent decisions are locally valid; jointly they are not.
 
-FAAR v0.2 prevents the *same trusted risk state* from authorizing two distinct new intents. That mechanism is only sound if the risk engine follows the versioning contract below.
+FAAR prevents the *same trusted risk state* from authorizing two distinct new intents, and refuses a state version older than any version already consumed by an intent or a retry. That mechanism is only sound if the risk engine follows the versioning contract below.
 
 ## Required snapshot fields
 
 A signed risk snapshot includes:
 
 ```text
-scope
-state_version
-observed_at
-position_usd
-daily_turnover_usd
+scope                       (required)
+state_version               (required, >= 1)
+observed_at                 (required, timezone-aware)
+position_after_usd
+daily_turnover_after_usd
 daily_loss_usd
 market_data_age_seconds
-slippage_bps
+requested_slippage_bps
 price_impact_bps
-window_actions
-circuit_breaker
-source_consistent
+actions_in_window
+circuit_breaker_active
+data_complete
+source_count
+sources_agree
 ```
+
+These are the exact `RiskSnapshot` field names (`faar/models.py`) and the keys of
+`schemas/risk-snapshot.schema.json`. `parse_risk` rejects any other key, so a
+misspelled field is an error rather than a silently ignored control.
 
 ## Versioning invariant
 
@@ -77,7 +83,7 @@ A production system should choose one of:
 
 ## Failure policy
 
-If version order, source consistency, or snapshot freshness cannot be proven, the correct result is DEFER/STOP—not “use the last known safe value.”
+If version order, source consistency, or snapshot freshness cannot be proven, the correct result is DEFER/STOP—not “use the last known safe value.” A proven limit breach (position, turnover, loss, slippage, price impact, velocity) is a DENY.
 
 ## Production gate
 
