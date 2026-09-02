@@ -44,11 +44,10 @@ def _order_grant(**changes) -> CapabilityGrant:
         grant_id="g-paper-gw",
         allowed_primitives=frozenset({
             EconomicPrimitive.PLACE_ORDER, EconomicPrimitive.BUY, EconomicPrimitive.SELL,
-            EconomicPrimitive.CANCEL_ORDER, EconomicPrimitive.SWAP,
+            EconomicPrimitive.CANCEL_ORDER,
         }),
         allowed_venues=frozenset({VENUE}),
         allowed_assets=frozenset({"USDC", "MEME"}),
-        allowed_targets=frozenset(),
         **changes,
     )
 
@@ -59,6 +58,7 @@ def _order_intent(*, intent_id: str, primitive=EconomicPrimitive.PLACE_ORDER, **
         "quote_asset": "USDC",
         "amount_usd": "50",
         "limit_price": "0.55",
+        "target": "router:approved",
     }
     payload.update(payload_extra)
     return Intent(
@@ -98,14 +98,18 @@ class PaperGatewayTests(unittest.TestCase):
             self.permit_authority, {VENUE: self.verifier},
             allow_test_time_override=True,
         )
+        self._risk_version = 0
 
     def tearDown(self):
         self.store.close()
 
-    def issue(self, i: Intent, rs=None):
+    def _risk(self, **changes):
         from support import risk
-        rs = rs or risk(state_version=i.intent_id.__hash__() % 10000 + 1)
-        # Distinct risk versions so two intents in one test do not collide.
+        self._risk_version += 1
+        return risk(state_version=self._risk_version, **changes)
+
+    def issue(self, i: Intent, rs=None):
+        rs = rs or self._risk()
         aa, ra = attest_pair(self.trust, i, AUTH, rs)
         self.store.register(i, canonical_hash(i))
         self.assertTrue(self.store.reserve_usage(i, self.g, rs, NOW)[0])
@@ -117,8 +121,7 @@ class PaperGatewayTests(unittest.TestCase):
         return request, permit, rs, aa, ra
 
     def process(self, i: Intent, rs=None, *, now=NOW):
-        from support import risk
-        rs = rs or risk()
+        rs = rs or self._risk()
         aa, ra = attest_pair(self.trust, i, AUTH, rs)
         return self.runtime.process(i, AUTH, self.g, rs, authority_attestation=aa, risk_attestation=ra, now=now), rs
 
@@ -204,7 +207,7 @@ class PaperGatewayTests(unittest.TestCase):
             actor_id="agent:quant", grant_id="g-paper-gw", grant_version=1,
             primitive=EconomicPrimitive.CANCEL_ORDER, venue=VENUE,
             created_at=NOW, expires_at=NOW + timedelta(seconds=15),
-            payload={"order_id": receipt.evidence["order_id"]},
+            payload={"order_id": receipt.evidence["order_id"], "target": "router:approved"},
         )
         cancel_req, cancel_permit, *_ = self.issue(cancel)
         cancel_receipt = self.adapter.execute(cancel_req, cancel_permit)
@@ -223,7 +226,7 @@ class PaperGatewayTests(unittest.TestCase):
             actor_id="agent:quant", grant_id="g-paper-gw", grant_version=1,
             primitive=EconomicPrimitive.CANCEL_ORDER, venue=VENUE,
             created_at=NOW, expires_at=NOW + timedelta(seconds=15),
-            payload={"order_id": receipt.evidence["order_id"]},
+            payload={"order_id": receipt.evidence["order_id"], "target": "router:approved"},
         )
         cancel2_req, cancel2_permit, *_ = self.issue(cancel2)
         self.adapter.execute(cancel2_req, cancel2_permit)
@@ -251,7 +254,7 @@ class PaperGatewayTests(unittest.TestCase):
             actor_id="agent:quant", grant_id="g-paper-gw", grant_version=1,
             primitive=EconomicPrimitive.CANCEL_ORDER, venue=VENUE,
             created_at=NOW, expires_at=NOW + timedelta(seconds=15),
-            payload={"order_id": place_receipt.evidence["order_id"]},
+            payload={"order_id": place_receipt.evidence["order_id"], "target": "router:approved"},
         )
         cancel_req, cancel_permit, *_ = self.issue(cancel)
         with self.assertRaisesRegex(DeterministicFailure, "ORDER_ALREADY_FILLED"):

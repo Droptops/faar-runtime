@@ -120,8 +120,8 @@ Documentation corrections from the same pass: halt semantics for in-flight inten
 Current `make check` result for v0.4.0:
 
 ```text
-261 unit/invariant tests -> PASS
-100 targeted red-team attack classes, each mapped to named tests (131 tests) -> PASS, 0 unmapped
+277 unit/invariant tests (1 skipped) -> PASS
+104 targeted red-team attack classes, each mapped to named tests (137 tests) -> PASS, 0 unmapped
 160 deterministic denial mutations -> 0 unauthorized economic effects, 0 adapter calls
 100 retries of one logical intent -> 1 successful effect, 1 adapter call, 1 permit issued and consumed
 ambiguous timeout-after-effect recovery -> 1 successful effect, 1 adapter call

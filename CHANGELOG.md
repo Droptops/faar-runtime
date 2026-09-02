@@ -8,6 +8,7 @@ Paper gateway venue (not a live-money adapter):
 - Capability gate denies a present but non-canonical `limit_price` (`LIMIT_PRICE_INVALID`).
 - Review record: `docs/adapters/PAPER_GATEWAY.md`. Tests in `test/test_paper_gateway.py`.
 - In-repo evidence for paper-gateway rows of gates 4.2, 4.9, 6.7 and residual R-12. Gate 8, live venues, and funded credentials remain closed.
+- Suite now 277 unit/invariant tests (1 skipped); red-team matrix 104 classes / 137 mapped tests.
 
 ## 0.4.0 — 2026-09-02
 
