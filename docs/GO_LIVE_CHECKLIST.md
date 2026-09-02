@@ -11,6 +11,13 @@ sufficient. Live-money credentials and adapters remain prohibited until every
 DEPLOYMENT and OPEN row is closed and the result has been independently reviewed
 (gate 8).
 
+`faar/hyperliquid.py` and
+[`HYPERLIQUID_TESTNET_ADAPTER_REVIEW.md`](HYPERLIQUID_TESTNET_ADAPTER_REVIEW.md)
+now make one narrow venue contract executable against deterministic fakes. They
+do not change any OPEN or DEPLOYMENT status: no credentialed testnet run,
+constrained signer deployment, durable nonce allocator, independently operated
+settlement source, or venue-side fault campaign is present.
+
 ## Release gates
 
 | Gate | Requirement | Status | Evidence |
@@ -27,14 +34,14 @@ DEPLOYMENT and OPEN row is closed and the result has been independently reviewed
 | 3.2 | authoritative portfolio / market semantics | DEPLOYMENT | `RISK_ENGINE_CONTRACT.md` (external risk signer) |
 | 3.3 | no aggregate oversubscription under concurrency | DONE-IN-REPO | `test_runtime`, `test_multiprocess`, `evals/run_state_fuzz.py`, `test_store_hardening.TurnoverWindowTests` |
 | 4.1 | bounded adapter deadlines | DONE-IN-REPO | `adapter_deadline_seconds`; `test_runtime_hardening` deadline tests |
-| 4.2 | stable external intent identity | DEPLOYMENT (per venue; the contract is documented, no in-repo test can prove it for a real venue) | `ADAPTER_CONTRACT.md` A2; `test_runtime.test_adapter_without_exactly_once_contract_is_rejected` checks the declared profile only |
-| 4.3 | authoritative reconciliation by identity | DONE-IN-REPO (contract) / DEPLOYMENT | `test_runtime` settlement tests, `test_settlement` |
-| 4.4 | partial-fill / cancel semantics | DONE-IN-REPO (modelled: `PARTIALLY_FILLED` including open orders, `CANCELLED`, monotone cumulative fills) / DEPLOYMENT (venue guarantees cancel terminality) | `ADAPTER_CONTRACT.md` Part C; `test_partial_fills`; `test_economic_redteam`; `evals/run_crash_injection.py` `partial_fill_then_cancel` |
+| 4.2 | stable external intent identity | DEPLOYMENT (per venue; the contract is documented, no in-repo test can prove it for a real venue) | `ADAPTER_CONTRACT.md` A2; Hyperliquid candidate derives/queries a 128-bit `cloid`, `test_hyperliquid` checks the mapping against fakes; venue proof remains open |
+| 4.3 | authoritative reconciliation by identity | DONE-IN-REPO (contract) / DEPLOYMENT | `test_runtime` settlement tests, `test_settlement`; Hyperliquid candidate order/fill rebinding in `test_hyperliquid` |
+| 4.4 | partial-fill / cancel semantics | DONE-IN-REPO (modelled: `PARTIALLY_FILLED` including open orders, `CANCELLED`, monotone cumulative fills) / DEPLOYMENT (venue guarantees cancel terminality) | `ADAPTER_CONTRACT.md` Part C; `test_partial_fills`; `test_economic_redteam`; `evals/run_crash_injection.py` `partial_fill_then_cancel`; Hyperliquid IOC mapping review |
 | 4.5 | effect ID definition | DONE-IN-REPO (contract, per venue) | `INVARIANTS.md` I-10/I-11 |
 | 4.6 | authoritative positive and negative reconciliation | DONE-IN-REPO | `test_runtime_hardening` weak-observation tests |
-| 4.7 | independent settled amount / asset / target verification | DONE-IN-REPO (amount; executor-side slippage bound required and hash-bound when the grant caps slippage) / DEPLOYMENT (venue evidence; adapter enforces the bound) | I-24 tests, `test_mutation_gaps.PayPrimitiveTests`; I-39, `test_economic_redteam.ExecutorSideSlippageBoundTests` |
+| 4.7 | independent settled amount / asset / target verification | DONE-IN-REPO (amount; executor-side slippage bound required and hash-bound when the grant caps slippage) / DEPLOYMENT (venue evidence; adapter enforces the bound) | I-24 tests, `test_mutation_gaps.PayPrimitiveTests`; I-39, `test_economic_redteam.ExecutorSideSlippageBoundTests`; Hyperliquid testnet limit/fill checks use fakes only |
 | 4.8 | retry behaviour and maximum ambiguity window | DONE-IN-REPO | permit-bounded ambiguity window recorded at permit issuance for every adapter outcome; one live permit per intent; `test_runtime_hardening`, `test_permits`, model check |
-| 4.9 | finality definition | DEPLOYMENT (per venue) | `ADAPTER_CONTRACT.md` |
+| 4.9 | finality definition | DEPLOYMENT (per venue) | `ADAPTER_CONTRACT.md`; candidate definition and unverified assumptions in `HYPERLIQUID_TESTNET_ADAPTER_REVIEW.md` |
 | 5.1 | model cannot access signing secrets | DONE-IN-REPO (structure) / DEPLOYMENT (process isolation) | `UNPLUG_TEST.md` |
 | 5.2 | credential scope narrower than root authority | DEPLOYMENT | venue configuration |
 | 5.3 | withdrawal authority disabled for trading credentials | DEPLOYMENT | venue configuration |
@@ -44,10 +51,10 @@ DEPLOYMENT and OPEN row is closed and the result has been independently reviewed
 | 6.2 | process / network partition | DONE-IN-REPO (deadline + window; worker killed before every store call) / DEPLOYMENT | `test_runtime_hardening`; `evals/run_crash_injection.py` |
 | 6.3 | duplicate workers | DONE-IN-REPO | `test_runtime.test_concurrent_workers_create_at_most_one_effect`, `test_multiprocess` |
 | 6.4 | datastore failover | OPEN (not testable against SQLite; `STORE_CONTRACT.md` lists every guarantee a replacement must reproduce and the tests that check it) | `STORE_CONTRACT.md`; `evals/run_crash_injection.py`; `test_multiprocess` |
-| 6.5 | stale / malicious RPC or provider | DONE-IN-REPO (fail closed; a transient single-source error is retriable, a contest stops) | non-authoritative settlement tests, quorum tests |
+| 6.5 | stale / malicious RPC or provider | DONE-IN-REPO (fail closed; a transient single-source error is retriable, a contest stops) | non-authoritative settlement tests, quorum tests; Hyperliquid missing/truncated/outage and rebinding tests |
 | 6.6 | revocation during submission | DONE-IN-REPO | fence and cross-process tests |
-| 6.7 | partial fill + cancellation race | DONE-IN-REPO (a cancel reporting no fill after a recorded fill STOPs; a fill after CANCELLED is a venue contract violation) / DEPLOYMENT | `test_partial_fills.test_cancel_reporting_no_fill_after_a_recorded_fill_stops`; crash scenarios `contradictory_settlement_stop` and `fill_regression_stop`; `ADAPTER_CONTRACT.md` Part C |
-| 6.8 | venue returns changing identifiers / states | DONE-IN-REPO | effect continuity tests |
+| 6.7 | partial fill + cancellation race | DONE-IN-REPO (a cancel reporting no fill after a recorded fill STOPs; a fill after CANCELLED is a venue contract violation) / DEPLOYMENT | `test_partial_fills.test_cancel_reporting_no_fill_after_a_recorded_fill_stops`; crash scenarios `contradictory_settlement_stop` and `fill_regression_stop`; `ADAPTER_CONTRACT.md` Part C; Hyperliquid IOC tests use fakes only |
+| 6.8 | venue returns changing identifiers / states | DONE-IN-REPO | effect continuity tests; candidate treats wrong terms, non-terminal IOC and conflicting trade ids as contradictory |
 | 7.1 | authenticated intent creation | DEPLOYMENT (ingress) | `THREAT_MODEL.md` intent-namespace section |
 | 7.2 | separately authorized provisioning / pause / resume / revoke | DEPLOYMENT (ingress); in-repo the runtime cannot provision or change lifecycle | `test_mutation_gaps.GrantProvisioningTests` |
 | 7.3 | production time not trusting caller timestamps | DONE-IN-REPO | `test_runtime.test_caller_cannot_move_security_clock_backwards` |
@@ -72,7 +79,7 @@ DEPLOYMENT and OPEN row is closed and the result has been independently reviewed
 | R-09 hung adapter delays revocation; orphaned adapter threads | DONE-IN-REPO | deadline + kill switch + `max_orphaned_adapter_calls`; a cancelled Python call cannot be killed, the venue refuses its expired or superseded permit |
 | R-10 intent namespace squatting | DEPLOYMENT | ingress authentication |
 | R-11 trusted clock | DEPLOYMENT | |
-| R-12 mock verifier shares ground truth with mock venue | DEPLOYMENT | independent read path or quorum per venue |
+| R-12 mock verifier shares ground truth with mock venue | DEPLOYMENT | Hyperliquid candidate separates `/exchange` and `/info`, but live use still needs an independently operated node or quorum/archival source |
 | R-13 anchor placement | DEPLOYMENT | anchor restored with the DB detects nothing |
 | R-14 partial fills and cancellation | DONE-IN-REPO / DEPLOYMENT (venue cancel terminality) | gates 4.4 and 6.7; `ADAPTER_CONTRACT.md` Part C |
 
@@ -85,3 +92,7 @@ DEPLOYMENT and OPEN row is closed and the result has been independently reviewed
    authority anchor outside the backup set, bind every gateway to its venue,
    rehearse `halt`/`resume`, a restore and a worker crash (`make crash`), and keep
    `make check` green in CI.
+
+For the Hyperliquid candidate, complete the seven steps under "Required work
+before a funded testnet trial" in its venue review before treating even testnet
+behavior as evidence.

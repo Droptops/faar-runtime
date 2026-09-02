@@ -16,11 +16,14 @@ In scope:
 - emergency halt/resume, scope exposure caps, the external authority anchor, and the operator CLI
 - partial-fill and cancellation semantics for order venues
 - replay, concurrency, revocation, restore and settlement-evidence checks in the reference model
+- a fixed-origin Hyperliquid testnet candidate for USDC spot BUY limit-IOC orders,
+  tested with deterministic fakes and accompanied by a venue review
 - the release gate (`make check`), including the mapped red-team matrix and the bounded permit protocol model
 
 Out of scope:
 
-- live-money adapters, production credentials, or funded venues
+- live-money adapters, production credentials, funded venues, or a credentialed
+  testnet certification
 - formal verification or independent security audit
 - production-safety or exactly-once claims outside the tested mock/paper model
 
@@ -46,8 +49,8 @@ Current `make check` headline results:
 
 | Gate | Result |
 |---|---|
-| Unit/invariant tests | 353/353 pass |
-| Targeted red-team | 158 attack classes mapped to 221 named tests, 0 unmapped |
+| Unit/invariant tests | 382/382 pass |
+| Targeted red-team | 165 attack classes mapped to 242 named tests, 0 unmapped |
 | Adversarial denial cases | 160; 0 unauthorized economic effects; 0 adapter calls |
 | Same-intent replay attempts | 100; 1 effect, 1 adapter call, 1 permit issued and consumed |
 | Seeded fuzz scenarios | 96; 0 duplicate-effect violations; 0 aggregate-budget violations |
@@ -59,6 +62,10 @@ Current `make check` headline results:
 
 These are deterministic regression, adversarial, fuzz, mutation-derived, and bounded-model results for the reference implementation and its encoded fault classes.
 
+The Hyperliquid adapter tests validate the repository-side translation and
+verification contract against fakes. They do not prove the live testnet service,
+API-wallet scope, signer isolation, nonce operations, or an external data source.
+
 Do **not** describe FAAR v0.4.0 as formally verified, independently audited, production-safe, or approved for live funds. The bounded permit checker explores a small abstract state space; it is not a proof of the Python runtime or of any external venue.
 
 ## Explicitly not tested in-repo
@@ -68,6 +75,9 @@ Do **not** describe FAAR v0.4.0 as formally verified, independently audited, pro
 - venue-side permit verification against a real venue;
 - key custody in KMS/HSM;
 - authenticated ingress.
+
+Venue-specific open evidence for the testnet candidate is tracked in
+[`HYPERLIQUID_TESTNET_ADAPTER_REVIEW.md`](HYPERLIQUID_TESTNET_ADAPTER_REVIEW.md).
 
 ## Remaining blockers before live-money use
 
