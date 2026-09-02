@@ -138,7 +138,7 @@ An `intent_id`, its usage reservation, its permits and its evidence belong to on
 
 ## I-30 — In-flight attempts are bounded by their permit
 
-Any attempt can be acted on by the venue until its permit expires, whatever the adapter reported (timeout, exception, deterministic rejection, receipt, or an uninterpretable value). The store persists that instant together with the permit, the runtime neither trusts absence nor retries before it has passed, the store refuses a second live permit for one intent, and a later permit supersedes an earlier one at consumption (`test_runtime_hardening`, `test_permits`, `evals/model_check_permit_protocol.py`).
+Any attempt can be acted on by the venue until its permit expires, whatever the adapter reported (timeout, exception, deterministic rejection, receipt, or an uninterpretable value). The store persists that instant together with the permit, the runtime neither trusts absence nor retries before it has passed, the store refuses a second live permit for one intent, a later permit supersedes an earlier one at consumption, and before absence is acted on every unconsumed permit is voided and a consumed one turns absence into a STOP (`test_runtime_hardening`, `test_permits`, `test_live_money_redteam`, `evals/model_check_permit_protocol.py`).
 
 ## I-31 — Adapter calls are bounded
 

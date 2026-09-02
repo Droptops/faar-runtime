@@ -65,10 +65,30 @@ class PaperTradingVenue:
             if existing:
                 return existing
 
-            ok, reasons = self.permit_verifier.consume(permit, intent, now=self.clock())
+            ok, reasons = self.permit_verifier.consume(permit, intent, now=self.clock(), venue=self.name)
             if not ok:
                 raise DeterministicFailure("permit rejected:" + ",".join(reasons))
+            try:
+                return self._fill(intent)
+            except DeterministicFailure as exc:
+                # The venue admitted the request (permit consumed) and rejected it:
+                # an authoritative record must exist, or the runtime would see a
+                # consumed permit with no settlement, which is a contradiction. The
+                # rejection is a CANCELLED order with nothing filled.
+                effect_id = "paper_rej_" + hashlib.sha256((intent.principal_id + "\x1f" + intent.intent_id).encode()).hexdigest()[:24]
+                self._effects[key] = ExecutionReceipt(
+                    effect_id=effect_id, status=SettlementStatus.CANCELLED,
+                    evidence={
+                        "venue": self.name, "principal_id": intent.principal_id, "intent_id": intent.intent_id,
+                        "effect_id": effect_id, "request_hash": canonical_hash(intent), "rejected": str(exc)[:256],
+                    },
+                    amount_usd=Decimal("0"),
+                )
+                raise
 
+    def _fill(self, intent: ExecutionRequest) -> ExecutionReceipt:
+        with self._lock:
+            key = self._key(intent)
             p = intent.payload
             notional = parse_bounded_decimal(p.get("amount_usd", p.get("notional_usd")))
             if intent.primitive == EconomicPrimitive.CANCEL_ORDER:
@@ -140,9 +160,12 @@ class PaperTradingVenue:
                     authoritative=True, verified_request_hash=request_hash,
                 )
             return SettlementRecord(
-                SettlementStatus.FINALIZED, effect_id=receipt.effect_id, amount_usd=receipt.amount_usd,
+                receipt.status, effect_id=receipt.effect_id, amount_usd=receipt.amount_usd,
                 evidence=receipt.evidence, authoritative=True, verified_request_hash=request_hash,
             )
 
     def successful_effect_count(self, intent_id: str, *, principal_id: str = "principal:test") -> int:
-        return 1 if f"{principal_id}\x1f{intent_id}" in self._effects else 0
+        receipt = self._effects.get(f"{principal_id}\x1f{intent_id}")
+        if receipt is None or receipt.status == SettlementStatus.CANCELLED:
+            return 0
+        return 1

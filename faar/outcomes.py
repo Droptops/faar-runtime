@@ -7,6 +7,7 @@ from typing import Any, Mapping
 from .attestation import AttestationVerifier
 from .canonical import canonical_hash
 from .models import (
+    IntentState,
     Attestation,
     AttestationKind,
     ExecutionRequest,
@@ -128,9 +129,23 @@ def verify_attested_task_outcome(
     trust: AttestationVerifier,
     now,
     max_clock_skew_seconds: int = 5,
+    runtime_state: IntentState | None = None,
+    runtime_effect_id: str | None = None,
 ) -> OutcomeResult:
+    """Definition of done for an attested task contract.
+
+    Pass the runtime's stored state and effect id (`runtime_state`,
+    `runtime_effect_id`) whenever they are available: a settlement record the
+    runtime refused to finalize (effect id owned by another intent, amount above
+    the authorized envelope) must not be declared done by a control plane that
+    only looked at the record itself.
+    """
     if contract.intent_id != intent.intent_id:
         return OutcomeResult(OutcomeVerdict.UNKNOWN, ("TASK_INTENT_ID_MISMATCH",))
+    if runtime_state is not None and runtime_state != IntentState.FINALIZED:
+        return OutcomeResult(OutcomeVerdict.UNKNOWN, ("TASK_INTENT_NOT_FINALIZED",))
+    if runtime_state is not None and runtime_effect_id != settlement.effect_id:
+        return OutcomeResult(OutcomeVerdict.UNKNOWN, ("TASK_EFFECT_ID_MISMATCH",))
     # Issuance tolerates the same small clock skew as the attestation layer;
     # expiry stays exact.
     if now + timedelta(seconds=max(max_clock_skew_seconds, 0)) < contract.issued_at:

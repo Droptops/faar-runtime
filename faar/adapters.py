@@ -68,6 +68,9 @@ class MockMode(StrEnum):
     TIMEOUT_BEFORE_EFFECT = "TIMEOUT_BEFORE_EFFECT"
     TIMEOUT_AFTER_EFFECT = "TIMEOUT_AFTER_EFFECT"
     AMBIGUOUS = "AMBIGUOUS"
+    # The venue admitted the request (consumed the permit) and then timed out
+    # before producing any effect or record.
+    TIMEOUT_AFTER_ADMISSION = "TIMEOUT_AFTER_ADMISSION"
     # The order rests on the book half filled; `complete_fill` / `cancel_order`
     # move it to its terminal state.
     PARTIAL_FILL = "PARTIAL_FILL"
@@ -140,12 +143,19 @@ class MockVenue:
             if key in self._effects:
                 return self._effects[key]
 
-            ok, reasons = self.permit_verifier.consume(permit, request, now=self.clock())
+            if self.mode == MockMode.TIMEOUT_BEFORE_EFFECT:
+                # Transport timeout before the venue admitted the request: the
+                # permit is never consumed, so a retry after the window is legal.
+                raise AmbiguousExecution("timeout before venue admission; caller must reconcile before retry")
+
+            # The gateway binds the permit to this venue: a permit minted for another
+            # venue's request is refused before anything is consumed.
+            ok, reasons = self.permit_verifier.consume(permit, request, now=self.clock(), venue=self.name)
             if not ok:
                 raise DeterministicFailure("permit rejected:" + ",".join(reasons))
 
-            if self.mode == MockMode.TIMEOUT_BEFORE_EFFECT:
-                raise AmbiguousExecution("timeout before venue effect; caller must reconcile before retry")
+            if self.mode == MockMode.TIMEOUT_AFTER_ADMISSION:
+                raise AmbiguousExecution("timeout after venue admission; no effect and no record")
             if self.mode == MockMode.AMBIGUOUS:
                 raise AmbiguousExecution("venue remains ambiguous")
             if self.mode == MockMode.PARTIAL_FILL:
@@ -194,7 +204,12 @@ class MockVenue:
             return self._effects.get(self._key(request))
 
     def successful_effect_count(self, intent_id: str, *, principal_id: str = "principal:test") -> int:
-        return 1 if f"{principal_id}\x1f{intent_id}" in self._effects else 0
+        receipt = self._effects.get(f"{principal_id}\x1f{intent_id}")
+        if receipt is None:
+            return 0
+        if receipt.status == SettlementStatus.CANCELLED and not (receipt.amount_usd or 0) > 0:
+            return 0
+        return 1
 
     def execute_call_count(self, intent_id: str, *, principal_id: str = "principal:test") -> int:
         return self._execute_calls.get(f"{principal_id}\x1f{intent_id}", 0)

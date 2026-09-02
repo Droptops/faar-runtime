@@ -28,6 +28,14 @@ Third adversarial pass over v0.3.1 plus the operator controls a first bounded de
 - `FAARRuntime(max_orphaned_adapter_calls=8)`: a worker with too many abandoned adapter calls stops submitting (`ADAPTER_ORPHAN_LIMIT_REACHED`, budget released) until they drain.
 - `evals/run_crash_injection.py` (`make crash`, part of `make check`) kills a worker before every store call across six scenarios and recovers by the runbook; it found and closed RT-80 (finalize and commit were two statements). Invariants I-35..I-38.
 
+**Live-money red team (RT-81..RT-87)**
+
+- Permit gateways are bound to their venue (`PERMIT_VENUE_MISMATCH`), so a compromised adapter cannot spend a permit at a venue the grant never allowed.
+- Absence is acted on only after every unconsumed permit of the intent is voided (`PERMIT_VOIDED`), and never when the ledger shows a consumed permit (`SETTLEMENT_NONE_AFTER_PERMIT_CONSUMED`). `MockMode.TIMEOUT_BEFORE_EFFECT` no longer consumes the permit; `TIMEOUT_AFTER_ADMISSION` does; the paper venue records admitted-then-rejected orders as `CANCELLED`.
+- Settlement records and receipts are bounded at construction (canonical amounts, string ids, evidence of at most 64 KiB and 10 000 nodes); a record the chain cannot carry is `SETTLEMENT_RECORD_MALFORMED`; adapter content can no longer crash `_submit`; `BaseException` from an adapter is recorded before it propagates.
+- Quorum: finality lag between members is not a contest, and a member returning garbage cannot wedge the quorum.
+- `verify_attested_task_outcome` accepts the runtime's state and effect id and refuses MET for anything the runtime did not finalize.
+
 **Trust boundaries**
 
 - One bounded amount parser (plain ASCII decimal grammar, canonical precision/exponent bounds) shared by gates, usage reservation, permit signer, settlement integrity and reference venues; `1e-999999999` could previously make the store allocate gigabytes (RT-50).
@@ -46,8 +54,8 @@ Third adversarial pass over v0.3.1 plus the operator controls a first bounded de
 
 **Evidence and packaging**
 
-- `evals/run_redteam.py` maps every attack class to named unit tests, loads the suite in-process, and fails on unmapped tests (110 classes, 147 tests). `run_adversarial.py` measures adapter calls and permits issued/consumed. `run_state_fuzz.py` advances a shared clock. The model checker models two permits, in-flight submission, expiry, halt and resume, and reports the without-rule counterexample.
-- New test modules: `test_store_hardening` (including real 0.3-shape databases and legacy chains), `test_runtime_hardening`, `test_boundary_hardening`, `test_mutation_gaps` (kills the 17 mutants that previously survived), `test_controls` (including a cross-process anchor test), `test_key_lifecycle`, `test_schemas`, plus a cross-process revocation test. 279 unit tests; the suite no longer leaks temporary files (RT-79).
+- `evals/run_redteam.py` maps every attack class to named unit tests, loads the suite in-process, and fails on unmapped tests (117 classes, 157 tests). `run_adversarial.py` measures adapter calls and permits issued/consumed. `run_state_fuzz.py` advances a shared clock. The model checker models two permits, in-flight submission, expiry, halt and resume, and reports the without-rule counterexample.
+- New test modules: `test_store_hardening` (including real 0.3-shape databases and legacy chains), `test_runtime_hardening`, `test_boundary_hardening`, `test_mutation_gaps` (kills the 17 mutants that previously survived), `test_controls` (including a cross-process anchor test), `test_key_lifecycle`, `test_schemas`, plus a cross-process revocation test. 289 unit tests; the suite no longer leaks temporary files (RT-79).
 - Schemas describe 0.3 documents (`principal_id`, `algorithm`+`signature`); examples validate in the unit suite when `jsonschema` is installed (`pip install -e ".[dev]"`). CI job timeout; Python 3.12/3.13 classifiers; full Apache-2.0 license text.
 - Documentation rewritten to match the code: architecture, trust and threat models, adapter/verifier contract, recovery table, invariants I-1..I-34, execution permits, operations runbook, go-live checklist; stale v0.2/HMAC statements removed.
 

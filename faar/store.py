@@ -291,6 +291,7 @@ class SQLiteIntentStore:
                 issued_at TEXT NOT NULL,
                 expires_at TEXT,
                 consumed_at TEXT,
+                voided_at TEXT,
                 UNIQUE(grant_id, grant_version, fence_token)
             );
             CREATE TABLE IF NOT EXISTS store_settings (
@@ -377,6 +378,7 @@ class SQLiteIntentStore:
         ("risk_claims", "principal_id", "TEXT NOT NULL DEFAULT 'legacy:unknown'"),
         ("execution_permits", "consumed_at", "TEXT"),
         ("execution_permits", "expires_at", "TEXT"),
+        ("execution_permits", "voided_at", "TEXT"),
     )
 
     def _migrate_columns(self) -> None:
@@ -908,6 +910,35 @@ class SQLiteIntentStore:
             rows = self._conn.execute("SELECT * FROM intent_leases ORDER BY acquired_at").fetchall()
         return [dict(r) for r in rows]
 
+    def void_unconsumed_permits(self, intent_id: str) -> int:
+        """Kill every permit of the intent the venue has not consumed. Returns the count.
+
+        Called by the runtime before it acts on authoritative absence (release or
+        retry). Voiding and consumption are both single-row transactions, so either
+        the venue consumed first (and the runtime then sees `permit_counts`
+        consumed > 0) or the void wins and a late consumption is refused with
+        `PERMIT_VOIDED`, independent of any clock.
+        """
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                cur = self._conn.execute(
+                    "UPDATE execution_permits SET voided_at=? WHERE intent_id=? AND consumed_at IS NULL AND voided_at IS NULL",
+                    (self._now(), intent_id),
+                )
+                self._conn.execute("COMMIT")
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
+        return int(cur.rowcount or 0)
+
+    def voided_permit_count(self, intent_id: str) -> int:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM execution_permits WHERE intent_id=? AND voided_at IS NOT NULL", (intent_id,)
+            ).fetchone()
+        return int(row["n"] or 0)
+
     def permit_counts(self, intent_id: str) -> tuple[int, int]:
         """(issued, consumed) execution permits recorded for one intent."""
         with self._lock:
@@ -1130,7 +1161,7 @@ class SQLiteIntentStore:
         skew = timedelta(seconds=grant.limits.max_clock_skew_seconds)
         live: list[str] = []
         for row in self._conn.execute(
-            "SELECT permit_id,expires_at FROM execution_permits WHERE intent_id=? AND consumed_at IS NULL AND expires_at IS NOT NULL",
+            "SELECT permit_id,expires_at FROM execution_permits WHERE intent_id=? AND consumed_at IS NULL AND voided_at IS NULL AND expires_at IS NOT NULL",
             (intent_id,),
         ).fetchall():
             expires = self._parse_timestamp(row["expires_at"])
@@ -1227,6 +1258,11 @@ class SQLiteIntentStore:
                 if row["consumed_at"] is not None:
                     self._conn.execute("COMMIT")
                     return False, ("PERMIT_ALREADY_CONSUMED",)
+                if row["voided_at"] is not None:
+                    # The runtime acted on authoritative absence after this permit's
+                    # window: whatever the venue's clock says, it is dead.
+                    self._conn.execute("COMMIT")
+                    return False, ("PERMIT_VOIDED",)
                 # A later permit for the same intent supersedes this one: the runtime
                 # only issues a retry permit once this one can no longer be honoured,
                 # so a venue whose clock lags must still refuse it.

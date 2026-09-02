@@ -416,6 +416,7 @@ class ExecutionPermitVerifier:
         allow_signing_backend_for_tests: bool = False,
         key_validity: Mapping[str, KeyValidity] | None = None,
         max_permit_lifetime_seconds: int = 60,
+        venue: str | None = None,
     ) -> None:
         verifiers = dict(signature) if isinstance(signature, Mapping) else {signature.signer_id: signature}
         if not verifiers:
@@ -443,25 +444,24 @@ class ExecutionPermitVerifier:
         # Together with `KeyValidity.not_after` (judged on issued_at) this caps the
         # exposure of a retired-but-not-revoked signer to `not_after + lifetime`.
         self.max_permit_lifetime_seconds = max_permit_lifetime_seconds
+        # The venue this gateway serves. When set, every permit presented here must
+        # be for a request addressed to it; callers may also pass `venue=` per call.
+        self.venue = None if venue is None else str(venue)
 
     def with_key_validity(self, key_validity: Mapping[str, KeyValidity]) -> "ExecutionPermitVerifier":
         return ExecutionPermitVerifier(
             self.verifiers, self.control_store, max_clock_skew_seconds=self.max_clock_skew_seconds,
             allow_signing_backend_for_tests=True, key_validity=key_validity,
-            max_permit_lifetime_seconds=self.max_permit_lifetime_seconds,
+            max_permit_lifetime_seconds=self.max_permit_lifetime_seconds, venue=self.venue,
         )
 
     def verify(
-        self,
-        signed: SignedExecutionPermit,
-        request: ExecutionRequest,
-        *,
-        now: datetime,
+        self, signed: SignedExecutionPermit, request: ExecutionRequest, *, now: datetime, venue: str | None = None
     ) -> tuple[bool, tuple[str, ...]]:
         # Transport-supplied input: any structural surprise is a deterministic
         # rejection, never an exception the venue would have to classify.
         try:
-            return self._verify_checked(signed, request, now=now)
+            return self._verify_checked(signed, request, now=now, venue=venue)
         except Exception:
             return False, ("PERMIT_MALFORMED",)
 
@@ -471,11 +471,19 @@ class ExecutionPermitVerifier:
         request: ExecutionRequest,
         *,
         now: datetime,
+        venue: str | None = None,
     ) -> tuple[bool, tuple[str, ...]]:
         reasons: list[str] = []
         if not isinstance(signed, SignedExecutionPermit) or not isinstance(request, ExecutionRequest):
             return False, ("PERMIT_MALFORMED",)
         permit = signed.permit
+        # A gateway has an identity. A permit minted for another venue's request is
+        # refused before anything is consumed, so a compromised adapter cannot move
+        # the money at a venue the grant never allowed (the venue is inside the
+        # signed request hash, but only the consumer knows who it is).
+        bound_venue = venue if venue is not None else self.venue
+        if bound_venue is not None and request.venue != bound_venue:
+            return False, ("PERMIT_VENUE_MISMATCH",)
         verifier = self.verifiers.get(signed.signer_id)
         if verifier is None:
             return False, ("PERMIT_SIGNER_UNKNOWN",)
@@ -521,10 +529,10 @@ class ExecutionPermitVerifier:
         return not reasons, tuple(reasons)
 
     def consume(
-        self, signed: SignedExecutionPermit, request: ExecutionRequest, *, now: datetime
+        self, signed: SignedExecutionPermit, request: ExecutionRequest, *, now: datetime, venue: str | None = None
     ) -> tuple[bool, tuple[str, ...]]:
         """Cryptographically verify, then atomically consume the execution permit."""
-        ok, reasons = self.verify(signed, request, now=now)
+        ok, reasons = self.verify(signed, request, now=now, venue=venue)
         if not ok:
             return False, reasons
         permit = signed.permit

@@ -42,14 +42,14 @@ Current `make check` headline results:
 
 | Gate | Result |
 |---|---|
-| Unit/invariant tests | 279/279 pass |
-| Targeted red-team | 110 attack classes mapped to 147 named tests, 0 unmapped |
+| Unit/invariant tests | 289/289 pass |
+| Targeted red-team | 117 attack classes mapped to 157 named tests, 0 unmapped |
 | Adversarial denial cases | 160; 0 unauthorized economic effects; 0 adapter calls |
 | Same-intent replay attempts | 100; 1 effect, 1 adapter call, 1 permit issued and consumed |
 | Seeded fuzz scenarios | 96; 0 duplicate-effect violations; 0 aggregate-budget violations |
 | Bounded permit model | 1766 states, 4304 transitions, 0 violations; stale permit unconsumable after revoke and after halt/resume; 187 violations without the permit-window rule |
 | Demo | mock execution FINALIZED once; keyed evidence chain and head commitment valid |
-| Crash injection | 193 worker kills before every store call across 6 scenarios; 0 duplicate effects, 0 lost effects, 0 stranded budget, every recovery terminal |
+| Crash injection | 191 worker kills before every store call across 6 scenarios; 0 duplicate effects, 0 lost effects, 0 stranded budget, every recovery terminal |
 
 ## Claim boundary
 

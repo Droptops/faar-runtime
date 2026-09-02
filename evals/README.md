@@ -32,7 +32,7 @@ timeout_after_effect_successful_effects = 1
 
 ## Targeted red team
 
-`run_redteam.py` maps 110 named attack classes to 147 concrete unit tests, loads the suite in-process, asserts that every mapped test exists and passes, and reports any `unmapped_tests`. The headline count therefore cannot drift from real coverage: deleting a mapped test fails the gate.
+`run_redteam.py` maps 117 named attack classes to 157 concrete unit tests, loads the suite in-process, asserts that every mapped test exists and passes, and reports any `unmapped_tests`. The headline count therefore cannot drift from real coverage: deleting a mapped test fails the gate.
 
 ## Crash injection
 
@@ -46,7 +46,7 @@ worker's lease with its owner token, process again with fresh attestations past 
 permit window) and asserts: at most one effect and two adapter calls, an effect
 implies `FINALIZED` with usage `COMMITTED`, a terminal intent without an effect has
 released its budget unless the stop is settlement-derived, evidence verifies, and
-recovery never raises or ends non-terminal. Headline: 193 crash points, 0
+recovery never raises or ends non-terminal. Headline: 191 crash points, 0
 violations. This is a statement about the reference store and mock venue, not a
 proof.
 

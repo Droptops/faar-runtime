@@ -435,9 +435,11 @@ class RuntimeHardeningTests(unittest.TestCase):
         self.assertFalse(receipt_events[0]["payload"]["reported_effect_id_well_formed"])
 
     def test_malformed_verifier_effect_id_stops_with_held_budget(self):
+        # A string effect id outside the accepted grammar is an authoritative record
+        # the runtime refuses: terminal STOP, budget held.
         adapter = ScriptedAdapter(
             [ExecutionReceipt("effect-A", SettlementStatus.FINALIZED, {}, Decimal("50"))],
-            [_auth(SettlementStatus.FINALIZED, b"binary-effect-id")],  # type: ignore[arg-type]
+            [_auth(SettlementStatus.FINALIZED, "x" * 600)],
         )
         runtime = self.runtime_for(adapter)
         i = intent(intent_id="intent_hard_000000000061")
@@ -446,6 +448,19 @@ class RuntimeHardeningTests(unittest.TestCase):
         self.assertIn("SETTLED_EFFECT_ID_INVALID", result.reason_codes)
         self.assertIsNone(self.store.get(i.intent_id).effect_id)
         self.assertEqual("HELD", self.usage_status(i.intent_id))
+        # A non-string effect id never forms a record at all: the verifier fails
+        # (where a quorum can outvote it) and the intent stays retriable, budget held.
+        with self.assertRaises(ValueError):
+            _auth(SettlementStatus.FINALIZED, b"binary-effect-id")(ExecutionRequest.from_intent(i))  # type: ignore[arg-type]
+        adapter = ScriptedAdapter(
+            [ExecutionReceipt("effect-B", SettlementStatus.FINALIZED, {}, Decimal("50"))],
+            [_auth(SettlementStatus.FINALIZED, b"binary-effect-id")],  # type: ignore[arg-type]
+        )
+        j = intent(intent_id="intent_hard_000000000062")
+        result = self.run_case(self.runtime_for(adapter), j, rs=risk(state_version=2))
+        self.assertEqual(IntentState.UNKNOWN, result.state)
+        self.assertIn("RECONCILIATION_EXCEPTION", result.reason_codes)
+        self.assertEqual("HELD", self.usage_status(j.intent_id))
 
     # --- in-flight ambiguity is bounded by the permit window -------------------------
 

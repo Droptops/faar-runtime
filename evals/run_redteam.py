@@ -225,6 +225,23 @@ ATTACK_CLASSES: dict[str, tuple[str, ...]] = {
     "exposure cap changed without the anchor": ("test_exposure_cap.ExposureCapTests.test_caps_are_authority_changes_on_an_anchored_database",),
     "unbounded abandoned adapter calls": ("test_orphan_cap.OrphanedAdapterCallCapTests.test_process_stops_submitting_while_too_many_abandoned_calls_are_running",),
     "crash between finalize and commit stranding budget": ("test_runtime_hardening.RuntimeHardeningTests.test_finalize_and_commit_are_one_transaction_and_replay_repairs_older_rows",),
+    # --- live-money pass: compromised adapter, malicious settlement source ------------
+    "permit for one venue consumed at another venue's gateway": ("test_live_money_redteam.CompromisedAdapterTests.test_permit_for_one_venue_is_refused_by_another_venues_gateway",),
+    "adapter-controlled content crashing the state machine": (
+        "test_live_money_redteam.CompromisedAdapterTests.test_adapter_content_cannot_crash_the_state_machine",
+        "test_live_money_redteam.CompromisedAdapterTests.test_base_exception_from_the_adapter_is_recorded_before_it_propagates",
+    ),
+    "consumed permit with authoritative absence released or retried": (
+        "test_live_money_redteam.CompromisedAdapterTests.test_consumed_permit_with_authoritative_absence_stops_instead_of_releasing",
+        "test_live_money_redteam.CompromisedAdapterTests.test_permit_is_voided_when_absence_is_acted_on_whatever_the_venue_clock_says",
+    ),
+    "malformed or unbounded settlement content": (
+        "test_live_money_redteam.MaliciousSettlementSourceTests.test_malformed_settlement_content_fails_in_the_verifier_not_after_reconciling",
+        "test_live_money_redteam.MaliciousSettlementSourceTests.test_dag_shaped_evidence_is_bounded_by_the_node_budget",
+    ),
+    "finality lag between quorum members treated as a contest": ("test_live_money_redteam.MaliciousSettlementSourceTests.test_finality_lag_between_sources_is_not_a_contest",),
+    "garbage-returning quorum member wedging the quorum": ("test_live_money_redteam.MaliciousSettlementSourceTests.test_a_garbage_returning_minority_member_cannot_wedge_the_quorum",),
+    "definition of done decoupled from the runtime verdict": ("test_live_money_redteam.MaliciousSettlementSourceTests.test_outcome_verifier_follows_the_runtime_verdict",),
 }
 
 

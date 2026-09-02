@@ -119,27 +119,51 @@ class QuorumSettlementVerifier:
         # know"; it can never contribute to a positive or negative quorum.
         observations: list[tuple[str, SettlementRecord]] = []
         errors: dict[str, str] = {}
-        for source in self.sources:
-            try:
-                observations.append((source.name, source.verify(request)))
-            except Exception as exc:
-                errors[source.name] = type(exc).__name__
-                observations.append((source.name, SettlementRecord(
-                    SettlementStatus.UNKNOWN, evidence={"verifier": source.name, "error": type(exc).__name__},
-                    authoritative=False,
-                )))
-        records = [record for _, record in observations]
         counts: dict[tuple[str, str | None, str | None], int] = {}
+        facts: list[tuple[str, str | None, str | None]] = []
         binding_mismatches = 0
-        for record in records:
+        for source in self.sources:
+            name = str(source.name)
+            try:
+                record = source.verify(request)
+                # Everything derived from a source's answer happens inside the
+                # per-source guard: a member that returns garbage instead of raising
+                # must not wedge the quorum either (I-8: zero weight in either direction).
+                if not isinstance(record, SettlementRecord):
+                    raise TypeError(f"source returned {type(record).__name__}")
+                fact = self._fact(record)
+            except Exception as exc:
+                errors[name] = type(exc).__name__
+                record = SettlementRecord(
+                    SettlementStatus.UNKNOWN, evidence={"verifier": name, "error": type(exc).__name__},
+                    authoritative=False,
+                )
+                fact = self._fact(record)
+            observations.append((name, record))
+            facts.append(fact)
             if not record.authoritative:
                 continue
             if record.verified_request_hash != expected_hash:
                 binding_mismatches += 1
                 continue
-            fact = self._fact(record)
             counts[fact] = counts.get(fact, 0) + 1
-        facts = [self._fact(r) for r in records]
+        records = [record for _, record in observations]
+        # Finality lag is not a contest. Independent sources cross the finality
+        # threshold at different times; CONFIRMED and FINALIZED for the same effect
+        # id and amount agree on *what* settled and differ only on *how final* it
+        # is. Reached finality is not vetoed by a lagging member; otherwise the
+        # weaker status carries the combined votes and the runtime reconciles again.
+        agree_statuses: set[str] = set()
+        if not binding_mismatches and len(counts) == 2:
+            keys = list(counts)
+            if {k[0] for k in keys} == {"CONFIRMED", "FINALIZED"} and len({(k[1], k[2]) for k in keys}) == 1:
+                final = next(k for k in keys if k[0] == "FINALIZED")
+                confirmed = next(k for k in keys if k[0] == "CONFIRMED")
+                if counts[final] >= self.quorum:
+                    counts = {final: counts[final]}
+                else:
+                    agree_statuses = {"CONFIRMED", "FINALIZED"}
+                    counts = {confirmed: counts[final] + counts[confirmed]}
         if binding_mismatches or len(counts) > 1:
             # Two distinct authoritative facts (a 2-2 split is the canonical case), or
             # an authoritative record bound to another request, is a contested
@@ -182,9 +206,11 @@ class QuorumSettlementVerifier:
         # per-source evidence is always available under `source_evidence`. The
         # runtime-owned standard fields (effect_id, amount_usd, status) still
         # override same-named evidence keys at outcome evaluation.
+        agree_statuses = agree_statuses or {fact[0]}
         agreeing = [
             (name, record) for name, record in observations
-            if record.authoritative and record.verified_request_hash == expected_hash and self._fact(record) == fact
+            if record.authoritative and record.verified_request_hash == expected_hash
+            and self._fact(record)[1:] == fact[1:] and self._fact(record)[0] in agree_statuses
         ]
         evidence: dict = {}
         if agreeing and len({canonical_hash(record.evidence) for _, record in agreeing}) == 1:

@@ -33,12 +33,14 @@ Both reconcile first. Submitter output never decides which.
 | `CANCELLED`, not authoritative | | `UNKNOWN (SETTLEMENT_CANCEL_NOT_AUTHORITATIVE)`, usage HELD |
 | `NONE`, not authoritative | | `UNKNOWN (SETTLEMENT_NONE_NOT_AUTHORITATIVE)`, usage HELD |
 | `NONE`, authoritative | last attempt's permit window still open | `UNKNOWN (SETTLEMENT_NONE_WITHIN_PERMIT_WINDOW)`, usage HELD |
-| `NONE`, authoritative | window closed, resubmission blocked | `FAILED_SAFE` (deterministic adapter failure) or `STOPPED` (grant not active), usage RELEASED |
+| `NONE`, authoritative | window closed, a permit of this intent was consumed | `STOPPED (SETTLEMENT_NONE_AFTER_PERMIT_CONSUMED)`, usage HELD; unconsumed permits voided |
+| `NONE`, authoritative | window closed, no permit consumed, resubmission blocked | `FAILED_SAFE` (deterministic adapter failure) or `STOPPED` (grant not active), usage RELEASED; unconsumed permits voided |
 | `NONE`, authoritative | window closed, retry predicates hold | new submission attempt |
 | `NONE`, authoritative | window closed, a retry predicate fails | `STOPPED` with the failing predicate, usage RELEASED |
 | `UNKNOWN` (including a quorum short of votes because sources were unreachable) | | `UNKNOWN (SETTLEMENT_UNKNOWN)`, usage HELD |
 | `CONTRADICTORY` | any authority | `STOPPED (SETTLEMENT_CONTRADICTORY)`, usage HELD |
-| verifier raised | | `UNKNOWN (RECONCILIATION_EXCEPTION)`, usage HELD |
+| verifier raised (including a record that fails its own bounds) | | `UNKNOWN (RECONCILIATION_EXCEPTION)`, usage HELD |
+| verifier returned something other than a `SettlementRecord`, or a record the chain cannot carry | | `STOPPED (SETTLEMENT_RECORD_MALFORMED)`, usage HELD |
 | authoritative record bound to a different request | | `STOPPED (SETTLEMENT_REQUEST_BINDING_MISMATCH)`, usage HELD |
 | authoritative positive record with malformed effect id | | `STOPPED (SETTLED_EFFECT_ID_INVALID)`, usage HELD |
 | authoritative record contradicting a recorded effect | previous effect id known | `STOPPED (SETTLEMENT_LOST_PREVIOUS_EFFECT / SETTLEMENT_EFFECT_ID_MISMATCH)`, usage HELD |

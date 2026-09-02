@@ -39,6 +39,12 @@ payment-intent ID, contract intent hash/nonce.
 
 ### A3. The permit must be consumed before any effect
 
+A gateway has an identity. It refuses a permit presented for a request addressed
+to another venue (`PERMIT_VENUE_MISMATCH`): construct the gateway with
+`ExecutionPermitVerifier(..., venue=<its name>)` or pass `venue=` on every
+`consume()`, as `MockVenue` and `PaperTradingVenue` do. Without this, a
+compromised adapter for venue A could move the money at venue B with A's permit.
+
 The venue, or a capability gateway in front of it, calls
 `ExecutionPermitVerifier.consume(permit, request, now=...)` and creates an effect
 only on success. A rejected permit is a `DeterministicFailure`. Consumption is
@@ -57,7 +63,7 @@ effect id is recorded as such.
 | Adapter raises | Runtime records | Then |
 |---|---|---|
 | `AmbiguousExecution` (incl. `AdapterDeadlineExceeded`) | `UNKNOWN (EXECUTION_AMBIGUOUS / EXECUTION_DEADLINE_EXCEEDED)` with `ambiguity_until = permit.expires_at` | independent reconciliation; absence is not trusted until the permit window closes |
-| `DeterministicFailure` | `UNKNOWN (EXECUTION_DETERMINISTIC_FAILURE_UNVERIFIED)` | independent reconciliation; on authoritative NONE the intent ends `FAILED_SAFE` with usage released and no resubmission. A new intent is required. The permit may legitimately show `consumed_at` with no effect. |
+| `DeterministicFailure` | `UNKNOWN (EXECUTION_DETERMINISTIC_FAILURE_UNVERIFIED)` | independent reconciliation; on authoritative NONE after the permit window the intent ends `FAILED_SAFE` with usage released and no resubmission, **provided the permit was never consumed**. A consumed permit is the venue's admission of the request: admission with no settlement record is `STOPPED (SETTLEMENT_NONE_AFTER_PERMIT_CONSUMED)`, budget held. A venue that admits and then rejects must therefore leave an authoritative record (`CANCELLED` with nothing filled), as the paper venue does. |
 | any other exception | `UNKNOWN (ADAPTER_EXECUTION_EXCEPTION)` with the ambiguity window | as for ambiguous |
 | returns a receipt | `UNKNOWN (AWAITING_INDEPENDENT_SETTLEMENT)` | independent reconciliation |
 
@@ -124,6 +130,14 @@ SettlementRecord(
 the effect was produced for. A record bound to any other request is a
 `SETTLEMENT_REQUEST_BINDING_MISMATCH` stop.
 
+Records are bounded at construction: `effect_id` and `verified_request_hash`
+are strings, `amount_usd` is a finite Decimal inside the canonical amount bounds,
+and `evidence` is canonical JSON of at most 64 KiB and 10 000 nodes. A record that
+violates these never exists; the verifier raises instead, which a quorum treats
+as one erroring member and a single-source runtime as `RECONCILIATION_EXCEPTION`
+(retriable). A verifier that returns something other than a `SettlementRecord`
+stops the intent (`SETTLEMENT_RECORD_MALFORMED`, budget held).
+
 ### B3. Authoritative absence
 
 `NONE, authoritative=True` may be returned only if the lookup is authoritative
@@ -132,7 +146,13 @@ create an effect. A single RPC/provider "not found", a transient 404, a cache mi
 or a timeout is `authoritative=False`.
 
 Even an authoritative NONE is ignored by the runtime while the last attempt's
-permit is still live (see the ambiguity window in `EXECUTION_PERMITS.md`).
+permit is still live (see the ambiguity window in `EXECUTION_PERMITS.md`). When
+the runtime does act on absence it first voids every permit of the intent the
+venue has not consumed (a later consumption is refused with `PERMIT_VOIDED`
+whatever the venue's clock says) and then reads the ledger: if any permit of the
+intent was consumed, absence contradicts the venue's own admission and the intent
+is `STOPPED (SETTLEMENT_NONE_AFTER_PERMIT_CONSUMED)` rather than released or
+retried.
 
 ### B4. Authoritative positive evidence
 
@@ -149,10 +169,16 @@ intent `UNKNOWN`, never confirm, and never invalidate a previously recorded effe
 ### B5. Quorum semantics
 
 `QuorumSettlementVerifier` votes on `(status, effect_id, numeric amount)`; two
-sources reporting `50` and `50.00` agree. A source that raises contributes a
-non-authoritative UNKNOWN and is listed under `evidence["errors"]`. Two distinct
-authoritative facts, whether or not either reaches quorum, or any authoritative
-record bound to another request, are `CONTRADICTORY` (authoritative; the runtime
+sources reporting `50` and `50.00` agree. A source that raises, or that returns
+anything other than a well-formed `SettlementRecord`, contributes a
+non-authoritative UNKNOWN and is listed under `evidence["errors"]`; nothing a
+single member returns can wedge the quorum. Finality lag is not a contest:
+`CONFIRMED` and `FINALIZED` for the same effect id and amount agree on what
+settled; reached finality is not vetoed by a lagging member, otherwise the
+combined votes carry the weaker status and the runtime reconciles again. Two
+distinct authoritative facts otherwise (positive versus `NONE`, different effect
+ids or amounts), whether or not either reaches quorum, or any authoritative record
+bound to another request, are `CONTRADICTORY` (authoritative; the runtime
 stops). One uncontested fact short of quorum is insufficient evidence, reported
 as a non-authoritative UNKNOWN (`quorum-not-reached`) that the runtime retries;
 a single transient source error therefore never terminally stops an intent.

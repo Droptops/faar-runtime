@@ -64,7 +64,7 @@ DEPLOYMENT and OPEN row is closed and the result has been independently reviewed
 | R-01 risk signer semantics | DEPLOYMENT | external |
 | R-02 distributed revocation fence | DONE-IN-REPO for a shared control store; DEPLOYMENT for venue-side verification | epoch at consumption |
 | R-03 key custody | DEPLOYMENT | signer/verifier separation done; KMS/HSM custody is operational |
-| R-04 adapter in TCB | DEPLOYMENT | permits narrow it; venue must verify them |
+| R-04 adapter in TCB | DEPLOYMENT | permits narrow it and the gateway is bound to its venue (`PERMIT_VENUE_MISMATCH`); venue must verify them |
 | R-05 profile is a declaration | DEPLOYMENT | per-venue failure injection |
 | R-06 credential authority | DEPLOYMENT | |
 | R-07 evidence host / key compromise | DEPLOYMENT | append refusal + head commitment in repo; remote anchoring operational |

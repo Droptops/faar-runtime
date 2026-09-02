@@ -87,20 +87,23 @@ class PaperVenueTests(unittest.TestCase):
             payload={"from_asset": "USDC", "to_asset": "MEME", "amount_usd": "50", "target": "paper-router"},
         )
         result = self.execute_case(i)
-        # The venue's rejection is not proof of non-execution while the permit it
-        # was handed can still be consumed: budget stays held for the window.
-        self.assertEqual(IntentState.UNKNOWN, result.state)
-        self.assertIn("SETTLEMENT_NONE_WITHIN_PERMIT_WINDOW", result.reason_codes)
-        self.assertEqual("HELD", self.store.usage("g-paper", 1)[0]["status"])
+        # The venue admitted the request (permit consumed) and rejected it. Its
+        # authoritative record is a CANCELLED order with nothing filled, so the
+        # intent fails safe at once and the budget is released; the consumed permit
+        # cannot be replayed and the intent is never resubmitted.
+        self.assertEqual(IntentState.FAILED_SAFE, result.state)
+        self.assertEqual(("SETTLEMENT_CANCELLED_UNFILLED",), result.reason_codes)
+        usage = self.store.usage("g-paper", 1)
+        self.assertEqual("RELEASED", usage[0]["status"])
+        self.assertEqual(0, self.venue.successful_effect_count(i.intent_id))
+        self.assertEqual((1, 1), self.store.permit_counts(i.intent_id))
         aa, ra = attest_pair(self.trust, i, AUTH, self.risk)
-        later = self.runtime.process(
+        replay = self.runtime.process(
             i, AUTH, self.grant, self.risk, authority_attestation=aa, risk_attestation=ra,
             now=NOW + timedelta(seconds=15),
         )
-        self.assertEqual(IntentState.FAILED_SAFE, later.state)
-        self.assertEqual(("EXECUTION_DETERMINISTIC_FAILURE",), later.reason_codes)
-        usage = self.store.usage("g-paper", 1)
-        self.assertEqual("RELEASED", usage[0]["status"])
+        self.assertEqual(IntentState.FAILED_SAFE, replay.state)
+        self.assertTrue(replay.replayed)
         self.assertEqual(0, self.venue.successful_effect_count(i.intent_id))
 
 

@@ -8,7 +8,7 @@ from math import isfinite
 from types import MappingProxyType
 from typing import Any, Mapping
 
-from .canonical import parse_bounded_decimal
+from .canonical import canonical_json, parse_bounded_decimal
 
 
 def _aware(value: datetime) -> bool:
@@ -42,13 +42,29 @@ def _require_mapping(name: str, value: object) -> None:
         raise ValueError(f"{name} must be a JSON object")
 
 
-def _deep_freeze(value: Any, _depth: int = 0) -> Any:
+# Total nodes one untrusted document may expand to. Per-container and depth
+# bounds alone still let a DAG (one child referenced from every key) materialise
+# millions of nodes when copied; the shared budget makes the copy linear in what
+# the caller may legitimately send.
+MAX_CANONICAL_TOTAL_NODES = 10_000
+# Upper bound on the canonical JSON size of an evidence payload accepted from a
+# settlement source or adapter and copied into the evidence chain.
+MAX_EVIDENCE_BYTES = 65_536
+
+
+def _deep_freeze(value: Any, _depth: int = 0, _budget: list[int] | None = None) -> Any:
     """Copy untrusted nested data into a bounded immutable JSON-like structure.
 
     Frozen dataclasses are only shallowly immutable. The explicit depth/container/
-    scalar bounds also stop model, adapter, or verifier data from turning evidence
-    handling and canonical hashing into a trivial memory/recursion denial of service.
+    scalar bounds and the total node budget also stop model, adapter, or verifier
+    data from turning evidence handling and canonical hashing into a trivial
+    memory/recursion denial of service.
     """
+    if _budget is None:
+        _budget = [MAX_CANONICAL_TOTAL_NODES]
+    _budget[0] -= 1
+    if _budget[0] < 0:
+        raise ValueError("canonical data exceeds maximum total node count")
     if _depth > MAX_CANONICAL_DEPTH:
         raise ValueError("canonical data exceeds maximum nesting depth")
     if isinstance(value, Mapping):
@@ -60,16 +76,16 @@ def _deep_freeze(value: Any, _depth: int = 0) -> Any:
                 raise ValueError("mapping keys must be strings")
             if len(key) > MAX_CANONICAL_STRING_CHARS:
                 raise ValueError("canonical mapping key is too long")
-            out[key] = _deep_freeze(item, _depth + 1)
+            out[key] = _deep_freeze(item, _depth + 1, _budget)
         return MappingProxyType(out)
     if isinstance(value, (list, tuple)):
         if len(value) > MAX_CANONICAL_CONTAINER_ITEMS:
             raise ValueError("canonical sequence exceeds maximum item count")
-        return tuple(_deep_freeze(v, _depth + 1) for v in value)
+        return tuple(_deep_freeze(v, _depth + 1, _budget) for v in value)
     if isinstance(value, (set, frozenset)):
         if len(value) > MAX_CANONICAL_CONTAINER_ITEMS:
             raise ValueError("canonical set exceeds maximum item count")
-        return frozenset(_deep_freeze(v, _depth + 1) for v in value)
+        return frozenset(_deep_freeze(v, _depth + 1, _budget) for v in value)
     if isinstance(value, Decimal):
         if not value.is_finite():
             raise ValueError("non-finite Decimals are not allowed in canonical data")
@@ -570,6 +586,30 @@ class Attestation:
             raise ValueError("attestation expires_at must be after issued_at")
 
 
+def _bounded_amount(name: str, value: object) -> Decimal | None:
+    """A settlement or receipt amount: a finite Decimal inside the canonical bounds,
+    stored as a plain canonical Decimal (a subclass with overridden formatting is
+    not carried into evidence)."""
+    if value is None:
+        return None
+    if not isinstance(value, Decimal) or not value.is_finite():
+        raise ValueError(f"{name} must be a finite Decimal or None")
+    bounded = parse_bounded_decimal(value)
+    if bounded is None:
+        raise ValueError(f"{name} is outside the canonical amount bounds")
+    return bounded
+
+
+def _require_bounded_evidence(evidence: Mapping[str, Any]) -> None:
+    """Evidence copied into the chain must canonicalize, UTF-8 encode, and stay small."""
+    try:
+        encoded = canonical_json(evidence).encode("utf-8")
+    except (ValueError, TypeError, UnicodeEncodeError) as exc:
+        raise ValueError(f"evidence is not canonical JSON: {type(exc).__name__}") from exc
+    if len(encoded) > MAX_EVIDENCE_BYTES:
+        raise ValueError("evidence exceeds the maximum canonical size")
+
+
 @dataclass(frozen=True)
 class SettlementRecord:
     status: SettlementStatus
@@ -581,13 +621,16 @@ class SettlementRecord:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "status", SettlementStatus(self.status))
+        if self.effect_id is not None and not isinstance(self.effect_id, str):
+            raise ValueError("settlement effect_id must be a string or None")
+        if self.verified_request_hash is not None and not isinstance(self.verified_request_hash, str):
+            raise ValueError("verified_request_hash must be a string or None")
         object.__setattr__(self, "evidence", _deep_freeze(self.evidence))
+        _require_bounded_evidence(self.evidence)
         _require_bool("authoritative", self.authoritative)
         if self.authoritative and not self.verified_request_hash:
             raise ValueError("authoritative settlement records require verified_request_hash")
-        if self.amount_usd is not None:
-            if not isinstance(self.amount_usd, Decimal) or not self.amount_usd.is_finite():
-                raise ValueError("settlement amount_usd must be finite Decimal or None")
+        object.__setattr__(self, "amount_usd", _bounded_amount("settlement amount_usd", self.amount_usd))
 
 
 @dataclass(frozen=True)
@@ -600,9 +643,8 @@ class ExecutionReceipt:
     def __post_init__(self) -> None:
         object.__setattr__(self, "status", SettlementStatus(self.status))
         object.__setattr__(self, "evidence", _deep_freeze(self.evidence))
-        if self.amount_usd is not None:
-            if not isinstance(self.amount_usd, Decimal) or not self.amount_usd.is_finite():
-                raise ValueError("execution amount_usd must be finite Decimal or None")
+        _require_bounded_evidence(self.evidence)
+        object.__setattr__(self, "amount_usd", _bounded_amount("execution amount_usd", self.amount_usd))
         # effect_id validity is deliberately enforced by the runtime, not here.
         # Adapter output is a trust boundary and malformed output must become an
         # explicit STOP rather than an adapter-construction exception/UNKNOWN.
