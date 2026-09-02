@@ -25,6 +25,7 @@ from faar.models import (
     CapabilityGrant,
     CapabilityLimits,
     EconomicPrimitive,
+    ExecutionRequest,
     GrantStatus,
     Intent,
     RiskSnapshot,
@@ -144,12 +145,39 @@ def replay_fuzz(seed: int) -> None:
     r = make_risk(1)
     aa, ra = signed(trust, i, r)
 
+    request = ExecutionRequest.from_intent(i)
     for _ in range(8):
         venue.set_mode(rng.choice(list(MockMode)))
         runtime.process(i, AUTH, grant, r, authority_attestation=aa, risk_attestation=ra, now=clock["now"])
         if venue.successful_effect_count(i.intent_id) > 1:
             raise AssertionError(f"seed {seed}: duplicate economic effect")
+        # Venue-side lifecycle of a resting order between two runtime calls.
+        step = rng.random()
+        if step < 0.2:
+            venue.complete_fill(request)
+        elif step < 0.4:
+            venue.cancel_order(request)
         clock["now"] = clock["now"] + timedelta(seconds=rng.choice((0, 1, 3, 8)))
+    _check_ledger(store, venue, i, grant, seed)
+
+
+def _check_ledger(store, venue, i, grant, seed) -> None:
+    """Ledger/effect consistency after any interleaving: budget is never released
+    while an effect exists, a FINALIZED intent commits, and a permit is never
+    consumed without a record of it."""
+    stored = store.get(i.intent_id)
+    rows = [row for row in store.usage(grant.grant_id, grant.version) if row["intent_id"] == i.intent_id]
+    usage = rows[0]["status"] if rows else None
+    effects = venue.successful_effect_count(i.intent_id)
+    if usage == "RELEASED" and effects:
+        raise AssertionError(f"seed {seed}: budget released while an effect exists ({stored.state.value} {stored.reason_codes})")
+    if stored.state.value == "FINALIZED" and (usage != "COMMITTED" or effects != 1):
+        raise AssertionError(f"seed {seed}: FINALIZED without committed budget and exactly one effect")
+    if stored.state.value in {"STOPPED", "FAILED_SAFE"} and effects and stored.effect_id is None:
+        # An effect the ledger does not know about may only coexist with a
+        # settlement-derived stop, which keeps the budget held for a human.
+        if usage != "HELD":
+            raise AssertionError(f"seed {seed}: unrecorded effect with budget {usage}")
 
 
 def concurrent_budget_fuzz(seed: int) -> None:

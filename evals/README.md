@@ -52,7 +52,7 @@ proof.
 
 ## Seeded state-machine fuzz
 
-`run_state_fuzz.py` executes 64 randomized retry/ambiguity sequences (with a shared clock advancing 0..8 s per step, so the permit-bounded ambiguity window and the retry path are both exercised) and 32 randomized concurrent-budget scenarios using deterministic seeds. It asserts no duplicate effect for one intent and no aggregate turnover oversubscription. It broadens state-space regression coverage but is not exhaustive property testing.
+`run_state_fuzz.py` executes 64 randomized retry/ambiguity sequences (with a shared clock advancing 0..8 s per step, every mock venue mode including admission timeouts and partial fills, and venue-side completion or cancellation of resting orders between calls, so the permit-bounded ambiguity window, the retry path and the order lifecycle are all exercised; after each sequence it checks that budget is never released while an effect exists and that FINALIZED implies a committed reservation and exactly one effect) and 32 randomized concurrent-budget scenarios using deterministic seeds. It asserts no duplicate effect for one intent and no aggregate turnover oversubscription. It broadens state-space regression coverage but is not exhaustive property testing.
 
 ## Bounded permit protocol model
 
