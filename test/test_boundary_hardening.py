@@ -249,8 +249,19 @@ class PermitVerifierBoundaryTests(unittest.TestCase):
         )
 
     def test_relabelled_signer_or_algorithm_breaks_the_signature(self):
+        from faar.permits import Ed25519PermitSigner, ExecutionPermitVerifier
         request, signed = self._issue()
         ok, reasons = self.verifier.verify(replace(signed, signer_id="someone-else"), request, now=NOW)
+        self.assertFalse(ok)
+        self.assertEqual(("PERMIT_SIGNER_UNKNOWN",), reasons)
+        # With a second trusted signer, relabelling a permit to that signer must
+        # fail the signature itself: signer_id is inside the signed payload.
+        other = Ed25519PermitSigner("other-trusted-signer")
+        gateway = ExecutionPermitVerifier(
+            {self.verifier.signature.signer_id: self.verifier.signature, other.signer_id: other.public_verifier()}, self.store,
+        )
+        self.assertTrue(gateway.verify(signed, request, now=NOW)[0])
+        ok, reasons = gateway.verify(replace(signed, signer_id=other.signer_id), request, now=NOW)
         self.assertFalse(ok)
         self.assertIn("PERMIT_SIGNATURE_INVALID", reasons)
 

@@ -19,6 +19,15 @@ class AmbiguousExecution(ExecutionError):
     """The caller cannot know whether an economic effect occurred."""
 
 
+class AdapterDeadlineExceeded(AmbiguousExecution):
+    """The adapter call did not return within the runtime's execution deadline.
+
+    The request may still be in flight; the venue can act on it until the signed
+    permit expires. The runtime therefore treats absence of an effect as
+    non-authoritative until that instant has passed.
+    """
+
+
 class DeterministicFailure(ExecutionError):
     """The adapter knows no economic effect occurred."""
 

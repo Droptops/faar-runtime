@@ -15,8 +15,12 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Iterable, Iterator
 
+from .anchor import AuthorityAnchor, AuthorityRegression, regressed
 from .canonical import canonical_json, parse_bounded_decimal
 from .models import CapabilityGrant, Intent, IntentState, MONETARY_PRIMITIVES, RiskSnapshot
+
+GLOBAL_CONTROL_SCOPE = "global"
+PRINCIPAL_CONTROL_PREFIX = "principal:"
 
 
 # Trailing window used for the atomic "daily" turnover reservation. A calendar-day
@@ -52,6 +56,10 @@ class StoredIntent:
     submission_count: int
     created_at: str
     updated_at: str
+    # ISO timestamp until which a submission attempt may still be acted on by the
+    # venue (the permit expiry of an in-flight, ambiguous attempt). Absence of an
+    # effect is not authoritative before this instant has passed.
+    ambiguity_until: str | None = None
 
 
 class IntentConflict(RuntimeError):
@@ -128,8 +136,16 @@ class SQLiteIntentStore:
     not the claimed production architecture.
     """
 
-    def __init__(self, path: str | Path = ":memory:", *, evidence_key: bytes | None = None) -> None:
+    def __init__(
+        self,
+        path: str | Path = ":memory:",
+        *,
+        evidence_key: bytes | None = None,
+        authority_anchor: AuthorityAnchor | None = None,
+    ) -> None:
         self.path = str(path)
+        # Optional external high-water mark of consumed authority; see faar.anchor.
+        self._anchor = authority_anchor
         self._lock = threading.RLock()
         self._intent_lock_guard = threading.Lock()
         self._intent_locks: dict[str, tuple[threading.RLock, int]] = {}
@@ -213,6 +229,7 @@ class SQLiteIntentStore:
                 effect_id TEXT,
                 reason_codes TEXT NOT NULL DEFAULT '[]',
                 submission_count INTEGER NOT NULL DEFAULT 0,
+                ambiguity_until TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -238,6 +255,13 @@ class SQLiteIntentStore:
                 seq INTEGER NOT NULL,
                 head_hash TEXT NOT NULL,
                 head_mac TEXT,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS runtime_controls (
+                scope TEXT PRIMARY KEY,
+                halted INTEGER NOT NULL CHECK(halted IN (0,1)),
+                reason TEXT,
+                control_epoch INTEGER NOT NULL DEFAULT 1,
                 updated_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS execution_permits (
@@ -274,6 +298,7 @@ class SQLiteIntentStore:
         ("intents", "submission_count", "INTEGER NOT NULL DEFAULT 0"),
         ("intents", "principal_id", "TEXT NOT NULL DEFAULT 'legacy:unknown'"),
         ("intents", "venue", "TEXT NOT NULL DEFAULT ''"),
+        ("intents", "ambiguity_until", "TEXT"),
         ("evidence", "event_mac", "TEXT"),
         ("evidence", "principal_id", "TEXT NOT NULL DEFAULT 'legacy:unknown'"),
         ("grants", "principal_id", "TEXT NOT NULL DEFAULT 'legacy:unknown'"),
@@ -331,6 +356,16 @@ class SQLiteIntentStore:
             except Exception:
                 self._conn.execute("ROLLBACK")
                 raise
+
+    def checkpoint(self) -> None:
+        """Fold the WAL into the main database file.
+
+        Operators must call this (or close every connection) before copying the
+        file for a backup; a bare copy of a WAL-mode database misses every
+        transaction still in the write-ahead log.
+        """
+        with self._lock:
+            self._execute_with_busy_retry("PRAGMA wal_checkpoint(TRUNCATE)")
 
     def close(self) -> None:
         with self._lock:
@@ -476,6 +511,209 @@ class SQLiteIntentStore:
             except Exception:
                 self._conn.execute("ROLLBACK")
                 raise
+            if row is None:
+                self._anchor_record(grant.grant_id, grant.version, 1, 0)
+
+    # ---- external authority anchor -------------------------------------------------
+
+    def _anchor_regressed(self, grant_id: str, version: int, epoch: int, fence: int) -> bool:
+        if self._anchor is None:
+            return False
+        return regressed((int(epoch), int(fence)), self._anchor.high_water(grant_id, version))
+
+    def _anchor_record(self, grant_id: str, version: int, epoch: int, fence: int) -> None:
+        if self._anchor is not None:
+            self._anchor.record(grant_id, version, int(epoch), int(fence))
+
+    def revoke_after_restore(self, grant_id: str, version: int) -> tuple[int, int]:
+        """Operator-only recovery for a grant version whose authority state regressed.
+
+        A restored database cannot know which permits and risk states were consumed
+        in the lost history, so the only safe continuation is to close that grant
+        version: its epoch is advanced past the anchored high-water mark (killing
+        every permit ever issued under it) and it is REVOKED. New authority requires
+        a new grant version. Returns the new (epoch, fence_counter).
+        """
+        with self.execution_guard(grant_id, version), self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute(
+                    "SELECT runtime_epoch,fence_counter FROM grants WHERE grant_id=? AND version=?",
+                    (grant_id, version),
+                ).fetchone()
+                if row is None:
+                    raise UnknownGrant(f"grant {grant_id}@{version} is not provisioned")
+                mark = self._anchor.high_water(grant_id, version) if self._anchor is not None else None
+                epoch = max(int(row["runtime_epoch"]), mark[0] if mark else 0) + 1
+                fence = max(int(row["fence_counter"]), mark[1] if mark else 0)
+                self._conn.execute(
+                    "UPDATE grants SET runtime_status='REVOKED', runtime_epoch=?, fence_counter=? WHERE grant_id=? AND version=?",
+                    (epoch, fence, grant_id, version),
+                )
+                self._conn.execute("COMMIT")
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
+            if self._anchor is not None:
+                self._anchor.reset(grant_id, version, epoch, fence)
+            return epoch, fence
+
+    # ---- emergency controls (kill switch) ------------------------------------------
+
+    @staticmethod
+    def _validate_control_scope(scope: str) -> str | None:
+        """Returns the principal for a principal scope, None for the global scope."""
+        if scope == GLOBAL_CONTROL_SCOPE:
+            return None
+        if isinstance(scope, str) and scope.startswith(PRINCIPAL_CONTROL_PREFIX) and len(scope) > len(PRINCIPAL_CONTROL_PREFIX):
+            return scope[len(PRINCIPAL_CONTROL_PREFIX):]
+        raise ValueError("control scope must be 'global' or 'principal:<principal_id>'")
+
+    def _active_halt_locked(self, principal_id: str) -> str | None:
+        row = self._conn.execute(
+            "SELECT scope FROM runtime_controls WHERE halted=1 AND (scope=? OR scope=?) "
+            "ORDER BY CASE WHEN scope=? THEN 0 ELSE 1 END LIMIT 1",
+            (GLOBAL_CONTROL_SCOPE, PRINCIPAL_CONTROL_PREFIX + principal_id, GLOBAL_CONTROL_SCOPE),
+        ).fetchone()
+        return None if row is None else str(row["scope"])
+
+    def halt(self, scope: str, *, reason: str) -> int:
+        """Emergency stop for every grant in `scope` ('global' or 'principal:<id>').
+
+        Marks the scope halted and advances the runtime epoch of every affected grant
+        in the same transaction, so permits already issued cannot be consumed even
+        after `resume`. The per-grant in-process fence is deliberately not awaited:
+        an emergency stop must complete while an adapter call is hung; the epoch
+        check at permit consumption is the fence for in-flight attempts. Returns the
+        number of grant versions fenced.
+        """
+        principal = self._validate_control_scope(scope)
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("a halt reason is required")
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                now = self._now()
+                self._conn.execute(
+                    "INSERT INTO runtime_controls(scope,halted,reason,control_epoch,updated_at) VALUES(?,?,?,?,?) "
+                    "ON CONFLICT(scope) DO UPDATE SET halted=1, reason=excluded.reason, "
+                    "control_epoch=runtime_controls.control_epoch+1, updated_at=excluded.updated_at",
+                    (scope, 1, reason, 1, now),
+                )
+                if principal is None:
+                    cur = self._conn.execute("UPDATE grants SET runtime_epoch=runtime_epoch+1")
+                    rows = self._conn.execute("SELECT grant_id,version,runtime_epoch,fence_counter FROM grants").fetchall()
+                else:
+                    cur = self._conn.execute("UPDATE grants SET runtime_epoch=runtime_epoch+1 WHERE principal_id=?", (principal,))
+                    rows = self._conn.execute(
+                        "SELECT grant_id,version,runtime_epoch,fence_counter FROM grants WHERE principal_id=?", (principal,)
+                    ).fetchall()
+                fenced = cur.rowcount
+                self._conn.execute("COMMIT")
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
+        for row in rows:
+            self._anchor_record(str(row["grant_id"]), int(row["version"]), int(row["runtime_epoch"]), int(row["fence_counter"]))
+        return fenced
+
+    def resume(self, scope: str) -> None:
+        """Lift a halt. Permits issued before the halt stay dead (their epoch is gone)."""
+        self._validate_control_scope(scope)
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                cur = self._conn.execute(
+                    "UPDATE runtime_controls SET halted=0, control_epoch=control_epoch+1, updated_at=? WHERE scope=?",
+                    (self._now(), scope),
+                )
+                if cur.rowcount == 0:
+                    raise KeyError(f"no control record for scope {scope!r}")
+                self._conn.execute("COMMIT")
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
+
+    def controls(self) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute("SELECT * FROM runtime_controls ORDER BY scope").fetchall()
+        return [dict(r) for r in rows]
+
+    def is_halted(self, principal_id: str) -> str | None:
+        with self._lock:
+            return self._active_halt_locked(principal_id)
+
+    # ---- operator queries ----------------------------------------------------------
+
+    def list_grants(self, *, principal_id: str | None = None) -> list[dict]:
+        with self._lock:
+            if principal_id is None:
+                rows = self._conn.execute(
+                    "SELECT grant_id,version,principal_id,grant_hash,runtime_status,runtime_epoch,fence_counter,provisioned_at "
+                    "FROM grants ORDER BY principal_id,grant_id,version"
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT grant_id,version,principal_id,grant_hash,runtime_status,runtime_epoch,fence_counter,provisioned_at "
+                    "FROM grants WHERE principal_id=? ORDER BY grant_id,version",
+                    (principal_id,),
+                ).fetchall()
+        out = []
+        for r in rows:
+            item = dict(r)
+            item["effective_status"] = self.get_grant_control(item["principal_id"], item["grant_id"], int(item["version"]))[0]
+            out.append(item)
+        return out
+
+    def list_intents(
+        self,
+        *,
+        state: IntentState | str | None = None,
+        principal_id: str | None = None,
+        limit: int = 200,
+    ) -> list[StoredIntent]:
+        clauses, params = [], []
+        if state is not None:
+            clauses.append("state=?")
+            params.append(IntentState(state).value)
+        if principal_id is not None:
+            clauses.append("principal_id=?")
+            params.append(principal_id)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT intent_id FROM intents{where} ORDER BY updated_at DESC LIMIT ?", (*params, int(limit))
+            ).fetchall()
+        return [self.get(str(r["intent_id"])) for r in rows]
+
+    def held_usage(self, *, principal_id: str | None = None) -> list[dict]:
+        """HELD reservations joined to their intent state; the budget an operator may be waiting on."""
+        with self._lock:
+            sql = (
+                "SELECT u.intent_id,u.principal_id,u.grant_id,u.grant_version,u.amount_usd,u.created_at,i.state,i.submission_count,i.ambiguity_until "
+                "FROM usage_reservations u JOIN intents i ON i.intent_id=u.intent_id WHERE u.status='HELD'"
+            )
+            params: tuple = ()
+            if principal_id is not None:
+                sql += " AND u.principal_id=?"
+                params = (principal_id,)
+            rows = self._conn.execute(sql + " ORDER BY u.created_at", params).fetchall()
+        return [dict(r) for r in rows]
+
+    def list_leases(self) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute("SELECT * FROM intent_leases ORDER BY acquired_at").fetchall()
+        return [dict(r) for r in rows]
+
+    def permit_counts(self, intent_id: str) -> tuple[int, int]:
+        """(issued, consumed) execution permits recorded for one intent."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS issued, SUM(CASE WHEN consumed_at IS NOT NULL THEN 1 ELSE 0 END) AS consumed "
+                "FROM execution_permits WHERE intent_id=?",
+                (intent_id,),
+            ).fetchone()
+        return int(row["issued"] or 0), int(row["consumed"] or 0)
 
     def verify_grant(self, grant: CapabilityGrant, grant_hash: str) -> None:
         with self._lock:
@@ -489,6 +727,13 @@ class SQLiteIntentStore:
                 raise GrantConflict("presented grant does not match provisioned principal/capability envelope")
 
     def get_grant_control(self, principal_id: str, grant_id: str, version: int) -> tuple[str, int, int]:
+        """Effective runtime status of a grant version plus its epoch and fence counter.
+
+        The effective status folds in the emergency controls and the external
+        authority anchor: REGRESSED (datastore older than anchored authority) and
+        HALTED (scope kill switch) are reported like any other non-ACTIVE status, so
+        every caller that requires ACTIVE fails closed without special cases.
+        """
         with self._lock:
             row = self._conn.execute(
                 "SELECT principal_id,runtime_status,runtime_epoch,fence_counter FROM grants WHERE grant_id=? AND version=?",
@@ -498,7 +743,13 @@ class SQLiteIntentStore:
                 raise UnknownGrant(f"grant {grant_id}@{version} is not provisioned")
             if str(row["principal_id"]) != principal_id:
                 raise GrantConflict("grant principal mismatch")
-            return str(row["runtime_status"]), int(row["runtime_epoch"]), int(row["fence_counter"])
+            status, epoch, fence = str(row["runtime_status"]), int(row["runtime_epoch"]), int(row["fence_counter"])
+            halted = self._active_halt_locked(principal_id) is not None
+        if self._anchor_regressed(grant_id, version, epoch, fence):
+            return "REGRESSED", epoch, fence
+        if status == "ACTIVE" and halted:
+            return "HALTED", epoch, fence
+        return status, epoch, fence
 
     def get_grant_status(self, principal_id: str, grant_id: str, version: int) -> str:
         return self.get_grant_control(principal_id, grant_id, version)[0]
@@ -513,25 +764,32 @@ class SQLiteIntentStore:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
                 row = self._conn.execute(
-                    "SELECT principal_id,runtime_status,runtime_epoch FROM grants WHERE grant_id=? AND version=?",
+                    "SELECT principal_id,runtime_status,runtime_epoch,fence_counter FROM grants WHERE grant_id=? AND version=?",
                     (grant_id, version),
                 ).fetchone()
                 if row is None:
                     raise UnknownGrant(f"grant {grant_id}@{version} is not provisioned")
                 if str(row["principal_id"]) != principal_id:
                     raise GrantConflict("grant principal mismatch")
+                if self._anchor_regressed(grant_id, version, int(row["runtime_epoch"]), int(row["fence_counter"])):
+                    raise AuthorityRegression(
+                        f"grant {grant_id}@{version} authority state is older than its anchor; use revoke_after_restore"
+                    )
                 current = str(row["runtime_status"])
                 if current == "REVOKED" and status != "REVOKED":
                     raise GrantConflict("revoked grant versions cannot be reactivated; provision a new version")
+                new_epoch = int(row["runtime_epoch"])
                 if current != status:
+                    new_epoch += 1
                     self._conn.execute(
-                        "UPDATE grants SET runtime_status=?, runtime_epoch=runtime_epoch+1 WHERE grant_id=? AND version=?",
-                        (status, grant_id, version),
+                        "UPDATE grants SET runtime_status=?, runtime_epoch=? WHERE grant_id=? AND version=?",
+                        (status, new_epoch, grant_id, version),
                     )
                 self._conn.execute("COMMIT")
             except Exception:
                 self._conn.execute("ROLLBACK")
                 raise
+            self._anchor_record(grant_id, version, new_epoch, int(row["fence_counter"]))
 
     def next_execution_fence(self, grant: CapabilityGrant) -> tuple[int, int]:
         """Atomically allocate a monotonically increasing fence for an ACTIVE grant."""
@@ -548,6 +806,10 @@ class SQLiteIntentStore:
                     raise GrantConflict("grant principal mismatch")
                 if str(row["runtime_status"]) != "ACTIVE":
                     raise GrantConflict(f"grant runtime status is {row['runtime_status']}")
+                if self._active_halt_locked(grant.principal_id) is not None:
+                    raise GrantConflict("grant scope is halted")
+                if self._anchor_regressed(grant.grant_id, grant.version, int(row["runtime_epoch"]), int(row["fence_counter"])):
+                    raise GrantConflict("grant authority state regressed behind its anchor")
                 counter = int(row["fence_counter"]) + 1
                 epoch = int(row["runtime_epoch"])
                 self._conn.execute(
@@ -555,10 +817,11 @@ class SQLiteIntentStore:
                     (counter, grant.grant_id, grant.version),
                 )
                 self._conn.execute("COMMIT")
-                return epoch, counter
             except Exception:
                 self._conn.execute("ROLLBACK")
                 raise
+            self._anchor_record(grant.grant_id, grant.version, epoch, counter)
+            return epoch, counter
 
     def verify_usage_held(self, intent: Intent, grant: CapabilityGrant) -> bool:
         with self._lock:
@@ -697,7 +960,7 @@ class SQLiteIntentStore:
                     return False, ("PERMIT_ALREADY_CONSUMED",)
 
                 grant_row = self._conn.execute(
-                    "SELECT principal_id,runtime_status,runtime_epoch FROM grants WHERE grant_id=? AND version=?",
+                    "SELECT principal_id,runtime_status,runtime_epoch,fence_counter FROM grants WHERE grant_id=? AND version=?",
                     (grant_id, grant_version),
                 ).fetchone()
                 if grant_row is None:
@@ -710,6 +973,10 @@ class SQLiteIntentStore:
                     reasons.append("PERMIT_GRANT_NOT_ACTIVE")
                 if int(grant_row["runtime_epoch"]) != grant_epoch:
                     reasons.append("PERMIT_GRANT_EPOCH_STALE")
+                if self._active_halt_locked(principal_id) is not None:
+                    reasons.append("PERMIT_HALTED")
+                if self._anchor_regressed(grant_id, grant_version, int(grant_row["runtime_epoch"]), int(grant_row["fence_counter"])):
+                    reasons.append("PERMIT_AUTHORITY_REGRESSED")
                 if reasons:
                     self._conn.execute("COMMIT")
                     return False, tuple(reasons)
@@ -913,6 +1180,7 @@ class SQLiteIntentStore:
             submission_count=int(row["submission_count"]),
             created_at=row["created_at"],
             updated_at=row["updated_at"],
+            ambiguity_until=row["ambiguity_until"],
         )
 
     def transition(
@@ -924,6 +1192,7 @@ class SQLiteIntentStore:
         reason_codes: Iterable[str] = (),
         effect_id: str | None = None,
         release_usage: bool = False,
+        ambiguity_until: datetime | None = None,
     ) -> bool:
         """Compare-and-set the intent state.
 
@@ -931,10 +1200,16 @@ class SQLiteIntentStore:
         transaction. Terminalizing and releasing as two autocommit statements leaves
         a crash window in which a provably never-submitted intent keeps consuming the
         grant's turnover and velocity budget forever.
+
+        `ambiguity_until` records the instant after which an in-flight submission can
+        no longer be acted on by the venue (its permit expiry). Reconciliation must
+        not treat absence as authoritative before it.
         """
         expected_set = {expected} if isinstance(expected, IntentState) else set(expected)
         if effect_id is not None and not isinstance(effect_id, str):
             raise ValueError("effect_id must be a string")
+        if ambiguity_until is not None and (ambiguity_until.tzinfo is None or ambiguity_until.utcoffset() is None):
+            raise ValueError("ambiguity_until must be timezone-aware")
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
@@ -953,6 +1228,11 @@ class SQLiteIntentStore:
                     "UPDATE intents SET state=?, effect_id=?, reason_codes=?, updated_at=? WHERE intent_id=?",
                     (new_state.value, final_effect, json.dumps(list(reason_codes)), ts, intent_id),
                 )
+                if ambiguity_until is not None:
+                    self._conn.execute(
+                        "UPDATE intents SET ambiguity_until=? WHERE intent_id=?",
+                        (ambiguity_until.isoformat(), intent_id),
+                    )
                 if release_usage:
                     self._conn.execute(
                         "UPDATE usage_reservations SET status='RELEASED', updated_at=? WHERE intent_id=? AND status='HELD'",
@@ -1001,8 +1281,10 @@ class SQLiteIntentStore:
                 if IntentState.SUBMITTED not in _ALLOWED_TRANSITIONS[current]:
                     raise InvalidTransition(f"{current.value} -> SUBMITTED is not allowed")
                 count += 1
+                # A new attempt begins only after any previous attempt's ambiguity
+                # window has closed, so the window is reset for this attempt.
                 self._conn.execute(
-                    "UPDATE intents SET state=?, submission_count=?, reason_codes='[]', updated_at=? WHERE intent_id=?",
+                    "UPDATE intents SET state=?, submission_count=?, reason_codes='[]', ambiguity_until=NULL, updated_at=? WHERE intent_id=?",
                     (IntentState.SUBMITTED.value, count, self._now(), intent_id),
                 )
                 self._conn.execute("COMMIT")

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 from decimal import Decimal
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Callable, Mapping
 
-from .adapters import AmbiguousExecution, DeterministicFailure, ExecutionAdapter
+from .adapters import AdapterDeadlineExceeded, AmbiguousExecution, DeterministicFailure, ExecutionAdapter
 from .attestation import AttestationVerifier, has_signing_api
 from .permits import ConstrainedPermitAuthority, PermitIssuanceError
 from .settlement import SettlementVerifier
@@ -77,9 +78,16 @@ class FAARRuntime:
         *,
         clock: Callable[[], datetime] = utcnow,
         allow_test_time_override: bool = False,
+        adapter_deadline_seconds: float | None = None,
     ) -> None:
         self.store = store
         self.adapters = dict(adapters)
+        if adapter_deadline_seconds is not None and not adapter_deadline_seconds > 0:
+            raise ValueError("adapter_deadline_seconds must be positive or None")
+        # Bounded adapter calls: a hung venue call must not hold the per-grant
+        # revocation fence indefinitely. Past the deadline the call is treated as an
+        # in-flight ambiguity bounded by the permit's expiry.
+        self.adapter_deadline_seconds = adapter_deadline_seconds
         for name, adapter in self.adapters.items():
             profile = getattr(adapter, "security_profile", None)
             if profile is None or not profile.exactly_once_compatible:
@@ -103,6 +111,48 @@ class FAARRuntime:
                 raise ValueError(f"settlement verifier {name!r} does not satisfy the trusted verification profile")
         self.clock = clock
         self.allow_test_time_override = allow_test_time_override
+
+    def _execute_adapter(self, adapter: ExecutionAdapter, request: ExecutionRequest, permit) -> object:
+        """Call the adapter, bounded by `adapter_deadline_seconds` when configured.
+
+        A Python thread cannot be cancelled, so a call that overruns is left to
+        finish on its own; the runtime stops waiting and records the attempt as
+        ambiguous until the permit the venue holds can no longer be consumed.
+        """
+        if self.adapter_deadline_seconds is None:
+            return adapter.execute(request, permit)
+        outcome: dict[str, object] = {}
+        done = threading.Event()
+
+        def run() -> None:
+            try:
+                outcome["receipt"] = adapter.execute(request, permit)
+            except BaseException as exc:  # propagated to the caller below
+                outcome["error"] = exc
+            finally:
+                done.set()
+
+        worker = threading.Thread(target=run, name=f"faar-adapter-{request.intent_id}", daemon=True)
+        worker.start()
+        if not done.wait(self.adapter_deadline_seconds):
+            raise AdapterDeadlineExceeded(
+                f"adapter call exceeded {self.adapter_deadline_seconds}s; request may still be in flight"
+            )
+        if "error" in outcome:
+            raise outcome["error"]  # type: ignore[misc]
+        return outcome["receipt"]
+
+    @staticmethod
+    def _ambiguity_window_closes_at(stored, grant: CapabilityGrant) -> datetime | None:
+        """Instant after which absence of an effect may be trusted again.
+
+        The venue judges permit expiry by its own clock, so the runtime waits the
+        grant's clock-skew allowance past the permit expiry before it will accept
+        an authoritative NONE for an attempt that may still be in flight.
+        """
+        if not stored.ambiguity_until:
+            return None
+        return datetime.fromisoformat(stored.ambiguity_until) + timedelta(seconds=grant.limits.max_clock_skew_seconds)
 
     def _decision_time(self, override: datetime | None) -> datetime:
         # Callers must not be able to move the security clock backwards to evade
@@ -497,12 +547,23 @@ class FAARRuntime:
                     "grant_epoch": permit.permit.grant_epoch,
                     "fence_token": permit.permit.fence_token,
                 })
+                # While the signed permit is live the venue may still act on an
+                # attempt whose outcome the runtime never observed. Absence of an
+                # effect is therefore not authoritative until the permit has expired.
+                ambiguity_until = permit.permit.expires_at
                 try:
-                    receipt = adapter.execute(request, permit)
+                    receipt = self._execute_adapter(adapter, request, permit)
                 except AmbiguousExecution as exc:
                     outcome = "ambiguous"
-                    self.store.transition(intent.intent_id, IntentState.SUBMITTED, IntentState.UNKNOWN, reason_codes=("EXECUTION_AMBIGUOUS",))
-                    self.store.add_evidence(intent.intent_id, "execution_ambiguous", {"message": str(exc), "attempt": attempt})
+                    reason = "EXECUTION_DEADLINE_EXCEEDED" if isinstance(exc, AdapterDeadlineExceeded) else "EXECUTION_AMBIGUOUS"
+                    self.store.transition(
+                        intent.intent_id, IntentState.SUBMITTED, IntentState.UNKNOWN,
+                        reason_codes=(reason,), ambiguity_until=ambiguity_until,
+                    )
+                    self.store.add_evidence(intent.intent_id, "execution_ambiguous", {
+                        "message": str(exc), "attempt": attempt, "reason": reason,
+                        "ambiguity_until": ambiguity_until.isoformat(),
+                    })
                 except DeterministicFailure as exc:
                     # A submitter is not allowed to prove non-execution. Even a
                     # deterministic-looking rejection is independently reconciled before
@@ -521,9 +582,13 @@ class FAARRuntime:
                     # Adapter crashes are economically ambiguous. The independent
                     # verifier, never the submitter, decides whether an effect exists.
                     outcome = "exception"
-                    self.store.transition(intent.intent_id, IntentState.SUBMITTED, IntentState.UNKNOWN, reason_codes=("ADAPTER_EXECUTION_EXCEPTION",))
+                    self.store.transition(
+                        intent.intent_id, IntentState.SUBMITTED, IntentState.UNKNOWN,
+                        reason_codes=("ADAPTER_EXECUTION_EXCEPTION",), ambiguity_until=ambiguity_until,
+                    )
                     self.store.add_evidence(intent.intent_id, "adapter_execution_exception", {
                         "type": type(exc).__name__, "message": str(exc), "attempt": attempt,
+                        "ambiguity_until": ambiguity_until.isoformat(),
                     })
                 else:
                     # A submitter receipt is telemetry, not settlement authority. Never
@@ -740,7 +805,19 @@ class FAARRuntime:
 
         if settlement.status == SettlementStatus.NONE:
             # Authoritative NONE is the only state in which releasing the held budget
-            # or considering a retry is safe.
+            # or considering a retry is safe, and only once no in-flight attempt can
+            # still be acted on by the venue (I-9): before the permit window closes a
+            # venue that has not yet processed the request will truthfully report
+            # "no effect" and a retry would create a duplicate.
+            window_closes_at = self._ambiguity_window_closes_at(stored, grant)
+            if window_closes_at is not None and decision_now < window_closes_at:
+                reasons = self._with_block("SETTLEMENT_NONE_WITHIN_PERMIT_WINDOW", _block_reason)
+                self.store.transition(intent.intent_id, IntentState.RECONCILING, IntentState.UNKNOWN, reason_codes=reasons)
+                self.store.add_evidence(intent.intent_id, "ambiguity_window_open", {
+                    "closes_at": window_closes_at.isoformat(), "observed_at": decision_now.isoformat(),
+                })
+                return self._current_result(intent.intent_id, decisions=decisions, reason_codes=reasons, replayed=True)
+
             if not _allow_resubmit:
                 reason = _block_reason or "RESUBMISSION_BLOCKED"
                 target = (

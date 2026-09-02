@@ -210,8 +210,7 @@ class PermitBoundaryTests(unittest.TestCase):
         other_verifier = ExecutionPermitVerifier(other.public_verifier(), self.store)
         ok, reasons = other_verifier.verify(permit, req, now=NOW)
         self.assertFalse(ok)
-        self.assertIn("PERMIT_SIGNER_UNKNOWN", reasons)
-        self.assertIn("PERMIT_SIGNATURE_INVALID", reasons)
+        self.assertEqual(("PERMIT_SIGNER_UNKNOWN",), reasons, "an unknown signer is rejected before any signature check")
 
     def test_intent_grant_binding_remains_enforced(self):
         i, req, permit = self.issue(i=intent(intent_id="permit_binding_00000000001"), rs=risk(state_version=44))

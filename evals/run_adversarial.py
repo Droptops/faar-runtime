@@ -99,6 +99,7 @@ def main() -> None:
         return runtime.process(i, auth, grant, risk, authority_attestation=aa, risk_attestation=ra, now=NOW)
 
     unauthorized_effects = 0
+    unauthorized_adapter_calls = 0
     denial_cases = []
     mutations = [
         ("target", {"target": "wallet:attacker"}, AUTH, rs()),
@@ -117,44 +118,65 @@ def main() -> None:
             i = make(f"eval_denied_{n:02d}_{label}_000000", **override)
             result = process(i, auth, risk)
             effects = venue.successful_effect_count(i.intent_id)
+            calls = venue.execute_call_count(i.intent_id)
             unauthorized_effects += effects
-            denial_cases.append({"case": f"{n}:{label}", "state": result.state.value, "effects": effects})
+            unauthorized_adapter_calls += calls
+            denial_cases.append({"case": f"{n}:{label}", "state": result.state.value, "effects": effects, "adapter_calls": calls})
 
     forged = make("eval_forged_attestation_0001")
     forged_result = process(forged, risk=rs(), tamper_auth=True)
     unauthorized_effects += venue.successful_effect_count(forged.intent_id)
+    unauthorized_adapter_calls += venue.execute_call_count(forged.intent_id)
 
-    # Exactly-once replay under repeated client retries.
+    # Exactly-once replay under repeated client retries. The mock venue is
+    # idempotent by construction, so the effect count alone cannot detect a
+    # runtime double-submission: adapter calls and consumed permits are measured
+    # too, and both must be exactly one.
     replay_intent = make("eval_replay_000000000001")
     replay_risk = rs(version=1)
     first = process(replay_intent, risk=replay_risk)
     for _ in range(99):
         process(replay_intent, risk=replay_risk)
     replay_effects = venue.successful_effect_count(replay_intent.intent_id)
+    replay_calls = venue.execute_call_count(replay_intent.intent_id)
+    replay_permits_issued, replay_permits_consumed = store.permit_counts(replay_intent.intent_id)
 
     # Ambiguous-after-effect reconciliation on a fresh risk state.
     venue.set_mode(MockMode.TIMEOUT_AFTER_EFFECT)
     ambiguous = make("eval_timeout_after_00000001")
     amb_result = process(ambiguous, risk=rs(version=2))
     ambiguous_effects = venue.successful_effect_count(ambiguous.intent_id)
+    ambiguous_calls = venue.execute_call_count(ambiguous.intent_id)
 
     report = {
-        "suite": "FAAR v0.3 deterministic adversarial smoke",
+        "suite": "FAAR v0.4 deterministic adversarial smoke",
         "denial_cases": len(denial_cases),
         "forged_attestation_state": forged_result.state.value,
         "unauthorized_economic_effects": unauthorized_effects,
+        "unauthorized_adapter_calls": unauthorized_adapter_calls,
         "replay_attempts": 100,
         "replay_final_state": first.state.value,
         "replay_successful_effects": replay_effects,
+        "replay_adapter_calls": replay_calls,
+        "replay_permits_issued": replay_permits_issued,
+        "replay_permits_consumed": replay_permits_consumed,
         "timeout_after_effect_final_state": amb_result.state.value,
         "timeout_after_effect_successful_effects": ambiguous_effects,
+        "timeout_after_effect_adapter_calls": ambiguous_calls,
         "evidence_chain_valid": store.verify_evidence_chain(replay_intent.intent_id),
         "pass": (
             unauthorized_effects == 0
+            and unauthorized_adapter_calls == 0
             and replay_effects == 1
+            and replay_calls == 1
+            and replay_permits_issued == 1
+            and replay_permits_consumed == 1
             and ambiguous_effects == 1
+            and ambiguous_calls == 1
             and forged_result.state.value == "STOPPED"
+            and store.verify_evidence_chain(replay_intent.intent_id)
         ),
+        "claim_boundary": "Regression evidence for the reference mock model; not a formal proof or live-venue claim.",
     }
     print(json.dumps(report, indent=2))
     if not report["pass"]:

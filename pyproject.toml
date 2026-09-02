@@ -16,8 +16,13 @@ classifiers = [
   "Development Status :: 2 - Pre-Alpha",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
   "Topic :: Security",
 ]
+
+[project.optional-dependencies]
+dev = ["jsonschema>=4.18"]
 
 [project.scripts]
 faar = "faar.cli:main"

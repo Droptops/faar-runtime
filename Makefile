@@ -4,7 +4,7 @@ compile:
 	python -m compileall -q faar test evals
 
 test: compile
-	python -m unittest discover -s test -v
+	python -m unittest discover -s test -p 'test_*.py' -v
 
 adversarial: compile
 	PYTHONPATH=. python evals/run_adversarial.py
@@ -19,7 +19,7 @@ demo: compile
 	rm -f faar-demo.sqlite
 	python -m faar.cli provision-grant --grant examples/grant.json --db faar-demo.sqlite
 	python -m faar.cli mock-run --intent examples/intent.json --grant examples/grant.json --risk examples/risk.json --authority examples/authority.json --db faar-demo.sqlite
-	python -m faar.cli verify-evidence --intent-id intent_demo_000000000001 --db faar-demo.sqlite
+	python -m faar.cli verify-evidence --intent-id intent_demo_000000000001 --db faar-demo.sqlite --demo-evidence-key
 
 modelcheck: compile
 	PYTHONPATH=. python evals/model_check_permit_protocol.py

@@ -7,6 +7,8 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Protocol
 
+from typing import Mapping
+
 from .attestation import AttestationVerifier, decode_ed25519_signature, encode_ed25519_signature, has_signing_api
 from .canonical import canonical_hash, canonical_json, parse_bounded_decimal
 from .gates import evaluate_authority, evaluate_capability, evaluate_risk
@@ -18,6 +20,7 @@ from .models import (
     ExecutionPermit,
     ExecutionRequest,
     Intent,
+    KeyValidity,
     MONETARY_PRIMITIVES,
     PermitAlgorithm,
     RiskSnapshot,
@@ -362,24 +365,49 @@ class ConstrainedPermitAuthority:
 
 
 class ExecutionPermitVerifier:
-    """Public-side verifier used by a constrained venue/capability gateway."""
+    """Public-side verifier used by a constrained venue/capability gateway.
+
+    Accepts one verifier or a mapping of `signer_id -> PermitVerifier` so a permit
+    signer can be rotated with an overlap window: the gateway trusts both keys for
+    the overlap, then the old key is revoked via `key_validity`. Unknown signers
+    are always rejected.
+    """
 
     def __init__(
         self,
-        signature: PermitVerifier,
+        signature: PermitVerifier | Mapping[str, PermitVerifier],
         control_store: PermitControlStore,
         *,
         max_clock_skew_seconds: int = 2,
         allow_signing_backend_for_tests: bool = False,
+        key_validity: Mapping[str, KeyValidity] | None = None,
     ) -> None:
-        if has_signing_api(signature) and not allow_signing_backend_for_tests:
-            raise ValueError(
-                "execution permit verifier must be verify-only; private/symmetric signing material "
-                "must not enter the execution transport trust domain"
-            )
-        self.signature = signature
+        verifiers = dict(signature) if isinstance(signature, Mapping) else {signature.signer_id: signature}
+        if not verifiers:
+            raise ValueError("at least one permit verifier is required")
+        for signer_id, verifier in verifiers.items():
+            if verifier.signer_id != signer_id:
+                raise ValueError(f"permit verifier registered under {signer_id!r} reports signer_id {verifier.signer_id!r}")
+            if has_signing_api(verifier) and not allow_signing_backend_for_tests:
+                raise ValueError(
+                    "execution permit verifier must be verify-only; private/symmetric signing material "
+                    "must not enter the execution transport trust domain"
+                )
+        unknown = sorted(set(key_validity or {}) - set(verifiers))
+        if unknown:
+            raise ValueError(f"key_validity references unknown permit signers: {unknown}")
+        self.verifiers = verifiers
+        self.key_validity = dict(key_validity or {})
+        # First registered verifier, kept for callers that inspect a single backend.
+        self.signature = next(iter(verifiers.values()))
         self.control_store = control_store
         self.max_clock_skew_seconds = max_clock_skew_seconds
+
+    def with_key_validity(self, key_validity: Mapping[str, KeyValidity]) -> "ExecutionPermitVerifier":
+        return ExecutionPermitVerifier(
+            self.verifiers, self.control_store, max_clock_skew_seconds=self.max_clock_skew_seconds,
+            allow_signing_backend_for_tests=True, key_validity=key_validity,
+        )
 
     def verify(
         self,
@@ -406,12 +434,18 @@ class ExecutionPermitVerifier:
         if not isinstance(signed, SignedExecutionPermit) or not isinstance(request, ExecutionRequest):
             return False, ("PERMIT_MALFORMED",)
         permit = signed.permit
-        if signed.signer_id != self.signature.signer_id:
-            reasons.append("PERMIT_SIGNER_UNKNOWN")
-        if signed.algorithm != self.signature.algorithm:
+        verifier = self.verifiers.get(signed.signer_id)
+        if verifier is None:
+            return False, ("PERMIT_SIGNER_UNKNOWN",)
+        validity = self.key_validity.get(signed.signer_id)
+        if validity is not None:
+            rejection = validity.rejection(permit.issued_at)
+            if rejection:
+                reasons.append("PERMIT_SIGNER_" + rejection[len("KEY_"):])
+        if signed.algorithm != verifier.algorithm:
             reasons.append("PERMIT_ALGORITHM_MISMATCH")
         payload = signed_permit_payload(permit, signed.signer_id, signed.algorithm)
-        if not self.signature.verify(payload, signed.signature):
+        if not verifier.verify(payload, signed.signature):
             reasons.append("PERMIT_SIGNATURE_INVALID")
         if permit.request_hash != canonical_hash(request):
             reasons.append("PERMIT_REQUEST_HASH_MISMATCH")

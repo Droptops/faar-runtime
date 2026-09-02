@@ -506,6 +506,40 @@ class Decision:
 
 
 @dataclass(frozen=True)
+class KeyValidity:
+    """Lifecycle window of a verification key (attestation or permit signer).
+
+    An artifact is accepted only if it was issued inside the key's window and the
+    key is not revoked at verification time. Overlapping windows across two key
+    ids give a rotation period without ever accepting an unknown signer; an
+    artifact issued within the window stays verifiable for its own lifetime after
+    `not_after` so rotation never invalidates authority already granted.
+    """
+
+    not_before: datetime | None = None
+    not_after: datetime | None = None
+    revoked: bool = False
+
+    def __post_init__(self) -> None:
+        _require_bool("revoked", self.revoked)
+        for name in ("not_before", "not_after"):
+            value = getattr(self, name)
+            if value is not None and not _aware(value):
+                raise ValueError(f"{name} must be a timezone-aware datetime or None")
+        if self.not_before is not None and self.not_after is not None and self.not_after <= self.not_before:
+            raise ValueError("not_after must be after not_before")
+
+    def rejection(self, issued_at: datetime) -> str | None:
+        if self.revoked:
+            return "KEY_REVOKED"
+        if self.not_before is not None and issued_at < self.not_before:
+            return "KEY_NOT_YET_VALID"
+        if self.not_after is not None and issued_at > self.not_after:
+            return "KEY_EXPIRED"
+        return None
+
+
+@dataclass(frozen=True)
 class Attestation:
     kind: AttestationKind
     key_id: str

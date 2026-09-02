@@ -26,7 +26,7 @@ from faar.settlement import MockSettlementVerifier, SettlementRecord, Settlement
 from faar.models import ExecutionRequest
 from faar.store import GrantConflict, IntentConflict, SQLiteIntentStore
 
-from support import AUTH, NOW, PRINCIPAL, attest_pair, grant, intent, risk, trust, verification_trust, build_mock_runtime, permit_stack
+from support import AUTH, NOW, PRINCIPAL, Clock, attest_pair, grant, intent, risk, trust, verification_trust, build_mock_runtime, permit_stack
 
 
 class AdapterBackedVerifier:
@@ -248,18 +248,39 @@ class FAARRuntimeTests(unittest.TestCase):
         self.assertEqual(1, self.venue.execute_call_count(i.intent_id))
 
     def test_timeout_before_effect_stops_after_durable_retry_budget(self):
+        # A timed-out attempt may still be in flight while its permit is live, so
+        # each retry is only admitted once the previous permit window has closed.
+        clock = Clock()
+        runtime, venue, *_ = build_mock_runtime(
+            self.store, self.trust, mode=MockMode.TIMEOUT_BEFORE_EFFECT,
+            runtime_clock=clock, venue_clock=clock, max_permit_ttl_seconds=1,
+        )
         i = intent(intent_id="intent_test_000000000009")
-        self.venue.set_mode(MockMode.TIMEOUT_BEFORE_EFFECT)
-        result = self.execute_case(i)
+
+        def run():
+            # A retry is a new authorization: fresh risk evidence and attestations.
+            rs = risk(observed_at=clock())
+            aa, ra = attest_pair(self.trust, i, AUTH, rs, clock())
+            return runtime.process(i, AUTH, grant(), rs, authority_attestation=aa, risk_attestation=ra, now=clock())
+
+        first = run()
+        self.assertEqual(IntentState.UNKNOWN, first.state)
+        self.assertIn("SETTLEMENT_NONE_WITHIN_PERMIT_WINDOW", first.reason_codes)
+        clock.advance(4)
+        second = run()
+        self.assertEqual(IntentState.UNKNOWN, second.state)
+        self.assertEqual(2, venue.execute_call_count(i.intent_id))
+        clock.advance(4)
+        result = run()
         self.assertEqual(IntentState.STOPPED, result.state)
         self.assertIn("MAX_SUBMISSION_ATTEMPTS_REACHED", result.reason_codes)
-        self.assertEqual(0, self.venue.successful_effect_count(i.intent_id))
-        self.assertEqual(2, self.venue.execute_call_count(i.intent_id))
+        self.assertEqual(0, venue.successful_effect_count(i.intent_id))
+        self.assertEqual(2, venue.execute_call_count(i.intent_id))
         self.assertEqual(2, self.store.get(i.intent_id).submission_count)
         # Retry budget is durable across later process invocations.
-        again = self.execute_case(i)
+        again = run()
         self.assertEqual(IntentState.STOPPED, again.state)
-        self.assertEqual(2, self.venue.execute_call_count(i.intent_id))
+        self.assertEqual(2, venue.execute_call_count(i.intent_id))
 
     def test_crash_after_external_effect_before_local_persist_reconciles(self):
         i = intent(intent_id="intent_test_000000000010")

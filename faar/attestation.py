@@ -9,7 +9,7 @@ from collections.abc import Iterable
 from typing import Mapping, Protocol
 
 from .canonical import canonical_hash, canonical_json
-from .models import Attestation, AttestationAlgorithm, AttestationKind, Intent
+from .models import Attestation, AttestationAlgorithm, AttestationKind, Intent, KeyValidity
 
 
 ED25519_SIGNATURE_BYTES = 64
@@ -221,6 +221,22 @@ class HMACTrustStore:
         return not reasons, tuple(reasons)
 
 
+def _normalize_validity(
+    key_ids: set[str], key_validity: Mapping[str, KeyValidity] | None
+) -> dict[str, KeyValidity]:
+    if not key_validity:
+        return {}
+    unknown = sorted(set(key_validity) - key_ids)
+    if unknown:
+        raise ValueError(f"key_validity references unknown keys: {unknown}")
+    out: dict[str, KeyValidity] = {}
+    for key_id, validity in key_validity.items():
+        if not isinstance(validity, KeyValidity):
+            raise ValueError(f"key_validity for {key_id} must be a KeyValidity")
+        out[str(key_id)] = validity
+    return out
+
+
 def _verify_ed25519_attestation(
     keys: Mapping[str, object],
     key_kinds: Mapping[str, frozenset[AttestationKind]],
@@ -231,6 +247,7 @@ def _verify_ed25519_attestation(
     intent: Intent,
     now: datetime,
     max_clock_skew_seconds: int,
+    key_validity: Mapping[str, KeyValidity] | None = None,
 ) -> tuple[bool, tuple[str, ...]]:
     reasons: list[str] = []
     if attestation.algorithm != AttestationAlgorithm.ED25519:
@@ -243,6 +260,11 @@ def _verify_ed25519_attestation(
         return False, tuple(reasons)
     if kind not in key_kinds.get(attestation.key_id, frozenset()):
         reasons.append("ATTESTATION_KEY_KIND_NOT_ALLOWED")
+    validity = (key_validity or {}).get(attestation.key_id)
+    if validity is not None:
+        rejection = validity.rejection(attestation.issued_at)
+        if rejection:
+            reasons.append("ATTESTATION_" + rejection)
     if attestation.subject_hash != canonical_hash(subject):
         reasons.append("ATTESTATION_SUBJECT_MISMATCH")
     if attestation.intent_hash != canonical_hash(intent):
@@ -289,11 +311,13 @@ class Ed25519TrustStore:
         *,
         key_kinds: Mapping[str, Iterable[AttestationKind]],
         max_clock_skew_seconds: int = 5,
+        key_validity: Mapping[str, KeyValidity] | None = None,
     ) -> None:
         if not keys:
             raise ValueError("at least one attestation key is required")
         self._keys = {str(k): v for k, v in keys.items()}
         self._key_kinds = _normalize_kinds(set(self._keys), key_kinds)
+        self._key_validity = _normalize_validity(set(self._keys), key_validity)
         capabilities = {hasattr(v, "sign") for v in self._keys.values()}
         if len(capabilities) != 1:
             raise ValueError("attestation trust store cannot mix private and public keys")
@@ -308,15 +332,19 @@ class Ed25519TrustStore:
         key_kinds: Mapping[str, Iterable[AttestationKind]],
         *,
         max_clock_skew_seconds: int = 5,
+        key_validity: Mapping[str, KeyValidity] | None = None,
     ) -> "Ed25519TrustStore":
         from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
         return cls(
             {str(k): Ed25519PrivateKey.generate() for k in key_kinds},
             key_kinds=key_kinds,
             max_clock_skew_seconds=max_clock_skew_seconds,
+            key_validity=key_validity,
         )
 
-    def public_verifier(self) -> "Ed25519AttestationVerifier":
+    def public_verifier(self, *, key_validity: Mapping[str, KeyValidity] | None = None) -> "Ed25519AttestationVerifier":
+        """Verify-only projection. `key_validity` overrides the store's lifecycle map,
+        so a verifier can revoke or window a key without touching signing material."""
         public = {}
         for key_id, key in self._keys.items():
             if callable(getattr(key, "sign", None)) and not hasattr(key, "public_key"):
@@ -325,6 +353,7 @@ class Ed25519TrustStore:
         return Ed25519AttestationVerifier(
             public, key_kinds=self._key_kinds,
             max_clock_skew_seconds=self.max_clock_skew_seconds,
+            key_validity=self._key_validity if key_validity is None else key_validity,
         )
 
     def _kind_allowed(self, key_id: str, kind: AttestationKind) -> bool:
@@ -378,11 +407,17 @@ class Ed25519TrustStore:
             self._keys, self._key_kinds, attestation,
             kind=kind, subject=subject, intent=intent, now=now,
             max_clock_skew_seconds=self.max_clock_skew_seconds,
+            key_validity=self._key_validity,
         )
 
 
 class Ed25519AttestationVerifier:
-    """Public-key-only attestation verifier. No minting API and no private keys."""
+    """Public-key-only attestation verifier. No minting API and no private keys.
+
+    `key_validity` maps key ids to `KeyValidity` windows; keys absent from the map
+    are valid indefinitely (until removed). Rotation is done by adding the new key,
+    signing with it once its `not_before` has passed, and later revoking the old one.
+    """
 
     algorithm = AttestationAlgorithm.ED25519
 
@@ -392,6 +427,7 @@ class Ed25519AttestationVerifier:
         *,
         key_kinds: Mapping[str, Iterable[AttestationKind]],
         max_clock_skew_seconds: int = 5,
+        key_validity: Mapping[str, KeyValidity] | None = None,
     ) -> None:
         if not keys:
             raise ValueError("at least one attestation key is required")
@@ -399,9 +435,17 @@ class Ed25519AttestationVerifier:
             raise ValueError("attestation verifier cannot hold signing-capable private keys")
         self._keys = {str(k): v for k, v in keys.items()}
         self._key_kinds = _normalize_kinds(set(self._keys), key_kinds)
+        self._key_validity = _normalize_validity(set(self._keys), key_validity)
         if max_clock_skew_seconds < 0:
             raise ValueError("max_clock_skew_seconds must be non-negative")
         self.max_clock_skew_seconds = max_clock_skew_seconds
+
+    def with_key_validity(self, key_validity: Mapping[str, KeyValidity]) -> "Ed25519AttestationVerifier":
+        """A copy with an updated lifecycle map (e.g. after revoking a key)."""
+        return Ed25519AttestationVerifier(
+            self._keys, key_kinds=self._key_kinds,
+            max_clock_skew_seconds=self.max_clock_skew_seconds, key_validity=key_validity,
+        )
 
     def verify(
         self,
@@ -416,4 +460,5 @@ class Ed25519AttestationVerifier:
             self._keys, self._key_kinds, attestation,
             kind=kind, subject=subject, intent=intent, now=now,
             max_clock_skew_seconds=self.max_clock_skew_seconds,
+            key_validity=self._key_validity,
         )
