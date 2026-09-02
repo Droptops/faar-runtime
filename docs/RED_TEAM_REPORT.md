@@ -138,8 +138,9 @@ ambiguous timeout-after-effect recovery -> 1 successful effect, 1 adapter call
 96 seeded replay/concurrency state-machine scenarios (clock advancing) -> 0 duplicate-effect violations
 96 seeded replay/concurrency state-machine scenarios -> 0 aggregate-budget violations
 CLI end-to-end mock execution -> FINALIZED once; keyed evidence chain + head -> valid
-bounded permit protocol model (2 permits, in-flight, expiry, halt) -> 1766 states, 4304 transitions, 0 invariant violations
-same model without the permit-window rule -> 187 violations (first: issue, issue, submit0, consume0, submit1, consume1)
+bounded permit protocol model (2 permits, in-flight, expiry, voiding, halt, settlement lag) -> 3940 states, 10047 transitions, 0 invariant violations
+same model without the permit-window rule -> 223 violations (first: issue, issue, submit0, consume0, submit1, consume1)
+same model without the consumed-permit ledger check -> 399 violations (first: issue, submit0, consume0, issue, submit1, consume1: settlement lag)
 ```
 
 The deterministic denial count covers attacks stopped **before the trusted adapter is permitted to create an effect**. A malicious adapter remains part of the TCB until the venue verifies permits; post-effect amount checks can detect a bad effect report but cannot undo a venue action the adapter already performed.

@@ -47,7 +47,7 @@ Current `make check` headline results:
 | Adversarial denial cases | 160; 0 unauthorized economic effects; 0 adapter calls |
 | Same-intent replay attempts | 100; 1 effect, 1 adapter call, 1 permit issued and consumed |
 | Seeded fuzz scenarios | 96; 0 duplicate-effect violations; 0 aggregate-budget violations |
-| Bounded permit model | 1766 states, 4304 transitions, 0 violations; stale permit unconsumable after revoke and after halt/resume; 187 violations without the permit-window rule |
+| Bounded permit model | 3940 states, 10047 transitions, 0 violations; stale permit unconsumable after revoke and after halt/resume; 223 violations without the permit-window rule, 399 without the consumed-permit ledger check |
 | Demo | mock execution FINALIZED once; keyed evidence chain and head commitment valid |
 | Crash injection | 191 worker kills before every store call across 6 scenarios; 0 duplicate effects, 0 lost effects, 0 stranded budget, every recovery terminal |
 
