@@ -2,30 +2,36 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 
 from .adapters import MockMode, MockVenue
+from .anchor import AnchorUnavailable, AuthorityRegression, FileAuthorityAnchor
 from .attestation import Ed25519TrustStore
 from .canonical import canonical_hash
 from .gates import evaluate_authority, evaluate_capability, evaluate_risk
-from .models import AttestationKind, utcnow
+from .models import AttestationKind, IntentState, utcnow
 from .parsing import parse_authority, parse_grant, parse_intent, parse_risk
 from .runtime import FAARRuntime
 from .permits import ConstrainedPermitAuthority, Ed25519PermitSignature, ExecutionPermitVerifier
 from .settlement import MockSettlementVerifier
-from .store import SQLiteIntentStore
+from .store import (
+    AuthorityAnchorRequired,
+    EvidenceIntegrityError,
+    GrantConflict,
+    MigrationError,
+    SQLiteIntentStore,
+    UnknownGrant,
+)
 
 
-_DEMO_KEYS = {
-    "demo-authority": b"demo-authority-key-not-for-production",
-    "demo-risk": b"demo-risk-key-material-not-production",
-}
 _DEMO_KEY_KINDS = {
     "demo-authority": {AttestationKind.AUTHORITY},
     "demo-risk": {AttestationKind.RISK},
 }
+# Embedded in source on purpose: `mock-run` is a self-contained demo against the
+# in-process mock venue and cannot be confused with a live trust domain.
 _DEMO_EVIDENCE_KEY = b"demo-evidence-key-not-for-production!!"
-_DEMO_PERMIT_KEY = b"demo-permit-key-material-not-production!!"
 
 
 def _reject_duplicate_keys(pairs):
@@ -49,103 +55,245 @@ def _load(path: str) -> dict:
     )
 
 
-def main() -> None:
+def _evidence_key(args) -> bytes | None:
+    """Evidence MAC key from the environment, never from the command line."""
+    if getattr(args, "demo_evidence_key", False):
+        return _DEMO_EVIDENCE_KEY
+    name = getattr(args, "evidence_key_env", None)
+    if not name:
+        return None
+    value = os.environ.get(name)
+    if not value:
+        raise SystemExit(f"environment variable {name} is not set")
+    return value.encode("utf-8")
+
+
+def _open_store(args, *, evidence_key: bytes | None = None) -> SQLiteIntentStore:
+    anchor = FileAuthorityAnchor(args.anchor) if getattr(args, "anchor", None) else None
+    return SQLiteIntentStore(args.db, evidence_key=evidence_key, authority_anchor=anchor)
+
+
+def _emit(payload) -> None:
+    print(json.dumps(payload, indent=2, default=str))
+
+
+def _stored(row) -> dict:
+    return {
+        "intent_id": row.intent_id,
+        "state": row.state.value,
+        "effect_id": row.effect_id,
+        "reason_codes": list(row.reason_codes),
+        "submission_count": row.submission_count,
+        "ambiguity_until": row.ambiguity_until,
+        "updated_at": row.updated_at,
+    }
+
+
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="faar", description="FAAR deterministic financial authority runtime")
     sub = parser.add_subparsers(dest="command", required=True)
+
+    def with_db(p, *, anchor: bool = True):
+        p.add_argument("--db", required=True, help="path to the reference SQLite store")
+        if anchor:
+            p.add_argument("--anchor", help="path to the external authority anchor file (keep it outside the DB backup set)")
+        return p
 
     p_hash = sub.add_parser("hash-intent", help="print the canonical SHA-256 of an intent")
     p_hash.add_argument("intent")
 
-    p_grant = sub.add_parser("provision-grant", help="provision an immutable grant version into a local reference store")
+    p_grant = with_db(sub.add_parser("provision-grant", help="provision an immutable grant version into a local reference store"))
     p_grant.add_argument("--grant", required=True)
-    p_grant.add_argument("--db", required=True)
 
-    p_status = sub.add_parser("set-grant-status", help="local reference admin: set ACTIVE/PAUSED/REVOKED runtime status")
+    p_status = with_db(sub.add_parser("set-grant-status", help="local reference admin: set ACTIVE/PAUSED/REVOKED runtime status"))
     p_status.add_argument("--principal-id", required=True)
     p_status.add_argument("--grant-id", required=True)
     p_status.add_argument("--grant-version", required=True, type=int)
     p_status.add_argument("--status", required=True, choices=["ACTIVE", "PAUSED", "REVOKED"])
-    p_status.add_argument("--db", required=True)
 
     p_eval = sub.add_parser("evaluate", help="evaluate authority, capability and risk without executing")
-    p_eval.add_argument("--intent", required=True)
-    p_eval.add_argument("--grant", required=True)
-    p_eval.add_argument("--risk", required=True)
-    p_eval.add_argument("--authority", required=True)
+    for name in ("--intent", "--grant", "--risk", "--authority"):
+        p_eval.add_argument(name, required=True)
 
     p_mock = sub.add_parser("mock-run", help="DEMO ONLY: execute against the deterministic mock venue")
-    p_mock.add_argument("--intent", required=True)
-    p_mock.add_argument("--grant", required=True)
-    p_mock.add_argument("--risk", required=True)
-    p_mock.add_argument("--authority", required=True)
+    for name in ("--intent", "--grant", "--risk", "--authority"):
+        p_mock.add_argument(name, required=True)
     p_mock.add_argument("--db", default="faar-demo.sqlite")
+    p_mock.add_argument("--anchor")
     p_mock.add_argument("--mode", choices=[m.value for m in MockMode], default=MockMode.SUCCESS.value)
-    p_mock.add_argument(
-        "--demo-auto-provision",
-        action="store_true",
-        help="DEMO ONLY: provision the supplied grant if absent.",
-    )
+    p_mock.add_argument("--demo-auto-provision", action="store_true", help="DEMO ONLY: provision the supplied grant if absent.")
 
-    p_inspect = sub.add_parser("inspect", help="inspect one persisted intent")
+    p_inspect = with_db(sub.add_parser("inspect", help="inspect one persisted intent and its evidence"))
     p_inspect.add_argument("--intent-id", required=True)
-    p_inspect.add_argument("--db", required=True)
 
-    p_ev = sub.add_parser("verify-evidence", help="verify the per-intent evidence hash chain")
+    p_ev = with_db(sub.add_parser("verify-evidence", help="verify the per-intent evidence hash chain (and MAC/head when keyed)"), anchor=False)
     p_ev.add_argument("--intent-id", required=True)
-    p_ev.add_argument("--db", required=True)
+    p_ev.add_argument("--evidence-key-env", help="name of the environment variable holding the evidence MAC key")
+    p_ev.add_argument("--demo-evidence-key", action="store_true", help="DEMO ONLY: verify with the embedded demo key")
 
-    p_usage = sub.add_parser("usage", help="show grant-level atomic usage reservations")
+    p_rebuild = with_db(sub.add_parser("rebuild-evidence-head", help="OPERATOR: commit a signed head for pre-0.4 chains that verify"), anchor=False)
+    p_rebuild.add_argument("--intent-id", help="one intent; or use --all for every intent without a head")
+    p_rebuild.add_argument("--all", action="store_true", help="every intent that has no head commitment")
+    p_rebuild.add_argument("--adopt-empty", action="store_true", help="also adopt legacy chains with zero events (records the adoption as the first event)")
+    p_rebuild.add_argument("--evidence-key-env", required=True)
+
+    p_usage = with_db(sub.add_parser("usage", help="show grant-level atomic usage reservations"), anchor=False)
     p_usage.add_argument("--grant-id", required=True)
     p_usage.add_argument("--grant-version", required=True, type=int)
-    p_usage.add_argument("--db", required=True)
 
-    args = parser.parse_args()
+    p_held = with_db(sub.add_parser("held-usage", help="OPERATOR: HELD reservations joined to intent state"), anchor=False)
+    p_held.add_argument("--principal-id")
 
-    if args.command == "hash-intent":
+    p_lg = with_db(sub.add_parser("list-grants", help="OPERATOR: grant versions with effective runtime status"))
+    p_lg.add_argument("--principal-id")
+
+    p_li = with_db(sub.add_parser("list-intents", help="OPERATOR: intents by state and/or principal"), anchor=False)
+    p_li.add_argument("--state", choices=[s.value for s in IntentState])
+    p_li.add_argument("--principal-id")
+    p_li.add_argument("--limit", type=int, default=200)
+
+    with_db(sub.add_parser("list-leases", help="OPERATOR: durable intent leases (a lease with no live worker is stale)"), anchor=False)
+
+    p_cl = with_db(sub.add_parser("clear-lease", help="OPERATOR: clear a stale lease after reconciling external settlement"), anchor=False)
+    p_cl.add_argument("--intent-id", required=True)
+    p_cl.add_argument("--owner-token", required=True, help="exact owner_token printed by list-leases")
+
+    p_halt = with_db(sub.add_parser("halt", help="EMERGENCY: stop every grant in scope and fence outstanding permits"))
+    p_halt.add_argument("--scope", required=True, help="'global' or 'principal:<principal_id>'")
+    p_halt.add_argument("--reason", required=True)
+
+    p_resume = with_db(sub.add_parser("resume", help="lift a halt; permits issued before it stay dead"))
+    p_resume.add_argument("--scope", required=True)
+
+    with_db(sub.add_parser("controls", help="show emergency control records"), anchor=False)
+
+    p_rar = with_db(sub.add_parser("revoke-after-restore", help="OPERATOR: close a grant version whose authority state regressed behind its anchor"))
+    p_rar.add_argument("--grant-id", required=True)
+    p_rar.add_argument("--grant-version", required=True, type=int)
+
+    with_db(sub.add_parser("checkpoint", help="fold the WAL into the database file before taking a backup"), anchor=False)
+    return parser
+
+
+# Typed store/anchor refusals are operator-facing outcomes, not crashes: they are
+# printed as JSON and exit 2 so scripts can branch on them.
+_OPERATOR_ERRORS = (
+    AuthorityAnchorRequired, AuthorityRegression, AnchorUnavailable, EvidenceIntegrityError,
+    GrantConflict, MigrationError, UnknownGrant,
+)
+
+
+def main(argv=None) -> None:
+    try:
+        _main(argv)
+    except _OPERATOR_ERRORS as exc:
+        _emit({"error": type(exc).__name__, "message": str(exc)})
+        raise SystemExit(2)
+
+
+def _main(argv=None) -> None:
+    args = build_parser().parse_args(argv)
+    command = args.command
+
+    if command == "hash-intent":
         print(canonical_hash(parse_intent(_load(args.intent))))
         return
 
-    if args.command == "provision-grant":
-        store = SQLiteIntentStore(args.db)
+    if command == "provision-grant":
+        store = _open_store(args)
         grant = parse_grant(_load(args.grant))
         digest = canonical_hash(grant)
         store.provision_grant(grant, digest)
-        print(json.dumps({"grant_id": grant.grant_id, "version": grant.version, "grant_hash": digest}, indent=2))
+        _emit({"grant_id": grant.grant_id, "version": grant.version, "grant_hash": digest})
         return
 
-    if args.command == "set-grant-status":
-        store = SQLiteIntentStore(args.db)
+    if command == "set-grant-status":
+        store = _open_store(args)
         store.set_grant_status(args.principal_id, args.grant_id, args.grant_version, args.status)
-        print(json.dumps({"grant_id": args.grant_id, "version": args.grant_version, "runtime_status": args.status}, indent=2))
+        _emit({"grant_id": args.grant_id, "version": args.grant_version, "runtime_status": args.status})
         return
 
-    if args.command == "inspect":
-        store = SQLiteIntentStore(args.db)
+    if command == "inspect":
+        store = _open_store(args)
         row = store.get(args.intent_id)
-        print(json.dumps({
-            "intent_id": row.intent_id,
-            "intent_hash": row.intent_hash,
-            "state": row.state.value,
-            "effect_id": row.effect_id,
-            "reason_codes": list(row.reason_codes),
-            "submission_count": row.submission_count,
-            "created_at": row.created_at,
-            "updated_at": row.updated_at,
-            "evidence": store.evidence(args.intent_id),
-        }, indent=2))
+        payload = _stored(row)
+        payload.update({"intent_hash": row.intent_hash, "created_at": row.created_at, "evidence": store.evidence(args.intent_id)})
+        _emit(payload)
         return
 
-    if args.command == "verify-evidence":
-        # The standalone verifier checks the public hash chain. Deployments using
-        # evidence HMACs must provide their trusted key through application code/KMS.
-        store = SQLiteIntentStore(args.db)
-        ok = store.verify_evidence_chain(args.intent_id)
-        print(json.dumps({"intent_id": args.intent_id, "evidence_chain_valid": ok}, indent=2))
-        raise SystemExit(0 if ok else 2)
+    if command == "verify-evidence":
+        key = _evidence_key(args)
+        store = SQLiteIntentStore(args.db, evidence_key=key)
+        status = store.evidence_status(args.intent_id)
+        _emit({
+            "intent_id": args.intent_id, "evidence_chain_valid": status["valid"], "status": status["status"],
+            "events": status["events"], "keyed": status["keyed"],
+        })
+        raise SystemExit(0 if status["valid"] else 2)
 
-    if args.command == "usage":
-        store = SQLiteIntentStore(args.db)
-        print(json.dumps(store.usage(args.grant_id, args.grant_version), indent=2))
+    if command == "rebuild-evidence-head":
+        if bool(args.all) == bool(args.intent_id):
+            raise SystemExit("rebuild-evidence-head needs exactly one of --intent-id or --all")
+        store = SQLiteIntentStore(args.db, evidence_key=_evidence_key(args))
+        if args.all:
+            _emit({"outcomes": store.rebuild_evidence_heads(allow_empty=args.adopt_empty)})
+            return
+        _emit({"intent_id": args.intent_id, "head_committed": store.rebuild_evidence_head(args.intent_id, allow_empty=args.adopt_empty)})
+        return
+
+    if command == "usage":
+        _emit(SQLiteIntentStore(args.db).usage(args.grant_id, args.grant_version))
+        return
+
+    if command == "held-usage":
+        _emit(SQLiteIntentStore(args.db).held_usage(principal_id=args.principal_id))
+        return
+
+    if command == "list-grants":
+        _emit(_open_store(args).list_grants(principal_id=args.principal_id))
+        return
+
+    if command == "list-intents":
+        rows = SQLiteIntentStore(args.db).list_intents(state=args.state, principal_id=args.principal_id, limit=args.limit)
+        _emit([_stored(r) for r in rows])
+        return
+
+    if command == "list-leases":
+        _emit(SQLiteIntentStore(args.db).list_leases())
+        return
+
+    if command == "clear-lease":
+        cleared = SQLiteIntentStore(args.db).clear_stale_intent_lease(args.intent_id, expected_owner_token=args.owner_token)
+        _emit({"intent_id": args.intent_id, "cleared": cleared})
+        if not cleared:
+            raise SystemExit(2)
+        return
+
+    if command == "halt":
+        store = _open_store(args)
+        fenced = store.halt(args.scope, reason=args.reason)
+        _emit({"scope": args.scope, "halted": True, "grant_versions_fenced": fenced})
+        return
+
+    if command == "resume":
+        store = _open_store(args)
+        store.resume(args.scope)
+        _emit({"scope": args.scope, "halted": False})
+        return
+
+    if command == "controls":
+        _emit(SQLiteIntentStore(args.db).controls())
+        return
+
+    if command == "revoke-after-restore":
+        store = _open_store(args)
+        epoch, fence = store.revoke_after_restore(args.grant_id, args.grant_version)
+        _emit({"grant_id": args.grant_id, "version": args.grant_version, "runtime_status": "REVOKED", "runtime_epoch": epoch, "fence_counter": fence})
+        return
+
+    if command == "checkpoint":
+        SQLiteIntentStore(args.db).checkpoint()
+        _emit({"db": args.db, "checkpointed": True})
         return
 
     intent = parse_intent(_load(args.intent))
@@ -153,22 +301,20 @@ def main() -> None:
     risk = parse_risk(_load(args.risk))
     authority = parse_authority(_load(args.authority))
 
-    if args.command == "evaluate":
+    if command == "evaluate":
         now = utcnow()
         decisions = [
             evaluate_authority(authority),
             evaluate_capability(intent, grant, now),
             evaluate_risk(intent, grant, risk, now),
         ]
-        print(json.dumps([
-            {"layer": d.layer, "verdict": d.verdict.value, "reason_codes": list(d.reason_codes)} for d in decisions
-        ], indent=2))
+        _emit([{"layer": d.layer, "verdict": d.verdict.value, "reason_codes": list(d.reason_codes)} for d in decisions])
         return
 
     # mock-run is intentionally self-contained and cannot be confused with a live
-    # trust domain: the fixed demo keys are embedded in source and the only adapter
-    # available here is MockVenue.
-    store = SQLiteIntentStore(args.db, evidence_key=_DEMO_EVIDENCE_KEY)
+    # trust domain: fresh Ed25519 keys are generated per invocation and the only
+    # adapter available here is MockVenue.
+    store = _open_store(args, evidence_key=_DEMO_EVIDENCE_KEY)
     if args.demo_auto_provision:
         store.provision_grant(grant, canonical_hash(grant))
     trust = Ed25519TrustStore.generate(_DEMO_KEY_KINDS)
@@ -190,7 +336,7 @@ def main() -> None:
         risk_attestation=ra,
         now=risk.observed_at,
     )
-    print(json.dumps({
+    _emit({
         "intent_id": result.intent_id,
         "state": result.state.value,
         "effect_id": result.effect_id,
@@ -198,7 +344,7 @@ def main() -> None:
         "replayed": result.replayed,
         "submission_count": result.submission_count,
         "successful_effect_count": venue.successful_effect_count(intent.intent_id, principal_id=intent.principal_id),
-    }, indent=2))
+    })
 
 
 if __name__ == "__main__":

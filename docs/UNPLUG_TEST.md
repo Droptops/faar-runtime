@@ -35,6 +35,27 @@ Production requirement:
 
 This cannot be guaranteed by a Python library alone. It is a deployment/key-isolation property and therefore a live-money release gate.
 
+## Remove the permit authority
+
+Expected:
+
+- no new adapter submissions at all: the runtime cannot construct an execution without a signed permit, and a permit-verifying venue refuses unsigned or self-signed requests;
+- no fallback to "the runtime already checked, so submit anyway".
+
+## Remove the settlement verifier
+
+Expected:
+
+- the runtime refuses to construct (every adapter must have a distinct trusted verifier);
+- an already running intent cannot advance past UNKNOWN on the submitter's receipt alone.
+
+## Remove the authority anchor
+
+Expected:
+
+- nothing changes while the datastore is intact;
+- a restored backup is no longer detected as regressed: this is the documented ceiling of a single-file store and why the anchor must live outside the backup set.
+
 ## Remove the outcome verifier
 
 Expected:

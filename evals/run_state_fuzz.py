@@ -130,18 +130,26 @@ def replay_fuzz(seed: int) -> None:
     permit_sig = Ed25519PermitSignature("fuzz-permit")
     permit_authority = ConstrainedPermitAuthority(store, trust.public_verifier(), permit_sig)
     permit_verifier = ExecutionPermitVerifier(permit_sig.public_verifier(), store)
-    venue = MockVenue(permit_verifier=permit_verifier, name="mock-dex", mode=rng.choice(list(MockMode)), clock=lambda: NOW)
+    # One advanceable clock shared by the runtime and the venue: retries after an
+    # ambiguous attempt are only admitted once that attempt's permit window has
+    # closed, so the fuzz must move time forward to exercise the retry path.
+    clock = {"now": NOW}
+    venue = MockVenue(permit_verifier=permit_verifier, name="mock-dex", mode=rng.choice(list(MockMode)), clock=lambda: clock["now"])
     settlement = MockSettlementVerifier(venue)
-    runtime = FAARRuntime(store, {"mock-dex": venue}, trust.public_verifier(), permit_authority, {"mock-dex": settlement}, allow_test_time_override=True)
+    runtime = FAARRuntime(
+        store, {"mock-dex": venue}, trust.public_verifier(), permit_authority, {"mock-dex": settlement},
+        clock=lambda: clock["now"], allow_test_time_override=True,
+    )
     i = make_intent(f"fuzz_replay_{seed:04d}_000000000", 25)
     r = make_risk(1)
     aa, ra = signed(trust, i, r)
 
     for _ in range(8):
         venue.set_mode(rng.choice(list(MockMode)))
-        runtime.process(i, AUTH, grant, r, authority_attestation=aa, risk_attestation=ra, now=NOW)
+        runtime.process(i, AUTH, grant, r, authority_attestation=aa, risk_attestation=ra, now=clock["now"])
         if venue.successful_effect_count(i.intent_id) > 1:
             raise AssertionError(f"seed {seed}: duplicate economic effect")
+        clock["now"] = clock["now"] + timedelta(seconds=rng.choice((0, 1, 3, 8)))
 
 
 def concurrent_budget_fuzz(seed: int) -> None:

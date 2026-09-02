@@ -1,16 +1,18 @@
 from __future__ import annotations
 
-import base64
 import hashlib
 import hmac
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 from typing import Protocol
 
-from .attestation import AttestationVerifier, has_signing_api
-from .canonical import canonical_hash, canonical_json
+from typing import Mapping
+
+from .attestation import AttestationVerifier, decode_ed25519_signature, encode_ed25519_signature, has_signing_api
+from .canonical import canonical_hash, canonical_json, parse_bounded_decimal
 from .gates import evaluate_authority, evaluate_capability, evaluate_risk
+from .store import PermitConflict
 from .models import (
     Attestation,
     AttestationKind,
@@ -19,6 +21,7 @@ from .models import (
     ExecutionPermit,
     ExecutionRequest,
     Intent,
+    KeyValidity,
     MONETARY_PRIMITIVES,
     PermitAlgorithm,
     RiskSnapshot,
@@ -52,17 +55,38 @@ class PermitSigner(Protocol):
 
 
 def _ed25519_verify(public_key, payload: bytes, signature: str) -> bool:
-    pad = "=" * (-len(signature) % 4)
+    raw = decode_ed25519_signature(signature)
+    if raw is None:
+        return False
     try:
-        raw = base64.urlsafe_b64decode(signature + pad)
         public_key.verify(raw, payload)
         return True
     except Exception:
         return False
 
 
+def signed_permit_payload(permit: ExecutionPermit, signer_id: str, algorithm: PermitAlgorithm) -> bytes:
+    """Bytes covered by a permit signature.
+
+    The signer identity and algorithm are inside the signed payload (as they are
+    for attestations) so a permit cannot be re-labelled to another key or
+    algorithm once multi-key or rotating verifiers exist.
+    """
+    return canonical_json({
+        "permit": permit,
+        "signer_id": signer_id,
+        "algorithm": PermitAlgorithm(algorithm).value,
+    }).encode("utf-8")
+
+
 @dataclass(frozen=True)
 class HMACPermitSignature:
+    """Symmetric test fixture. Anyone who can verify can also mint, so neither the
+    permit authority nor the execution gateway accepts it without the explicit
+    test-only override."""
+
+    symmetric = True
+
     """Symmetric compatibility backend. Not suitable for an isolated verifier.
 
     Any holder that can verify also has enough key material to mint permits. v0.4
@@ -126,8 +150,7 @@ class Ed25519PermitSigner:
         self._public_key = private_key.public_key()
 
     def sign(self, payload: bytes) -> str:
-        raw = self._private_key.sign(payload)
-        return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+        return encode_ed25519_signature(self._private_key.sign(payload))
 
     def public_verifier(self) -> Ed25519PermitVerifier:
         return Ed25519PermitVerifier(self.signer_id, self._public_key)
@@ -153,6 +176,9 @@ class PermitControlStore(Protocol):
         grant_epoch: int,
         fence_token: int,
         permit_hash: str,
+        *,
+        expires_at: datetime | None = None,
+        now: datetime | None = None,
     ) -> None: ...
     def consume_execution_permit(
         self, *, permit_id: str, principal_id: str, grant_id: str, grant_version: int,
@@ -161,14 +187,10 @@ class PermitControlStore(Protocol):
 
 
 def _amount(request: ExecutionRequest) -> Decimal | None:
-    raw = request.payload.get("amount_usd", request.payload.get("notional_usd"))
-    if raw is None:
-        return None
-    try:
-        value = Decimal(str(raw))
-    except (InvalidOperation, TypeError, ValueError):
-        return None
-    return value if value.is_finite() else None
+    # Same bounded parser as the gates and the store: an amount that cannot be
+    # canonicalized is rejected here, before any fence token or risk-state claim
+    # is consumed, instead of failing at signature time.
+    return parse_bounded_decimal(request.payload.get("amount_usd", request.payload.get("notional_usd")))
 
 
 class ConstrainedPermitAuthority:
@@ -194,11 +216,17 @@ class ConstrainedPermitAuthority:
         signature: PermitSigner,
         *,
         max_permit_ttl_seconds: int = 5,
+        allow_symmetric_backend_for_tests: bool = False,
     ) -> None:
         if max_permit_ttl_seconds <= 0:
             raise ValueError("max_permit_ttl_seconds must be positive")
         if not has_signing_api(signature):
             raise ValueError("permit authority requires a signing-capable private backend")
+        if getattr(signature, "symmetric", False) and not allow_symmetric_backend_for_tests:
+            raise ValueError(
+                "permit authority requires an asymmetric signer; a symmetric backend lets every "
+                "verifier mint permits"
+            )
         if has_signing_api(trust):
             raise ValueError("permit authority must receive a verify-only upstream attestation trust store")
         self.store = store
@@ -295,9 +323,13 @@ class ConstrainedPermitAuthority:
         if status != "ACTIVE" or current_epoch != epoch:
             raise PermitIssuanceError(("PERMIT_GRANT_EPOCH_CHANGED",))
 
+        # A derived permit never outlives the credentials it was derived from: the
+        # intent, the grant, and both signed upstream attestations.
         expires_at = min(
             intent.expires_at,
             grant.valid_until if grant.valid_until is not None else intent.expires_at,
+            authority_attestation.expires_at,
+            risk_attestation.expires_at,
             now + timedelta(seconds=self.max_permit_ttl_seconds),
         )
         if expires_at <= now:
@@ -330,43 +362,94 @@ class ConstrainedPermitAuthority:
             issued_at=now,
             expires_at=expires_at,
         )
-        payload = canonical_json(permit).encode("utf-8")
+        payload = signed_permit_payload(permit, self.signature.signer_id, self.signature.algorithm)
         signed = SignedExecutionPermit(
             permit=permit,
             signer_id=self.signature.signer_id,
             algorithm=self.signature.algorithm,
             signature=self.signature.sign(payload),
         )
-        self.store.record_execution_permit(
-            permit_id,
-            intent,
-            grant,
-            epoch,
-            fence,
-            canonical_hash(signed),
-        )
+        try:
+            self.store.record_execution_permit(
+                permit_id,
+                intent,
+                grant,
+                epoch,
+                fence,
+                canonical_hash(signed),
+                expires_at=expires_at,
+                now=now,
+            )
+        except PermitConflict:
+            # An earlier permit for this intent is still consumable at the venue.
+            # The signed object above never leaves this function, so no authority
+            # was transported; the caller must wait for that permit's window.
+            raise PermitIssuanceError(("PERMIT_PREVIOUS_ATTEMPT_LIVE",))
         return signed
 
 
+# Effective grant statuses that carry their own permit rejection code so a venue
+# operator can tell an emergency halt or a restore apart from an ordinary pause.
+_STATUS_REASONS = {
+    "HALTED": "PERMIT_HALTED",
+    "REGRESSED": "PERMIT_AUTHORITY_REGRESSED",
+    "ANCHOR_REQUIRED": "PERMIT_ANCHOR_REQUIRED",
+    "ANCHOR_UNAVAILABLE": "PERMIT_ANCHOR_UNAVAILABLE",
+}
+
+
 class ExecutionPermitVerifier:
-    """Public-side verifier used by a constrained venue/capability gateway."""
+    """Public-side verifier used by a constrained venue/capability gateway.
+
+    Accepts one verifier or a mapping of `signer_id -> PermitVerifier` so a permit
+    signer can be rotated with an overlap window: the gateway trusts both keys for
+    the overlap, then the old key is revoked via `key_validity`. Unknown signers
+    are always rejected.
+    """
 
     def __init__(
         self,
-        signature: PermitVerifier,
+        signature: PermitVerifier | Mapping[str, PermitVerifier],
         control_store: PermitControlStore,
         *,
         max_clock_skew_seconds: int = 2,
         allow_signing_backend_for_tests: bool = False,
+        key_validity: Mapping[str, KeyValidity] | None = None,
+        max_permit_lifetime_seconds: int = 60,
     ) -> None:
-        if has_signing_api(signature) and not allow_signing_backend_for_tests:
-            raise ValueError(
-                "execution permit verifier must be verify-only; private/symmetric signing material "
-                "must not enter the execution transport trust domain"
-            )
-        self.signature = signature
+        verifiers = dict(signature) if isinstance(signature, Mapping) else {signature.signer_id: signature}
+        if not verifiers:
+            raise ValueError("at least one permit verifier is required")
+        if max_permit_lifetime_seconds <= 0:
+            raise ValueError("max_permit_lifetime_seconds must be positive")
+        for signer_id, verifier in verifiers.items():
+            if verifier.signer_id != signer_id:
+                raise ValueError(f"permit verifier registered under {signer_id!r} reports signer_id {verifier.signer_id!r}")
+            if has_signing_api(verifier) and not allow_signing_backend_for_tests:
+                raise ValueError(
+                    "execution permit verifier must be verify-only; private/symmetric signing material "
+                    "must not enter the execution transport trust domain"
+                )
+        unknown = sorted(set(key_validity or {}) - set(verifiers))
+        if unknown:
+            raise ValueError(f"key_validity references unknown permit signers: {unknown}")
+        self.verifiers = verifiers
+        self.key_validity = dict(key_validity or {})
+        # First registered verifier, kept for callers that inspect a single backend.
+        self.signature = next(iter(verifiers.values()))
         self.control_store = control_store
         self.max_clock_skew_seconds = max_clock_skew_seconds
+        # Bounds how long any single permit can be valid, whatever its signer chose.
+        # Together with `KeyValidity.not_after` (judged on issued_at) this caps the
+        # exposure of a retired-but-not-revoked signer to `not_after + lifetime`.
+        self.max_permit_lifetime_seconds = max_permit_lifetime_seconds
+
+    def with_key_validity(self, key_validity: Mapping[str, KeyValidity]) -> "ExecutionPermitVerifier":
+        return ExecutionPermitVerifier(
+            self.verifiers, self.control_store, max_clock_skew_seconds=self.max_clock_skew_seconds,
+            allow_signing_backend_for_tests=True, key_validity=key_validity,
+            max_permit_lifetime_seconds=self.max_permit_lifetime_seconds,
+        )
 
     def verify(
         self,
@@ -375,14 +458,36 @@ class ExecutionPermitVerifier:
         *,
         now: datetime,
     ) -> tuple[bool, tuple[str, ...]]:
+        # Transport-supplied input: any structural surprise is a deterministic
+        # rejection, never an exception the venue would have to classify.
+        try:
+            return self._verify_checked(signed, request, now=now)
+        except Exception:
+            return False, ("PERMIT_MALFORMED",)
+
+    def _verify_checked(
+        self,
+        signed: SignedExecutionPermit,
+        request: ExecutionRequest,
+        *,
+        now: datetime,
+    ) -> tuple[bool, tuple[str, ...]]:
         reasons: list[str] = []
+        if not isinstance(signed, SignedExecutionPermit) or not isinstance(request, ExecutionRequest):
+            return False, ("PERMIT_MALFORMED",)
         permit = signed.permit
-        if signed.signer_id != self.signature.signer_id:
-            reasons.append("PERMIT_SIGNER_UNKNOWN")
-        if signed.algorithm != self.signature.algorithm:
+        verifier = self.verifiers.get(signed.signer_id)
+        if verifier is None:
+            return False, ("PERMIT_SIGNER_UNKNOWN",)
+        validity = self.key_validity.get(signed.signer_id)
+        if validity is not None:
+            rejection = validity.rejection(permit.issued_at)
+            if rejection:
+                reasons.append("PERMIT_SIGNER_" + rejection[len("KEY_"):])
+        if signed.algorithm != verifier.algorithm:
             reasons.append("PERMIT_ALGORITHM_MISMATCH")
-        payload = canonical_json(permit).encode("utf-8")
-        if not self.signature.verify(payload, signed.signature):
+        payload = signed_permit_payload(permit, signed.signer_id, signed.algorithm)
+        if not verifier.verify(payload, signed.signature):
             reasons.append("PERMIT_SIGNATURE_INVALID")
         if permit.request_hash != canonical_hash(request):
             reasons.append("PERMIT_REQUEST_HASH_MISMATCH")
@@ -393,13 +498,15 @@ class ExecutionPermitVerifier:
             reasons.append("PERMIT_FROM_FUTURE")
         if now > permit.expires_at:
             reasons.append("PERMIT_EXPIRED")
+        if permit.expires_at - permit.issued_at > timedelta(seconds=self.max_permit_lifetime_seconds):
+            reasons.append("PERMIT_TTL_EXCEEDED")
 
         try:
             status, epoch, _ = self.control_store.get_grant_control(
                 permit.principal_id, permit.grant_id, permit.grant_version
             )
             if status != "ACTIVE":
-                reasons.append("PERMIT_GRANT_NOT_ACTIVE")
+                reasons.append(_STATUS_REASONS.get(status, "PERMIT_GRANT_NOT_ACTIVE"))
             if epoch != permit.grant_epoch:
                 reasons.append("PERMIT_GRANT_EPOCH_STALE")
         except Exception:

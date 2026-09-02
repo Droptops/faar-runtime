@@ -1,4 +1,6 @@
-# FAAR v0.3.0 Release Note
+# FAAR v0.3.0 Release Note (historical)
+
+> Superseded by [`V0_4_RELEASE.md`](V0_4_RELEASE.md). Kept for the record; counts and blockers below describe v0.3.0, not the current tree.
 
 **v0.3.0 pre-alpha reference runtime. Not approved for live funds or production credentials.**
 

@@ -1,4 +1,4 @@
-# FAAR v0.2 Architecture
+# FAAR Architecture
 
 ## Security objective
 
@@ -9,43 +9,44 @@ FAAR narrows the path from an untrusted agent proposal to an external economic e
               Strategy / LLM / tools
                        │ proposal
                        ▼
-              Canonical economic Intent
+              Canonical economic Intent  (principal-namespaced, schema 0.3)
                        │ stable hash
        ┌───────────────┴────────────────┐
        │                                │
        ▼                                ▼
  Authority signer                  Risk signer
  AAR posture/primitive             portfolio state
-       │ signed attestation             │ signed attestation
+       │ Ed25519 attestation            │ Ed25519 attestation
        └───────────────┬────────────────┘
                        ▼
-                 FAAR Runtime
-       ┌───────────────┼──────────────────────┐
-       │               │                      │
+                 FAAR Runtime  (verify-only trust)
+       ┌───────────────┼──────────────────────────┐
+       │               │                          │
  grant registry    deterministic gates   transactional store
- fingerprint       capability + risk     intent/usage/risk claim
- runtime status           │                      │
-       └───────────────┬───┴──────────────────────┘
+ fingerprint       capability + risk     intent / usage / risk claim
+ epoch, halt,             │              evidence chain + signed head
+ authority anchor         │                          │
+       └───────────────┬──┴──────────────────────────┘
                        ▼
-               submission fence
-                       │
+             Constrained permit authority   (independent re-check, Ed25519 signer)
+                       │ SignedExecutionPermit
                        ▼
-               reviewed adapter
-                       │
+             submission fence + deadline
+                       │ ExecutionRequest + permit
                        ▼
-              external venue/chain
-                       │
+               reviewed adapter ──► venue / gateway verifies & consumes the permit
+                       │                              (epoch, halt, anchor, single use)
                        ▼
-          authoritative reconciliation
-                       │
+          independent settlement verifier   (distinct component; quorum optional)
+                       │ authoritative record bound to the request hash
                        ▼
-              economic settlement
+              economic settlement  (permit-bounded ambiguity window)
                        │
                        ▼
              signed task contract
                        │
                        ▼
-          deterministic outcome check
+          deterministic outcome check   (bound to this intent's settlement)
              MET / NOT_MET / UNKNOWN
 ```
 
@@ -59,31 +60,45 @@ A single LLM-generated object such as:
 
 is not a security boundary. If the coordinator or model can fabricate both authorization and risk evidence, deterministic downstream checks provide little protection.
 
-v0.2 therefore binds two upstream decisions to the exact canonical intent:
+FAAR therefore binds two upstream decisions to the exact canonical intent:
 
 - **authority attestation**: posture and work primitive;
 - **risk attestation**: portfolio/market state and risk-state version.
 
-The reference implementation uses HMAC-SHA256 because it is dependency-free and easy to test. Production should normally separate signing and verification with KMS/HSM-backed asymmetric keys.
+Reference attestations and execution permits are Ed25519 (the `cryptography` package is a required dependency). Signers hold private keys; the runtime and the execution gateway hold public keys only and refuse any object that exposes a signing API; the permit authority holds exactly one private key (the permit signer) plus verify-only upstream trust. Symmetric HMAC classes survive solely as test fixtures and are refused by the permit authority and the gateway. Keys carry optional lifecycle windows and revocation (`KeyValidity`), and verifiers bound every artifact's own lifetime.
 
 ## Intent lifecycle
 
-The durable state machine distinguishes authorization, reservation, submission, ambiguity, reconciliation, and settlement. Important properties:
+The durable state machine distinguishes authorization, reservation, submission, ambiguity, reconciliation, and settlement:
 
-- storing `SUBMITTED` happens before the external adapter call;
-- a process restart resumes the same intent;
+```text
+PROPOSED ─► AUTHORIZED ─► RESERVED ─► SUBMITTED ─► UNKNOWN ─► RECONCILING ─► CONFIRMED ─► FINALIZED
+   │            │            │            │            ▲            │  │
+   └─► DENIED / DEFERRED / STOPPED        └─► FAILED_SAFE          │  ├─► STOPPED
+                                                       │            │  └─► FAILED_SAFE (authoritative absence, retry blocked)
+                                                       └────────────┘  (retry: RECONCILING ─► SUBMITTED, new permit)
+```
+
+Important properties:
+
+- `SUBMITTED`, the durable attempt counter, the permit and the `submission_started` event are persisted before the external adapter call;
+- every terminal decision leaves an event in the evidence chain, and every chain starts atomically with registration;
+- a process restart resumes the same intent unless the crashed worker still owns the durable lease (`INTENT_BUSY`, operator recovery in `OPERATIONS.md`);
 - ambiguous execution never creates a new logical intent;
-- resubmission requires authoritative proof of absence, fresh authorization/risk, unexpired authority, ACTIVE grant status, and remaining retry budget.
+- every recorded permit sets the intent's `ambiguity_until` to its expiry in the same transaction, whatever the adapter reports afterwards; absence is not trusted and no retry is issued until that window has closed, and the store refuses a second live permit for one intent;
+- a decision is never recorded without evidence: if the chain refuses an append (`EVIDENCE_INTEGRITY_FAILURE`) no state advances;
+- resubmission requires authoritative proof of absence after the window, fresh authorization/risk, unexpired authority, ACTIVE grant status, remaining retry budget, and no durable resubmission block;
+- settlement verification and retries run outside the per-grant revocation fence; only the adapter call is fenced, and it can be bounded by `adapter_deadline_seconds`.
 
 ## Grant lifecycle
 
-The complete grant document is fingerprinted:
+The complete parsed grant document is fingerprinted:
 
 ```text
 (grant_id, version) -> SHA256(canonical grant)
 ```
 
-Runtime status is separate:
+The parser rejects unknown keys, so a misspelled limit is an error rather than an unenforced limit with a valid fingerprint. Runtime status is separate:
 
 ```text
 ACTIVE <-> PAUSED
@@ -91,7 +106,7 @@ ACTIVE/PAUSED -> REVOKED
 REVOKED -X-> ACTIVE
 ```
 
-A revoked version cannot be resurrected. New authority requires a new grant version.
+Every lifecycle change advances the grant's `runtime_epoch`, which every permit carries and which permit consumption re-checks. Two more effective statuses are folded in by the store: `HALTED` (a global or per-principal emergency stop, which also advances epochs) and `REGRESSED` (the datastore's authority state is older than its external anchor; see `OPERATIONS.md` §5).
 
 Money-moving grants are bounded by construction: explicit asset scope, positive per-action and daily-turnover caps, and an action-velocity limit are mandatory; PAY/SWAP also require target allowlists.
 
@@ -99,23 +114,27 @@ Money-moving grants are bounded by construction: explicit asset scope, positive 
 
 Per-order checks are not enough. Two different intents can each look safe against the same portfolio snapshot and jointly exceed a limit.
 
-Every trusted risk snapshot therefore carries:
+Every trusted risk snapshot therefore carries `scope`, `state_version` and `observed_at`. FAAR atomically claims one state version for one new intent, and a retry that presents a fresher version claims that version too. A version older than any claimed version is refused in both ledgers. The risk engine is responsible for advancing versions only after incorporating prior reservations/effects; see `RISK_ENGINE_CONTRACT.md`.
 
-```text
-scope
-state_version
-observed_at
-```
+Aggregate usage (turnover, velocity) is reserved atomically in the store over trailing windows, independently of the risk signer's own accounting.
 
-FAAR atomically claims one state version for one new intent. A second intent must obtain a newer trusted state version. The risk engine is responsible for advancing versions only after incorporating prior reservations/effects; see `RISK_ENGINE_CONTRACT.md`.
+## Execution permits
+
+See [`EXECUTION_PERMITS.md`](EXECUTION_PERMITS.md). The permit authority independently re-verifies everything the runtime checked, claims the risk state, allocates a fence token and signs a short-lived permit. The venue (or a gateway) verifies the signature and every binding and consumes the permit once in the shared store; consumption checks the grant epoch, halt state and authority anchor in the same transaction, which is the cross-process revocation fence.
 
 ## Adapter boundary
 
-The adapter is not a generic tool pass-through. FAAR converts the authorized `Intent` into a minimized `ExecutionRequest`; the adapter never receives model metadata, the capability grant, or the authority/risk decision objects. Agent-supplied calldata, raw transactions, signing payloads, key material, delegatecall, unlimited approvals, and unknown execution fields are rejected before this boundary.
+The adapter is not a generic tool pass-through. FAAR converts the authorized `Intent` into a minimized `ExecutionRequest` and a permit; the adapter never receives model metadata, the capability grant, or the authority/risk decision objects. Agent-supplied calldata, raw transactions, signing payloads, key material, delegatecall, unlimited approvals, unknown execution fields, dual amount fields and non-canonical amount strings are rejected before this boundary.
 
-The runtime also requires the adapter to declare stable intent identity, idempotent submission, authoritative reconciliation, and stable effect identity. That declaration is not a security proof; the adapter remains part of the reference trusted computing base.
+Whatever the adapter returns is untrusted telemetry. Positive and negative settlement come only from the independent settlement verifier, which must be a distinct component with a trusted profile. Positive reconciliation must be authoritative and bound to the exact request hash; for money-moving effects FAAR also checks that a settled amount exists and does not exceed the authorized notional (`PAY` requires exact equality).
 
-Positive reconciliation is required to be authoritative. For money-moving effects FAAR also checks that a settled amount exists and does not exceed the authorized notional (`PAY` requires exact equality).
+## Evidence
+
+Each intent owns a hash-linked evidence chain. With an evidence key configured, every event carries a MAC and a signed head commitment binds the chain's length and tail; the store refuses to append to a chain whose head no longer matches, and verification reads chain and head in one transaction. Evidence records what the runtime observed and decided; it does not by itself prove what an external venue did.
+
+## Emergency controls and restore safety
+
+`halt(scope)`/`resume(scope)` stop a principal or everything without waiting on in-flight adapter calls. An `AuthorityAnchor` kept outside the database backup set records the highest epoch and fence token per grant version so a restored backup cannot resurrect revoked grants, consumed permits or spent risk states. Both are operator procedures in [`OPERATIONS.md`](OPERATIONS.md).
 
 ## Settlement vs outcome
 
@@ -127,4 +146,4 @@ Outcome verification answers:
 
 > Did that effect satisfy the objective fixed before execution?
 
-Those are intentionally separate. A finalized payment can still fail to purchase the desired service; a filled trade can still fail a strategy-level objective.
+Those are intentionally separate. A finalized payment can still fail to purchase the desired service; a filled trade can still fail a strategy-level objective. The attested outcome check additionally binds the settlement record to this intent's execution request, so the settlement of another intent cannot satisfy the contract.

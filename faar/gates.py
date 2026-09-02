@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 
+from .canonical import parse_bounded_decimal
 from .models import (
     AuthorityDecision,
     AuthorityPosture,
@@ -10,8 +11,8 @@ from .models import (
     CapabilityGrant,
     Decision,
     EconomicPrimitive,
-    GrantStatus,
     Intent,
+    MONETARY_PRIMITIVES,
     RiskSnapshot,
     Verdict,
 )
@@ -40,13 +41,9 @@ def evaluate_authority(authority: AuthorityDecision) -> Decision:
 
 
 def _decimal(raw: object) -> Decimal | None:
-    if raw is None:
-        return None
-    try:
-        value = Decimal(str(raw))
-    except (InvalidOperation, ValueError, TypeError):
-        return None
-    return value if value.is_finite() else None
+    # Shared bounded parser: the same grammar and bounds are applied by usage
+    # reservation, the permit signer, settlement integrity and reference venues.
+    return parse_bounded_decimal(raw)
 
 
 def _amount_usd(intent: Intent) -> Decimal | None:
@@ -113,7 +110,10 @@ def _validate_intent_shape(intent: Intent) -> list[str]:
         for field in ("from_asset", "to_asset", "amount_usd", "target"):
             if payload.get(field) in (None, ""):
                 reasons.append(f"PAYLOAD_FIELD_REQUIRED:{field}")
-        if payload.get("from_asset") and payload.get("to_asset") and payload.get("from_asset") == payload.get("to_asset"):
+        # Presence and normalised comparison, matching how the allowlist check
+        # sees assets (str()), so 0/0 or 0/"0" cannot slip past as distinct.
+        from_asset, to_asset = payload.get("from_asset"), payload.get("to_asset")
+        if from_asset not in (None, "") and to_asset not in (None, "") and str(from_asset) == str(to_asset):
             reasons.append("SWAP_ASSETS_IDENTICAL")
     elif intent.primitive in {EconomicPrimitive.BUY, EconomicPrimitive.SELL, EconomicPrimitive.PLACE_ORDER}:
         for field in ("base_asset", "quote_asset"):
@@ -121,6 +121,10 @@ def _validate_intent_shape(intent: Intent) -> list[str]:
                 reasons.append(f"PAYLOAD_FIELD_REQUIRED:{field}")
         if payload.get("amount_usd") is None and payload.get("notional_usd") is None:
             reasons.append("PAYLOAD_FIELD_REQUIRED:notional_usd")
+        # Exactly one economic amount may be authorized. Two fields would let the
+        # ceiling be enforced on one while an adapter executes the other.
+        if "amount_usd" in payload and "notional_usd" in payload:
+            reasons.append("AMOUNT_FIELDS_AMBIGUOUS")
     elif intent.primitive == EconomicPrimitive.CANCEL_ORDER:
         if payload.get("order_id") in (None, ""):
             reasons.append("PAYLOAD_FIELD_REQUIRED:order_id")
@@ -160,14 +164,10 @@ def evaluate_capability(intent: Intent, grant: CapabilityGrant, now: datetime) -
     if grant.valid_until is not None and now > grant.valid_until:
         reasons.append("GRANT_EXPIRED")
 
-    # Coalesce on presence, not truthiness: `a or b` would fall through a falsy
-    # target (0, False) to the next key and ultimately to None, skipping the
-    # denied_targets / TARGET_REQUIRED checks for that value.
+    # `target` is the single authoritative counterparty/router key. Presence, not
+    # truthiness: a falsy target (0, False) must still reach the denied_targets /
+    # TARGET_REQUIRED checks.
     target = intent.payload.get("target")
-    if target is None:
-        target = intent.payload.get("counterparty")
-    if target is None:
-        target = intent.payload.get("contract")
     if target is not None:
         target = str(target)
         if target in grant.denied_targets:
@@ -192,7 +192,7 @@ def evaluate_capability(intent: Intent, grant: CapabilityGrant, now: datetime) -
             reasons.append("AMOUNT_NOT_POSITIVE")
         if grant.limits.max_order_usd is not None and amount > grant.limits.max_order_usd:
             reasons.append("MAX_ORDER_USD_EXCEEDED")
-    elif intent.primitive in {EconomicPrimitive.PAY, EconomicPrimitive.SWAP, EconomicPrimitive.BUY, EconomicPrimitive.SELL, EconomicPrimitive.PLACE_ORDER}:
+    elif intent.primitive in MONETARY_PRIMITIVES:
         reasons.append("AMOUNT_REQUIRED")
 
     return _decision("capability", reasons)
@@ -280,4 +280,8 @@ def evaluate_risk(intent: Intent, grant: CapabilityGrant, risk: RiskSnapshot, no
         if risk.actions_in_window >= limits.max_actions_per_window:
             reasons.append("ACTION_VELOCITY_EXCEEDED")
 
-    return _decision("risk", reasons, defer=bool(reasons))
+    # A proven limit breach is a deterministic policy failure (DENY). Missing,
+    # malformed or stale data is ambiguity and routes to DEFER. Both are terminal
+    # and equally safe; the distinction keeps audit evidence machine-readable.
+    breach = any(reason.endswith("_EXCEEDED") for reason in reasons)
+    return _decision("risk", reasons, defer=not breach)

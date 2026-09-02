@@ -63,7 +63,34 @@ class SettlementQuorumTests(unittest.TestCase):
         weak = SettlementRecord(SettlementStatus.FINALIZED, "fx-1", Decimal("50"), authoritative=False)
         q = QuorumSettlementVerifier([Source(good, "a"), Source(weak, "b")], quorum=2)
         result = q.verify(REQ)
-        self.assertEqual(SettlementStatus.CONTRADICTORY, result.status)
+        # One uncontested vote is insufficient evidence, not a contradiction: the
+        # record is a weak UNKNOWN that neither finalizes nor terminally stops.
+        self.assertEqual(SettlementStatus.UNKNOWN, result.status)
+        self.assertFalse(result.authoritative)
+        self.assertIsNone(result.effect_id)
+        self.assertEqual("quorum-not-reached", result.evidence["quorum"])
+
+    def test_single_transient_source_error_is_insufficient_evidence_not_contradiction(self):
+        good = SettlementRecord(SettlementStatus.FINALIZED, "fx-1", Decimal("50"), authoritative=True, verified_request_hash=REQ_HASH)
+
+        class Down:
+            name = "b"
+            security_profile = REFERENCE_SETTLEMENT_PROFILE
+
+            def verify(self, request):
+                raise TimeoutError("transient")
+
+        result = QuorumSettlementVerifier([Source(good, "a"), Down()], quorum=2).verify(REQ)
+        self.assertEqual(SettlementStatus.UNKNOWN, result.status)
+        self.assertFalse(result.authoritative)
+        self.assertEqual({"b": "TimeoutError"}, dict(result.evidence["errors"]))
+        # The same sources disagreeing authoritatively is still contested.
+        none = SettlementRecord(SettlementStatus.NONE, authoritative=True, verified_request_hash=REQ_HASH)
+        down = Down()
+        down.name = "c"
+        contested = QuorumSettlementVerifier([Source(good, "a"), Source(none, "b"), down], quorum=2).verify(REQ)
+        self.assertEqual(SettlementStatus.CONTRADICTORY, contested.status)
+        self.assertTrue(contested.authoritative)
     def test_authoritative_source_for_different_request_is_not_counted(self):
         wrong = SettlementRecord(
             SettlementStatus.FINALIZED, "fx-wrong", Decimal("50"), authoritative=True,

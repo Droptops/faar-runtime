@@ -5,8 +5,7 @@
   "criteria": [
     {
       "path": "effect_id",
-      "op": "present",
-      "value": true
+      "op": "present"
     },
     {
       "path": "status",

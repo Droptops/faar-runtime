@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import os
+import tempfile
 from dataclasses import replace
+from types import SimpleNamespace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
@@ -35,6 +38,22 @@ TRUST_KEY_KINDS = {
     "risk-test": {AttestationKind.RISK},
     "task-test": {AttestationKind.TASK},
 }
+
+
+def temp_path(case, suffix: str = ".sqlite") -> str:
+    """A unique path inside a per-test temporary directory that is removed at cleanup.
+
+    Nothing is created at the path itself, so it serves for SQLite files (and their
+    -wal/-shm companions), anchor files and snapshots alike.
+    """
+    tmpdir = tempfile.TemporaryDirectory(prefix="faar-test-")
+    case.addCleanup(tmpdir.cleanup)
+    return os.path.join(tmpdir.name, "store" + suffix)
+
+
+def temp_file(case, suffix: str = ".sqlite"):
+    """`temp_path` wrapped so `.name` reads like a NamedTemporaryFile."""
+    return SimpleNamespace(name=temp_path(case, suffix))
 
 
 def trust() -> Ed25519TrustStore:
@@ -122,13 +141,25 @@ def attest_pair(t, i: Intent, auth: AuthorityDecision, rs: RiskSnapshot, now: da
     return aa, ra
 
 
-PERMIT_KEY = b"permit-test-key-32-bytes-long!!!!!!!"
+class Clock:
+    """Deterministic, advanceable clock shared by the runtime and a venue in tests."""
 
-def permit_stack(store, trust_store=None):
+    def __init__(self, start: datetime = NOW) -> None:
+        self.now = start
+
+    def __call__(self) -> datetime:
+        return self.now
+
+    def advance(self, seconds: float) -> datetime:
+        self.now = self.now + timedelta(seconds=seconds)
+        return self.now
+
+
+def permit_stack(store, trust_store=None, *, max_permit_ttl_seconds=5):
     trust_store = trust_store or trust()
     verifier_trust = verification_trust(trust_store)
     sig = Ed25519PermitSignature("permit-test")
-    authority = ConstrainedPermitAuthority(store, verifier_trust, sig, max_permit_ttl_seconds=5)
+    authority = ConstrainedPermitAuthority(store, verifier_trust, sig, max_permit_ttl_seconds=max_permit_ttl_seconds)
     verifier = ExecutionPermitVerifier(sig.public_verifier(), store)
     return authority, verifier
 
@@ -142,14 +173,17 @@ def build_mock_runtime(
     runtime_clock=lambda: NOW,
     venue_clock=lambda: NOW,
     allow_test_time_override=True,
+    max_permit_ttl_seconds=5,
+    adapter_deadline_seconds=None,
 ):
     trust_store = trust_store or trust()
     verifier_trust = verification_trust(trust_store)
-    permit_authority, permit_verifier = permit_stack(store, trust_store)
+    permit_authority, permit_verifier = permit_stack(store, trust_store, max_permit_ttl_seconds=max_permit_ttl_seconds)
     venue = MockVenue(permit_verifier=permit_verifier, name=name, mode=mode, clock=venue_clock)
     settlement = MockSettlementVerifier(venue=venue)
     runtime = FAARRuntime(
         store, {name: venue}, verifier_trust, permit_authority, {name: settlement},
         clock=runtime_clock, allow_test_time_override=allow_test_time_override,
+        adapter_deadline_seconds=adapter_deadline_seconds,
     )
     return runtime, venue, settlement, permit_authority, permit_verifier

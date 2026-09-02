@@ -8,15 +8,38 @@ from math import isfinite
 from types import MappingProxyType
 from typing import Any, Mapping
 
+from .canonical import parse_bounded_decimal
+
 
 def _aware(value: datetime) -> bool:
-    return value.tzinfo is not None and value.utcoffset() is not None
+    return isinstance(value, datetime) and value.tzinfo is not None and value.utcoffset() is not None
 
 
 MAX_CANONICAL_DEPTH = 24
 MAX_CANONICAL_CONTAINER_ITEMS = 256
 MAX_CANONICAL_STRING_CHARS = 8192
 MAX_CANONICAL_INT_BITS = 256
+
+# Identifier bounds mirror schemas/*.schema.json. Identifiers are replicated into
+# primary keys, permits, evidence rows and adapter idempotency keys, so they are
+# bounded here as well as at the JSON boundary. A durable economic intent id also
+# has a minimum length so trivially enumerable ids cannot be squatted.
+MAX_IDENTIFIER_CHARS = 128
+MIN_INTENT_ID_CHARS = 16
+MAX_SAFE_INT = 2**63 - 1
+SUPPORTED_INTENT_SCHEMA_VERSIONS = frozenset({"0.3"})
+
+
+def _require_identifier(name: str, value: object, *, minimum: int = 1) -> None:
+    if not isinstance(value, str):
+        raise ValueError(f"{name} must be a string")
+    if not (minimum <= len(value) <= MAX_IDENTIFIER_CHARS):
+        raise ValueError(f"{name} must be between {minimum} and {MAX_IDENTIFIER_CHARS} characters")
+
+
+def _require_mapping(name: str, value: object) -> None:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{name} must be a JSON object")
 
 
 def _deep_freeze(value: Any, _depth: int = 0) -> Any:
@@ -59,7 +82,11 @@ def _deep_freeze(value: Any, _depth: int = 0) -> Any:
         if len(value) > MAX_CANONICAL_STRING_CHARS:
             raise ValueError("canonical string is too long")
         return value
-    if isinstance(value, bool) or value is None or isinstance(value, (datetime, StrEnum)):
+    if isinstance(value, datetime):
+        if not _aware(value):
+            raise ValueError("naive datetimes are not allowed in canonical data")
+        return value
+    if isinstance(value, bool) or value is None or isinstance(value, StrEnum):
         return value
     if isinstance(value, int):
         if value.bit_length() > MAX_CANONICAL_INT_BITS:
@@ -68,11 +95,13 @@ def _deep_freeze(value: Any, _depth: int = 0) -> Any:
     raise ValueError(f"unsupported canonical value type: {type(value).__name__}")
 
 
-def _require_int(name: str, value: int, *, minimum: int | None = None) -> None:
+def _require_int(name: str, value: int, *, minimum: int | None = None, maximum: int = MAX_SAFE_INT) -> None:
     if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError(f"{name} must be an integer")
     if minimum is not None and value < minimum:
         raise ValueError(f"{name} must be >= {minimum}")
+    if value > maximum:
+        raise ValueError(f"{name} must be <= {maximum}")
 
 
 def _require_bool(name: str, value: bool) -> None:
@@ -262,8 +291,8 @@ class CapabilityGrant:
         object.__setattr__(self, "allowed_assets", frozenset(str(v) for v in self.allowed_assets))
         object.__setattr__(self, "allowed_targets", frozenset(str(v) for v in self.allowed_targets))
         object.__setattr__(self, "denied_targets", frozenset(str(v) for v in self.denied_targets))
-        if not self.principal_id or not self.grant_id or not self.actor_id:
-            raise ValueError("principal_id, grant_id and actor_id are required")
+        for name in ("principal_id", "grant_id", "actor_id"):
+            _require_identifier(name, getattr(self, name))
         _require_int("grant version", self.version, minimum=1)
         if not self.allowed_primitives:
             raise ValueError("allowed_primitives cannot be empty")
@@ -315,10 +344,18 @@ class Intent:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "primitive", EconomicPrimitive(self.primitive))
+        # A payload that is not a JSON object must fail at construction: the gates
+        # index it by key and a list/str/None would surface as an exception inside
+        # the runtime instead of a verdict.
+        _require_mapping("intent payload", self.payload)
+        _require_mapping("intent metadata", self.metadata)
         object.__setattr__(self, "payload", _deep_freeze(self.payload))
         object.__setattr__(self, "metadata", _deep_freeze(self.metadata))
-        if not self.principal_id or not self.intent_id or not self.actor_id or not self.grant_id or not self.venue:
-            raise ValueError("principal_id, intent identifiers and venue are required")
+        for name in ("principal_id", "actor_id", "grant_id", "venue"):
+            _require_identifier(name, getattr(self, name))
+        _require_identifier("intent_id", self.intent_id, minimum=MIN_INTENT_ID_CHARS)
+        if self.schema_version not in SUPPORTED_INTENT_SCHEMA_VERSIONS:
+            raise ValueError(f"unsupported intent schema_version {self.schema_version!r}")
         _require_int("grant_version", self.grant_version, minimum=1)
         if not _aware(self.created_at) or not _aware(self.expires_at):
             raise ValueError("intent timestamps must be timezone-aware")
@@ -342,9 +379,11 @@ class ExecutionRequest:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "primitive", EconomicPrimitive(self.primitive))
+        _require_mapping("execution request payload", self.payload)
         object.__setattr__(self, "payload", _deep_freeze(self.payload))
-        if not self.principal_id or not self.intent_id or not self.venue:
-            raise ValueError("execution request principal, identity and venue are required")
+        _require_identifier("principal_id", self.principal_id)
+        _require_identifier("intent_id", self.intent_id, minimum=MIN_INTENT_ID_CHARS)
+        _require_identifier("venue", self.venue)
 
     @classmethod
     def from_intent(cls, intent: Intent) -> "ExecutionRequest":
@@ -383,14 +422,19 @@ class ExecutionPermit:
     expires_at: datetime
 
     def __post_init__(self) -> None:
-        if not all((self.permit_id, self.principal_id, self.intent_id, self.grant_id, self.grant_hash, self.request_hash)):
-            raise ValueError("execution permit identity fields are required")
+        for name in ("permit_id", "principal_id", "grant_id"):
+            _require_identifier(name, getattr(self, name))
+        _require_identifier("intent_id", self.intent_id, minimum=MIN_INTENT_ID_CHARS)
+        for name in ("grant_hash", "request_hash", "authority_attestation_hash", "risk_attestation_hash"):
+            if not isinstance(getattr(self, name), str) or not getattr(self, name):
+                raise ValueError(f"permit {name} is required")
         _require_int("grant_version", self.grant_version, minimum=1)
         _require_int("grant_epoch", self.grant_epoch, minimum=1)
         _require_int("fence_token", self.fence_token, minimum=1)
         if self.max_amount_usd is not None:
-            if not isinstance(self.max_amount_usd, Decimal) or not self.max_amount_usd.is_finite() or self.max_amount_usd <= 0:
-                raise ValueError("permit max_amount_usd must be a positive finite Decimal or None")
+            bounded = parse_bounded_decimal(self.max_amount_usd) if isinstance(self.max_amount_usd, Decimal) else None
+            if bounded is None or bounded <= 0:
+                raise ValueError("permit max_amount_usd must be a positive, canonically bounded Decimal or None")
         if not _aware(self.issued_at) or not _aware(self.expires_at):
             raise ValueError("permit timestamps must be timezone-aware")
         if self.expires_at <= self.issued_at:
@@ -406,8 +450,11 @@ class SignedExecutionPermit:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "algorithm", PermitAlgorithm(self.algorithm))
-        if not self.signer_id or not self.signature:
-            raise ValueError("signed permit signer_id and signature are required")
+        if not isinstance(self.permit, ExecutionPermit):
+            raise ValueError("signed permit body must be an ExecutionPermit")
+        _require_identifier("signer_id", self.signer_id)
+        if not isinstance(self.signature, str) or not self.signature:
+            raise ValueError("signed permit signature is required")
 
 
 @dataclass(frozen=True)
@@ -459,6 +506,40 @@ class Decision:
 
 
 @dataclass(frozen=True)
+class KeyValidity:
+    """Lifecycle window of a verification key (attestation or permit signer).
+
+    An artifact is accepted only if it was issued inside the key's window and the
+    key is not revoked at verification time. Overlapping windows across two key
+    ids give a rotation period without ever accepting an unknown signer; an
+    artifact issued within the window stays verifiable for its own lifetime after
+    `not_after` so rotation never invalidates authority already granted.
+    """
+
+    not_before: datetime | None = None
+    not_after: datetime | None = None
+    revoked: bool = False
+
+    def __post_init__(self) -> None:
+        _require_bool("revoked", self.revoked)
+        for name in ("not_before", "not_after"):
+            value = getattr(self, name)
+            if value is not None and not _aware(value):
+                raise ValueError(f"{name} must be a timezone-aware datetime or None")
+        if self.not_before is not None and self.not_after is not None and self.not_after <= self.not_before:
+            raise ValueError("not_after must be after not_before")
+
+    def rejection(self, issued_at: datetime) -> str | None:
+        if self.revoked:
+            return "KEY_REVOKED"
+        if self.not_before is not None and issued_at < self.not_before:
+            return "KEY_NOT_YET_VALID"
+        if self.not_after is not None and issued_at > self.not_after:
+            return "KEY_EXPIRED"
+        return None
+
+
+@dataclass(frozen=True)
 class Attestation:
     kind: AttestationKind
     key_id: str
@@ -471,8 +552,11 @@ class Attestation:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "algorithm", AttestationAlgorithm(self.algorithm))
-        if not self.key_id or not self.subject_hash or not self.intent_hash or not self.signature:
-            raise ValueError("attestation fields cannot be empty")
+        object.__setattr__(self, "kind", AttestationKind(self.kind))
+        _require_identifier("key_id", self.key_id)
+        for name in ("subject_hash", "intent_hash", "signature"):
+            if not isinstance(getattr(self, name), str) or not getattr(self, name):
+                raise ValueError("attestation fields cannot be empty")
         if not _aware(self.issued_at) or not _aware(self.expires_at):
             raise ValueError("attestation timestamps must be timezone-aware")
         if self.expires_at <= self.issued_at:
@@ -542,7 +626,9 @@ class TaskContract:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "criteria", tuple(self.criteria))
-        if not self.task_id or not self.intent_id or not self.objective.strip():
+        _require_identifier("task_id", self.task_id)
+        _require_identifier("intent_id", self.intent_id, minimum=MIN_INTENT_ID_CHARS)
+        if not isinstance(self.objective, str) or not self.objective.strip():
             raise ValueError("task_id, intent_id and objective are required")
         if not self.criteria:
             raise ValueError("task contract must define at least one success criterion")

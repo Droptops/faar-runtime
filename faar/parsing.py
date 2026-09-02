@@ -20,14 +20,63 @@ from .models import (
 )
 
 
-def _dt(value: str | None) -> datetime | None:
-    if not value:
+_INTENT_FIELDS = frozenset({
+    "schema_version", "principal_id", "intent_id", "actor_id", "grant_id", "grant_version",
+    "primitive", "venue", "created_at", "expires_at", "payload", "metadata",
+})
+_GRANT_FIELDS = frozenset({
+    "schema_version", "principal_id", "grant_id", "version", "actor_id", "status",
+    "allowed_primitives", "allowed_venues", "allowed_assets", "allowed_targets", "denied_targets",
+    "valid_until", "limits",
+})
+_LIMIT_FIELDS = frozenset({
+    "max_order_usd", "max_position_usd", "max_daily_turnover_usd", "max_daily_loss_usd",
+    "max_slippage_bps", "max_price_impact_bps", "max_market_data_age_seconds",
+    "max_risk_snapshot_age_seconds", "max_intent_ttl_seconds", "max_clock_skew_seconds",
+    "max_actions_per_window", "action_window_seconds", "max_submission_attempts",
+})
+_RISK_FIELDS = frozenset({
+    "observed_at", "state_version", "scope", "position_after_usd", "daily_turnover_after_usd",
+    "daily_loss_usd", "market_data_age_seconds", "requested_slippage_bps", "price_impact_bps",
+    "actions_in_window", "circuit_breaker_active", "data_complete", "source_count", "sources_agree",
+})
+_AUTHORITY_FIELDS = frozenset({"posture", "primitive", "reason_codes", "source"})
+_ATTESTATION_FIELDS = frozenset({
+    "kind", "key_id", "algorithm", "subject_hash", "intent_hash", "issued_at", "expires_at", "signature",
+})
+
+
+def _document(data: Any, name: str, allowed: frozenset[str]) -> dict[str, Any]:
+    """Reject unknown keys so a misspelled limit cannot silently become 'unbounded'.
+
+    Every optional limit defaults to "not enforced" when absent, which makes a
+    typo in a grant document a security-relevant event rather than a cosmetic one.
+    """
+    if not isinstance(data, dict):
+        raise ValueError(f"{name} document must be a JSON object")
+    unknown = sorted(set(data) - allowed)
+    if unknown:
+        raise ValueError(f"{name} document has unknown fields: {unknown}")
+    return data
+
+
+def _dt(value: Any) -> datetime | None:
+    # Only an absent/null value means "no timestamp". Falsy values such as "" or 0
+    # must not silently turn a required timestamp (or a grant expiry) into None.
+    if value is None:
         return None
     if not isinstance(value, str):
         raise ValueError("timestamp must be an ISO-8601 string")
     parsed = datetime.fromisoformat(value)
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         raise ValueError("timestamps must include a timezone offset")
+    return parsed
+
+
+def _required_dt(value: Any, name: str) -> datetime:
+    parsed = _dt(value)
+    if parsed is None:
+        raise ValueError(f"{name} is required")
     return parsed
 
 
@@ -60,28 +109,38 @@ def _dec(value: Any) -> Decimal | None:
 
 
 def parse_authority(data: dict[str, Any]) -> AuthorityDecision:
+    data = _document(data, "authority decision", _AUTHORITY_FIELDS)
+    reason_codes = data.get("reason_codes", [])
+    if not isinstance(reason_codes, list) or not all(isinstance(r, str) for r in reason_codes):
+        raise ValueError("reason_codes must be a list of strings")
     return AuthorityDecision(
         posture=AuthorityPosture(data["posture"]),
         primitive=AuthorityPrimitive(data["primitive"]),
-        reason_codes=tuple(data.get("reason_codes", [])),
+        reason_codes=tuple(reason_codes),
         source=data.get("source", "external"),
     )
 
 
 def parse_attestation(data: dict[str, Any]) -> Attestation:
+    data = _document(data, "attestation", _ATTESTATION_FIELDS)
     return Attestation(
         kind=AttestationKind(data["kind"]),
         key_id=data["key_id"],
         algorithm=AttestationAlgorithm(data["algorithm"]),
         subject_hash=data["subject_hash"],
         intent_hash=data["intent_hash"],
-        issued_at=_dt(data["issued_at"]),
-        expires_at=_dt(data["expires_at"]),
+        issued_at=_required_dt(data["issued_at"], "issued_at"),
+        expires_at=_required_dt(data["expires_at"], "expires_at"),
         signature=data["signature"],
     )
 
 
 def parse_intent(data: dict[str, Any]) -> Intent:
+    data = _document(data, "intent", _INTENT_FIELDS)
+    payload = data.get("payload", {})
+    metadata = data.get("metadata", {})
+    if not isinstance(payload, dict) or not isinstance(metadata, dict):
+        raise ValueError("intent payload and metadata must be JSON objects")
     return Intent(
         schema_version=data.get("schema_version", "0.3"),
         principal_id=data["principal_id"],
@@ -91,15 +150,16 @@ def parse_intent(data: dict[str, Any]) -> Intent:
         grant_version=_int(data["grant_version"], "grant_version"),
         primitive=EconomicPrimitive(data["primitive"]),
         venue=data["venue"],
-        created_at=_dt(data["created_at"]),
-        expires_at=_dt(data["expires_at"]),
-        payload=data.get("payload", {}),
-        metadata=data.get("metadata", {}),
+        created_at=_required_dt(data["created_at"], "created_at"),
+        expires_at=_required_dt(data["expires_at"], "expires_at"),
+        payload=payload,
+        metadata=metadata,
     )
 
 
 def parse_grant(data: dict[str, Any]) -> CapabilityGrant:
-    raw_limits = data.get("limits", {})
+    data = _document(data, "capability grant", _GRANT_FIELDS)
+    raw_limits = _document(data.get("limits", {}), "capability grant limits", _LIMIT_FIELDS)
     limits = CapabilityLimits(
         max_order_usd=_dec(raw_limits.get("max_order_usd")),
         max_position_usd=_dec(raw_limits.get("max_position_usd")),
@@ -132,8 +192,9 @@ def parse_grant(data: dict[str, Any]) -> CapabilityGrant:
 
 
 def parse_risk(data: dict[str, Any]) -> RiskSnapshot:
+    data = _document(data, "risk snapshot", _RISK_FIELDS)
     return RiskSnapshot(
-        observed_at=_dt(data["observed_at"]),
+        observed_at=_required_dt(data["observed_at"], "observed_at"),
         state_version=_int(data.get("state_version", 1), "state_version"),
         scope=str(data.get("scope", "portfolio")),
         position_after_usd=_dec(data.get("position_after_usd")),

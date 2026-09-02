@@ -8,7 +8,7 @@ from threading import RLock
 from typing import Callable
 
 from .adapters import AdapterSecurityProfile, DeterministicFailure, REFERENCE_SAFE_PROFILE
-from .canonical import canonical_hash, canonical_json
+from .canonical import canonical_hash, canonical_json, parse_bounded_decimal
 from .models import EconomicPrimitive, ExecutionReceipt, ExecutionRequest, SettlementRecord, SettlementStatus, SignedExecutionPermit, utcnow
 from .permits import ExecutionPermitVerifier
 
@@ -70,9 +70,11 @@ class PaperTradingVenue:
                 raise DeterministicFailure("permit rejected:" + ",".join(reasons))
 
             p = intent.payload
-            notional = Decimal(str(p.get("amount_usd", p.get("notional_usd", "0"))))
-            if notional <= 0 and intent.primitive != EconomicPrimitive.CANCEL_ORDER:
-                raise DeterministicFailure("paper notional must be positive")
+            notional = parse_bounded_decimal(p.get("amount_usd", p.get("notional_usd")))
+            if intent.primitive == EconomicPrimitive.CANCEL_ORDER:
+                notional = notional if notional is not None else Decimal("0")
+            elif notional is None or notional <= 0:
+                raise DeterministicFailure("paper notional must be a positive bounded decimal")
 
             fill: dict[str, str] = {"notional_usd": format(notional, "f")}
             if intent.primitive in {EconomicPrimitive.BUY, EconomicPrimitive.PLACE_ORDER}:
@@ -115,6 +117,10 @@ class PaperTradingVenue:
             return self._effects.get(self._key(intent))
 
     def reconcile(self, intent: ExecutionRequest) -> SettlementRecord:
+        """Venue-side read path. The supported independent verifier is
+        `MockSettlementVerifier`; this mirrors its request-binding check so a
+        thin wrapper around it cannot be handed a FINALIZED record bound to a
+        payload other than the one that produced the effect."""
         with self._lock:
             receipt = self._effects.get(self._key(intent))
             request_hash = canonical_hash(intent)
@@ -122,6 +128,16 @@ class PaperTradingVenue:
                 return SettlementRecord(
                     SettlementStatus.NONE, evidence={"venue": self.name}, authoritative=True,
                     verified_request_hash=request_hash,
+                )
+            observed = receipt.evidence.get("request_hash")
+            if observed != request_hash:
+                return SettlementRecord(
+                    SettlementStatus.CONTRADICTORY,
+                    evidence={
+                        "venue": self.name, "reason": "observed-effect-request-binding-mismatch",
+                        "observed_request_hash": observed, "expected_request_hash": request_hash,
+                    },
+                    authoritative=True, verified_request_hash=request_hash,
                 )
             return SettlementRecord(
                 SettlementStatus.FINALIZED, effect_id=receipt.effect_id, amount_usd=receipt.amount_usd,

@@ -4,14 +4,90 @@
   "title": "FAAR Trusted Input Attestation",
   "type": "object",
   "additionalProperties": false,
-  "required": ["kind", "key_id", "subject_hash", "intent_hash", "issued_at", "expires_at", "mac"],
+  "required": [
+    "kind",
+    "key_id",
+    "algorithm",
+    "subject_hash",
+    "intent_hash",
+    "issued_at",
+    "expires_at",
+    "signature"
+  ],
   "properties": {
-    "kind": {"enum": ["AUTHORITY", "RISK", "TASK"]},
-    "key_id": {"type": "string", "minLength": 1, "maxLength": 128},
-    "subject_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-    "intent_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-    "issued_at": {"type": "string", "format": "date-time"},
-    "expires_at": {"type": "string", "format": "date-time"},
-    "mac": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
-  }
+    "kind": {
+      "enum": [
+        "AUTHORITY",
+        "RISK",
+        "TASK"
+      ]
+    },
+    "key_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "algorithm": {
+      "enum": [
+        "ED25519",
+        "HMAC_SHA256"
+      ]
+    },
+    "subject_hash": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "intent_hash": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "issued_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "expires_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "signature": {
+      "type": "string",
+      "minLength": 64,
+      "maxLength": 128,
+      "description": "ED25519: unpadded base64url of the 64-byte signature (86 chars). HMAC_SHA256 (compatibility only): 64 lowercase hex chars."
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "algorithm": {
+            "const": "ED25519"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "signature": {
+            "pattern": "^[A-Za-z0-9_-]{86}$"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "algorithm": {
+            "const": "HMAC_SHA256"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "signature": {
+            "pattern": "^[0-9a-f]{64}$"
+          }
+        }
+      }
+    }
+  ]
 }

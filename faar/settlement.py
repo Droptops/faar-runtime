@@ -106,12 +106,29 @@ class QuorumSettlementVerifier:
 
     @staticmethod
     def _fact(record: SettlementRecord) -> tuple[str, str | None, str | None]:
-        amount = None if record.amount_usd is None else format(record.amount_usd, "f")
+        # Vote on the numeric value, not its textual scale: Decimal("50") and
+        # Decimal("50.00") from two honest sources are one fact, not a contradiction.
+        amount = None if record.amount_usd is None else format(record.amount_usd.normalize(), "f")
         return record.status.value, record.effect_id, amount
 
     def verify(self, request: ExecutionRequest) -> SettlementRecord:
         expected_hash = canonical_hash(request)
-        records = [source.verify(request) for source in self.sources]
+        # One unreachable minority source must not wedge an intent whose effect a
+        # quorum of healthy sources can attest. A raising source contributes a
+        # non-authoritative UNKNOWN, exactly like a source that answers "I don't
+        # know"; it can never contribute to a positive or negative quorum.
+        observations: list[tuple[str, SettlementRecord]] = []
+        errors: dict[str, str] = {}
+        for source in self.sources:
+            try:
+                observations.append((source.name, source.verify(request)))
+            except Exception as exc:
+                errors[source.name] = type(exc).__name__
+                observations.append((source.name, SettlementRecord(
+                    SettlementStatus.UNKNOWN, evidence={"verifier": source.name, "error": type(exc).__name__},
+                    authoritative=False,
+                )))
+        records = [record for _, record in observations]
         counts: dict[tuple[str, str | None, str | None], int] = {}
         binding_mismatches = 0
         for record in records:
@@ -122,51 +139,68 @@ class QuorumSettlementVerifier:
                 continue
             fact = self._fact(record)
             counts[fact] = counts.get(fact, 0) + 1
-        if not counts:
-            if binding_mismatches:
-                return SettlementRecord(
-                    SettlementStatus.CONTRADICTORY,
-                    evidence={"quorum": "request-binding-mismatch", "mismatches": binding_mismatches},
-                    authoritative=True,
-                    verified_request_hash=expected_hash,
-                )
-            return SettlementRecord(SettlementStatus.UNKNOWN, evidence={"quorum": "no-authoritative-facts"}, authoritative=False)
-        # Reaching quorum is necessary but not sufficient. If two DISTINCT
-        # authoritative facts each reach quorum (e.g. a 2-2 split with quorum=2),
-        # settlement is genuinely contested and must fail closed, not be resolved
-        # by whichever fact `max` happens to visit first.
-        quorum_facts = [fact for fact, count in counts.items() if count >= self.quorum]
-        if len(quorum_facts) > 1:
+        facts = [self._fact(r) for r in records]
+        if binding_mismatches or len(counts) > 1:
+            # Two distinct authoritative facts (a 2-2 split is the canonical case), or
+            # an authoritative record bound to another request, is a contested
+            # settlement: fail closed whether or not any fact reached quorum.
             return SettlementRecord(
                 SettlementStatus.CONTRADICTORY,
                 evidence={
-                    "quorum": "multiple-facts-reached-quorum",
+                    "quorum": "request-binding-mismatch" if binding_mismatches and len(counts) <= 1 else "contested",
                     "required": self.quorum,
-                    "facts": [self._fact(r) for r in records],
+                    "facts": facts,
                     "binding_mismatches": binding_mismatches,
+                    "errors": errors,
                 },
                 authoritative=True,
                 verified_request_hash=expected_hash,
             )
-        fact, count = max(counts.items(), key=lambda kv: kv[1])
-        if count < self.quorum:
+        if not counts:
             return SettlementRecord(
-                SettlementStatus.CONTRADICTORY,
+                SettlementStatus.UNKNOWN, evidence={"quorum": "no-authoritative-facts", "errors": errors}, authoritative=False,
+            )
+        ((fact, count),) = counts.items()
+        if count < self.quorum:
+            # One uncontested fact short of quorum (the other sources were unreachable
+            # or non-authoritative) is insufficient evidence, not a contradiction. A
+            # weak UNKNOWN keeps the intent retriable; CONTRADICTORY would terminally
+            # STOP an intent whose effect exists on a single transient source error.
+            return SettlementRecord(
+                SettlementStatus.UNKNOWN,
                 evidence={
-                    "quorum": count, "required": self.quorum,
-                    "facts": [self._fact(r) for r in records],
-                    "binding_mismatches": binding_mismatches,
+                    "quorum": "quorum-not-reached", "votes": count, "required": self.quorum,
+                    "fact": list(fact), "facts": facts, "errors": errors,
                 },
-                authoritative=True,
-                verified_request_hash=expected_hash,
+                authoritative=False,
             )
         status = SettlementStatus(fact[0])
         amount = Decimal(fact[2]) if fact[2] is not None else None
+        # Carry the agreeing sources' evidence forward so definition-of-done
+        # criteria that address venue evidence (fill quantities, assets) remain
+        # evaluable behind a quorum. Identical evidence is merged at the top level;
+        # per-source evidence is always available under `source_evidence`. The
+        # runtime-owned standard fields (effect_id, amount_usd, status) still
+        # override same-named evidence keys at outcome evaluation.
+        agreeing = [
+            (name, record) for name, record in observations
+            if record.authoritative and record.verified_request_hash == expected_hash and self._fact(record) == fact
+        ]
+        evidence: dict = {}
+        if agreeing and len({canonical_hash(record.evidence) for _, record in agreeing}) == 1:
+            evidence.update(dict(agreeing[0][1].evidence))
+        evidence.update({
+            "quorum": count,
+            "required": self.quorum,
+            "sources": [s.name for s in self.sources],
+            "source_evidence": {name: dict(record.evidence) for name, record in agreeing},
+            "errors": errors,
+        })
         return SettlementRecord(
             status=status,
             effect_id=fact[1],
             amount_usd=amount,
-            evidence={"quorum": count, "required": self.quorum, "sources": [s.name for s in self.sources]},
+            evidence=evidence,
             authoritative=True,
             verified_request_hash=expected_hash,
         )

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import multiprocessing as mp
-import tempfile
 import unittest
 from dataclasses import replace
 from decimal import Decimal
@@ -9,7 +8,7 @@ from decimal import Decimal
 from faar.canonical import canonical_hash
 from faar.models import IntentState
 from faar.store import IntentBusy, SQLiteIntentStore
-from support import NOW, grant, intent, risk
+from support import NOW, grant, intent, risk, temp_file
 
 
 def _reserve_worker(path, grant_id, intent_id, risk_version, daily_cap, barrier, queue):
@@ -58,9 +57,57 @@ def _submit_worker(path, intent_id, barrier, queue):
         store.close()
 
 
+def _blocked_submit_worker(path, entered, go, queue):
+    """Process A: submits through a runtime whose adapter blocks until B signals."""
+    from faar.adapters import REFERENCE_SAFE_PROFILE, MockVenue
+    from faar.runtime import FAARRuntime
+    from faar.settlement import MockSettlementVerifier
+    from support import AUTH, attest_pair, permit_stack, trust, verification_trust
+
+    t = trust()
+    store = SQLiteIntentStore(path)
+    try:
+        permit_authority, permit_verifier = permit_stack(store, t)
+        inner = MockVenue(permit_verifier=permit_verifier, name="mock-dex", clock=lambda: NOW)
+
+        class Blocking:
+            name = "mock-dex"
+            security_profile = REFERENCE_SAFE_PROFILE
+
+            def execute(self, request, permit):
+                entered.set()
+                go.wait(10)  # the other process revokes while we sit here
+                return inner.execute(request, permit)  # venue checks the permit against the shared ledger
+
+        runtime = FAARRuntime(store, {"mock-dex": Blocking()}, verification_trust(t), permit_authority,
+                              {"mock-dex": MockSettlementVerifier(inner)}, clock=lambda: NOW, allow_test_time_override=True)
+        i = intent(intent_id="mp_revoke_000000000001")
+        aa, ra = attest_pair(t, i, AUTH, risk(), NOW)
+        result = runtime.process(i, AUTH, grant(), risk(), authority_attestation=aa, risk_attestation=ra, now=NOW)
+        queue.put((result.state.value, list(result.reason_codes), inner.successful_effect_count(i.intent_id),
+                   [e["payload"].get("message", "") for e in store.evidence(i.intent_id) if e["event_type"] == "adapter_rejection_untrusted"]))
+    finally:
+        store.close()
+
+
+def _revoke_worker(path, entered, go, queue):
+    """Process B: revokes the grant while A's adapter call is in flight."""
+    import time as _time
+    from support import PRINCIPAL
+    store = SQLiteIntentStore(path)
+    try:
+        entered.wait(10)
+        started = _time.monotonic()
+        store.set_grant_status(PRINCIPAL, "grant:test", 1, "REVOKED")
+        queue.put(("revoked", _time.monotonic() - started))
+    finally:
+        go.set()
+        store.close()
+
+
 class MultiProcessStoreTests(unittest.TestCase):
     def test_distinct_processes_cannot_oversubscribe_daily_budget(self):
-        f = tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False); f.close()
+        f = temp_file(self)
         parent = SQLiteIntentStore(f.name)
         tight = grant(
             grant_id="grant:mp-budget",
@@ -85,7 +132,7 @@ class MultiProcessStoreTests(unittest.TestCase):
         self.assertIn("ATOMIC_DAILY_TURNOVER_EXCEEDED", denied[0])
 
     def test_distinct_processes_cannot_both_begin_same_submission(self):
-        f = tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False); f.close()
+        f = temp_file(self)
         parent = SQLiteIntentStore(f.name)
         i = intent(intent_id="mp_submit_0000000000001")
         parent.register(i, canonical_hash(i))
@@ -109,7 +156,7 @@ class MultiProcessStoreTests(unittest.TestCase):
         finally:
             store.close()
     def test_durable_intent_lease_blocks_second_process(self):
-        f = tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False); f.close()
+        f = temp_file(self)
         parent = SQLiteIntentStore(f.name)
         i = intent(intent_id="mp_lease_00000000000001")
         parent.register(i, canonical_hash(i))
@@ -134,6 +181,31 @@ class MultiProcessStoreTests(unittest.TestCase):
                 self.assertIsNotNone(store.intent_lease(i.intent_id))
         finally:
             store.close()
+
+
+    def test_revocation_in_other_process_during_submission_prevents_effect(self):
+        # Release gate 6 / I-17 across processes: the in-process fence cannot stop
+        # a revoke issued elsewhere, so the durable epoch checked at permit
+        # consumption must refuse the in-flight attempt.
+        f = temp_file(self)
+        parent = SQLiteIntentStore(f.name)
+        parent.provision_grant(grant(), canonical_hash(grant()))
+        parent.close()
+        ctx = mp.get_context("spawn")
+        entered, go, queue = ctx.Event(), ctx.Event(), ctx.Queue()
+        a = ctx.Process(target=_blocked_submit_worker, args=(f.name, entered, go, queue))
+        b = ctx.Process(target=_revoke_worker, args=(f.name, entered, go, queue))
+        a.start(); b.start(); a.join(40); b.join(40)
+        self.assertEqual(0, a.exitcode); self.assertEqual(0, b.exitcode)
+        results = {}
+        for _ in range(2):
+            item = queue.get(timeout=5)
+            results["B" if item[0] == "revoked" else "A"] = item
+        self.assertLess(results["B"][1], 5.0, "revocation must not wait on another process's adapter call")
+        state, reasons, effects, rejections = results["A"]
+        self.assertIn(state, {"FAILED_SAFE", "STOPPED", "UNKNOWN"})
+        self.assertEqual(0, effects)
+        self.assertTrue(any("PERMIT_GRANT_NOT_ACTIVE" in r or "PERMIT_GRANT_EPOCH_STALE" in r for r in rejections), rejections)
 
 
 

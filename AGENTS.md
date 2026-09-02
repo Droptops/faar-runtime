@@ -15,9 +15,11 @@ FAAR is security-sensitive financial infrastructure. Optimize for invariant pres
 9. Security-relevant behavior changes require regression tests.
 10. Keep ConstraintGate/AAR evidence claims separate from FAAR runtime claims.
 11. Money-moving grants must remain bounded by construction; never interpret a missing financial limit as infinity.
-12. Execution adapters receive only `ExecutionRequest`; do not reintroduce full model metadata or policy objects into the credentialed executor boundary.
+12. Execution adapters receive only a sanitized `ExecutionRequest` plus a signed, narrowly scoped `ExecutionPermit`; do not reintroduce full model metadata, grant documents, or policy objects into the credentialed executor boundary, and never let a submitter receipt advance settlement.
 13. Positive settlement is not trusted merely because it is positive: effect identity, authority of the lookup, and economic amount must be checked.
-14. Do not add a real-money adapter until `docs/V0_2_RELEASE_GATES.md` is satisfied and independently reviewed.
+14. Do not add a real-money adapter until `docs/V0_2_RELEASE_GATES.md` is satisfied and independently reviewed; track status in `docs/GO_LIVE_CHECKLIST.md`.
+15. Never trust absence of an effect while a previous attempt's permit is still live, and never resolve an ambiguity window early to improve liveness.
+16. Every check that stops an economic effect needs a test that fails when the check is removed; map new attack classes in `evals/run_redteam.py`.
 
 ## Development order
 

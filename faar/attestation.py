@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import hashlib
 import hmac
 from datetime import datetime, timedelta
@@ -8,7 +9,18 @@ from collections.abc import Iterable
 from typing import Mapping, Protocol
 
 from .canonical import canonical_hash, canonical_json
-from .models import Attestation, AttestationAlgorithm, AttestationKind, Intent
+from .models import Attestation, AttestationAlgorithm, AttestationKind, Intent, KeyValidity
+
+
+ED25519_SIGNATURE_BYTES = 64
+ED25519_SIGNATURE_CHARS = 86  # unpadded base64url of 64 bytes
+_B64URL_TO_STD = str.maketrans("-_", "+/")
+
+
+# Upper bound on a single attestation's `expires_at - issued_at` accepted by the
+# Ed25519 verifiers. Signers normally mint 20-30 s artifacts; the bound exists so
+# that `KeyValidity.not_after` (judged on issued_at) caps a retired key's exposure.
+DEFAULT_MAX_ATTESTATION_LIFETIME_SECONDS = 86_400
 
 
 def has_signing_api(obj: object) -> bool:
@@ -18,6 +30,29 @@ def has_signing_api(obj: object) -> bool:
     not sufficient: a compromised verifier must not have an API that can mint.
     """
     return callable(getattr(obj, "sign", None))
+
+
+def encode_ed25519_signature(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def decode_ed25519_signature(signature: object) -> bytes | None:
+    """Strictly decode the one canonical encoding of an Ed25519 signature.
+
+    `urlsafe_b64decode` alone discards foreign characters, tolerates padding and
+    ignores trailing bits, so one signature would have many accepted encodings that
+    all hash differently. A verifier must accept exactly the encoding the signer
+    produced; anything else is treated as an invalid signature.
+    """
+    if not isinstance(signature, str) or len(signature) != ED25519_SIGNATURE_CHARS:
+        return None
+    try:
+        raw = base64.b64decode(signature.translate(_B64URL_TO_STD) + "==", validate=True)
+    except (binascii.Error, ValueError):
+        return None
+    if len(raw) != ED25519_SIGNATURE_BYTES or encode_ed25519_signature(raw) != signature:
+        return None
+    return raw
 
 
 class AttestationVerifier(Protocol):
@@ -170,20 +205,42 @@ class HMACTrustStore:
             reasons.append("ATTESTATION_SUBJECT_MISMATCH")
         if attestation.intent_hash != canonical_hash(intent):
             reasons.append("ATTESTATION_INTENT_MISMATCH")
+        # Skew tolerance applies to issuance drift only. Extending the signed
+        # expiry by the skew would lengthen the authority the signer granted.
         skew = timedelta(seconds=self.max_clock_skew_seconds)
         if attestation.issued_at > now + skew:
             reasons.append("ATTESTATION_FROM_FUTURE")
-        if now > attestation.expires_at + skew:
+        if now > attestation.expires_at:
             reasons.append("ATTESTATION_EXPIRED")
-        payload = _payload(
-            algorithm=attestation.algorithm, kind=attestation.kind, key_id=attestation.key_id,
-            subject_hash=attestation.subject_hash, intent_hash=attestation.intent_hash,
-            issued_at=attestation.issued_at, expires_at=attestation.expires_at,
-        )
+        try:
+            payload = _payload(
+                algorithm=attestation.algorithm, kind=attestation.kind, key_id=attestation.key_id,
+                subject_hash=attestation.subject_hash, intent_hash=attestation.intent_hash,
+                issued_at=attestation.issued_at, expires_at=attestation.expires_at,
+            )
+        except Exception:
+            reasons.append("ATTESTATION_MALFORMED")
+            return False, tuple(reasons)
         expected = hmac.new(key, payload, hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(expected, attestation.signature):
+        if not isinstance(attestation.signature, str) or not hmac.compare_digest(expected, attestation.signature):
             reasons.append("ATTESTATION_SIGNATURE_INVALID")
         return not reasons, tuple(reasons)
+
+
+def _normalize_validity(
+    key_ids: set[str], key_validity: Mapping[str, KeyValidity] | None
+) -> dict[str, KeyValidity]:
+    if not key_validity:
+        return {}
+    unknown = sorted(set(key_validity) - key_ids)
+    if unknown:
+        raise ValueError(f"key_validity references unknown keys: {unknown}")
+    out: dict[str, KeyValidity] = {}
+    for key_id, validity in key_validity.items():
+        if not isinstance(validity, KeyValidity):
+            raise ValueError(f"key_validity for {key_id} must be a KeyValidity")
+        out[str(key_id)] = validity
+    return out
 
 
 def _verify_ed25519_attestation(
@@ -196,6 +253,8 @@ def _verify_ed25519_attestation(
     intent: Intent,
     now: datetime,
     max_clock_skew_seconds: int,
+    key_validity: Mapping[str, KeyValidity] | None = None,
+    max_lifetime_seconds: int | None = None,
 ) -> tuple[bool, tuple[str, ...]]:
     reasons: list[str] = []
     if attestation.algorithm != AttestationAlgorithm.ED25519:
@@ -208,23 +267,40 @@ def _verify_ed25519_attestation(
         return False, tuple(reasons)
     if kind not in key_kinds.get(attestation.key_id, frozenset()):
         reasons.append("ATTESTATION_KEY_KIND_NOT_ALLOWED")
+    validity = (key_validity or {}).get(attestation.key_id)
+    if validity is not None:
+        rejection = validity.rejection(attestation.issued_at)
+        if rejection:
+            reasons.append("ATTESTATION_" + rejection)
     if attestation.subject_hash != canonical_hash(subject):
         reasons.append("ATTESTATION_SUBJECT_MISMATCH")
     if attestation.intent_hash != canonical_hash(intent):
         reasons.append("ATTESTATION_INTENT_MISMATCH")
+    # Skew tolerance applies to issuance drift only; the signed expiry is exact.
     skew = timedelta(seconds=max_clock_skew_seconds)
     if attestation.issued_at > now + skew:
         reasons.append("ATTESTATION_FROM_FUTURE")
-    if now > attestation.expires_at + skew:
+    if now > attestation.expires_at:
         reasons.append("ATTESTATION_EXPIRED")
-    payload = _payload(
-        algorithm=attestation.algorithm, kind=attestation.kind, key_id=attestation.key_id,
-        subject_hash=attestation.subject_hash, intent_hash=attestation.intent_hash,
-        issued_at=attestation.issued_at, expires_at=attestation.expires_at,
-    )
-    pad = "=" * (-len(attestation.signature) % 4)
+    # Bound the artifact's own lifetime. `KeyValidity.not_after` is judged on the
+    # signer-controlled `issued_at`; without this bound a back-dated, long-lived
+    # artifact from a retired (not revoked) key would verify indefinitely.
+    if max_lifetime_seconds is not None and attestation.expires_at - attestation.issued_at > timedelta(seconds=max_lifetime_seconds):
+        reasons.append("ATTESTATION_TTL_EXCEEDED")
     try:
-        raw = base64.urlsafe_b64decode(attestation.signature + pad)
+        payload = _payload(
+            algorithm=attestation.algorithm, kind=attestation.kind, key_id=attestation.key_id,
+            subject_hash=attestation.subject_hash, intent_hash=attestation.intent_hash,
+            issued_at=attestation.issued_at, expires_at=attestation.expires_at,
+        )
+    except Exception:
+        reasons.append("ATTESTATION_MALFORMED")
+        return False, tuple(reasons)
+    raw = decode_ed25519_signature(attestation.signature)
+    if raw is None:
+        reasons.append("ATTESTATION_SIGNATURE_INVALID")
+        return False, tuple(reasons)
+    try:
         public = key.public_key() if hasattr(key, "public_key") else key
         public.verify(raw, payload)
     except Exception:
@@ -247,18 +323,24 @@ class Ed25519TrustStore:
         *,
         key_kinds: Mapping[str, Iterable[AttestationKind]],
         max_clock_skew_seconds: int = 5,
+        key_validity: Mapping[str, KeyValidity] | None = None,
+        max_attestation_lifetime_seconds: int = DEFAULT_MAX_ATTESTATION_LIFETIME_SECONDS,
     ) -> None:
         if not keys:
             raise ValueError("at least one attestation key is required")
         self._keys = {str(k): v for k, v in keys.items()}
         self._key_kinds = _normalize_kinds(set(self._keys), key_kinds)
+        self._key_validity = _normalize_validity(set(self._keys), key_validity)
         capabilities = {hasattr(v, "sign") for v in self._keys.values()}
         if len(capabilities) != 1:
             raise ValueError("attestation trust store cannot mix private and public keys")
         self.can_sign = capabilities.pop()
         if max_clock_skew_seconds < 0:
             raise ValueError("max_clock_skew_seconds must be non-negative")
+        if max_attestation_lifetime_seconds <= 0:
+            raise ValueError("max_attestation_lifetime_seconds must be positive")
         self.max_clock_skew_seconds = max_clock_skew_seconds
+        self.max_attestation_lifetime_seconds = max_attestation_lifetime_seconds
 
     @classmethod
     def generate(
@@ -266,15 +348,26 @@ class Ed25519TrustStore:
         key_kinds: Mapping[str, Iterable[AttestationKind]],
         *,
         max_clock_skew_seconds: int = 5,
+        key_validity: Mapping[str, KeyValidity] | None = None,
+        max_attestation_lifetime_seconds: int = DEFAULT_MAX_ATTESTATION_LIFETIME_SECONDS,
     ) -> "Ed25519TrustStore":
         from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
         return cls(
             {str(k): Ed25519PrivateKey.generate() for k in key_kinds},
             key_kinds=key_kinds,
             max_clock_skew_seconds=max_clock_skew_seconds,
+            key_validity=key_validity,
+            max_attestation_lifetime_seconds=max_attestation_lifetime_seconds,
         )
 
-    def public_verifier(self) -> "Ed25519AttestationVerifier":
+    def public_verifier(
+        self,
+        *,
+        key_validity: Mapping[str, KeyValidity] | None = None,
+        max_attestation_lifetime_seconds: int | None = None,
+    ) -> "Ed25519AttestationVerifier":
+        """Verify-only projection. `key_validity` overrides the store's lifecycle map,
+        so a verifier can revoke or window a key without touching signing material."""
         public = {}
         for key_id, key in self._keys.items():
             if callable(getattr(key, "sign", None)) and not hasattr(key, "public_key"):
@@ -283,6 +376,11 @@ class Ed25519TrustStore:
         return Ed25519AttestationVerifier(
             public, key_kinds=self._key_kinds,
             max_clock_skew_seconds=self.max_clock_skew_seconds,
+            key_validity=self._key_validity if key_validity is None else key_validity,
+            max_attestation_lifetime_seconds=(
+                self.max_attestation_lifetime_seconds
+                if max_attestation_lifetime_seconds is None else max_attestation_lifetime_seconds
+            ),
         )
 
     def _kind_allowed(self, key_id: str, kind: AttestationKind) -> bool:
@@ -317,7 +415,7 @@ class Ed25519TrustStore:
             issued_at=issued_at, expires_at=expires_at,
         )
         raw = key.sign(payload)
-        signature = base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+        signature = encode_ed25519_signature(raw)
         return Attestation(
             kind, key_id, self.algorithm, subject_hash, intent_hash,
             issued_at, expires_at, signature,
@@ -336,11 +434,18 @@ class Ed25519TrustStore:
             self._keys, self._key_kinds, attestation,
             kind=kind, subject=subject, intent=intent, now=now,
             max_clock_skew_seconds=self.max_clock_skew_seconds,
+            key_validity=self._key_validity,
+            max_lifetime_seconds=self.max_attestation_lifetime_seconds,
         )
 
 
 class Ed25519AttestationVerifier:
-    """Public-key-only attestation verifier. No minting API and no private keys."""
+    """Public-key-only attestation verifier. No minting API and no private keys.
+
+    `key_validity` maps key ids to `KeyValidity` windows; keys absent from the map
+    are valid indefinitely (until removed). Rotation is done by adding the new key,
+    signing with it once its `not_before` has passed, and later revoking the old one.
+    """
 
     algorithm = AttestationAlgorithm.ED25519
 
@@ -350,6 +455,8 @@ class Ed25519AttestationVerifier:
         *,
         key_kinds: Mapping[str, Iterable[AttestationKind]],
         max_clock_skew_seconds: int = 5,
+        key_validity: Mapping[str, KeyValidity] | None = None,
+        max_attestation_lifetime_seconds: int = DEFAULT_MAX_ATTESTATION_LIFETIME_SECONDS,
     ) -> None:
         if not keys:
             raise ValueError("at least one attestation key is required")
@@ -357,9 +464,21 @@ class Ed25519AttestationVerifier:
             raise ValueError("attestation verifier cannot hold signing-capable private keys")
         self._keys = {str(k): v for k, v in keys.items()}
         self._key_kinds = _normalize_kinds(set(self._keys), key_kinds)
+        self._key_validity = _normalize_validity(set(self._keys), key_validity)
         if max_clock_skew_seconds < 0:
             raise ValueError("max_clock_skew_seconds must be non-negative")
+        if max_attestation_lifetime_seconds <= 0:
+            raise ValueError("max_attestation_lifetime_seconds must be positive")
         self.max_clock_skew_seconds = max_clock_skew_seconds
+        self.max_attestation_lifetime_seconds = max_attestation_lifetime_seconds
+
+    def with_key_validity(self, key_validity: Mapping[str, KeyValidity]) -> "Ed25519AttestationVerifier":
+        """A copy with an updated lifecycle map (e.g. after revoking a key)."""
+        return Ed25519AttestationVerifier(
+            self._keys, key_kinds=self._key_kinds,
+            max_clock_skew_seconds=self.max_clock_skew_seconds, key_validity=key_validity,
+            max_attestation_lifetime_seconds=self.max_attestation_lifetime_seconds,
+        )
 
     def verify(
         self,
@@ -374,4 +493,6 @@ class Ed25519AttestationVerifier:
             self._keys, self._key_kinds, attestation,
             kind=kind, subject=subject, intent=intent, now=now,
             max_clock_skew_seconds=self.max_clock_skew_seconds,
+            key_validity=self._key_validity,
+            max_lifetime_seconds=self.max_attestation_lifetime_seconds,
         )
