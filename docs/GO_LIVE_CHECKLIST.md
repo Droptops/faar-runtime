@@ -46,7 +46,7 @@ DEPLOYMENT and OPEN row is closed and the result has been independently reviewed
 | 6.4 | datastore failover | OPEN (not testable against SQLite; `STORE_CONTRACT.md` lists every guarantee a replacement must reproduce and the tests that check it) | `STORE_CONTRACT.md`; `evals/run_crash_injection.py`; `test_multiprocess` |
 | 6.5 | stale / malicious RPC or provider | DONE-IN-REPO (fail closed; a transient single-source error is retriable, a contest stops) | non-authoritative settlement tests, quorum tests |
 | 6.6 | revocation during submission | DONE-IN-REPO | fence and cross-process tests |
-| 6.7 | partial fill + cancellation race | DONE-IN-REPO (a cancel reporting no fill after a recorded fill STOPs; a fill after CANCELLED is a venue contract violation) / DEPLOYMENT | `test_partial_fills.test_cancel_reporting_no_fill_after_a_recorded_fill_stops`; `ADAPTER_CONTRACT.md` Part C |
+| 6.7 | partial fill + cancellation race | DONE-IN-REPO (a cancel reporting no fill after a recorded fill STOPs; a fill after CANCELLED is a venue contract violation) / DEPLOYMENT | `test_partial_fills.test_cancel_reporting_no_fill_after_a_recorded_fill_stops`; crash scenarios `contradictory_settlement_stop` and `fill_regression_stop`; `ADAPTER_CONTRACT.md` Part C |
 | 6.8 | venue returns changing identifiers / states | DONE-IN-REPO | effect continuity tests |
 | 7.1 | authenticated intent creation | DEPLOYMENT (ingress) | `THREAT_MODEL.md` intent-namespace section |
 | 7.2 | separately authorized provisioning / pause / resume / revoke | DEPLOYMENT (ingress); in-repo the runtime cannot provision or change lifecycle | `test_mutation_gaps.GrantProvisioningTests` |

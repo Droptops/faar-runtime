@@ -39,14 +39,17 @@ timeout_after_effect_successful_effects = 1
 `run_crash_injection.py` (`make crash`) spawns a worker that runs `process()` for
 one intent against a file-backed store and a file-backed mock venue, and kills it
 (`os._exit`) immediately before its N-th store call, for every N a clean run makes,
-in seven scenarios: success, timeout before the effect, timeout after the effect,
+in nine scenarios: success, timeout before the effect, timeout after the effect,
 ambiguous venue that later recovers, deterministic rejection, partial fill then
-cancel, open order then cancel. The parent recovers exactly as `docs/OPERATIONS.md` §2 says (clear the dead
+cancel, open order then cancel, contradictory settlement, and cumulative-fill
+regression. The parent recovers exactly as `docs/OPERATIONS.md` §2 says (clear the dead
 worker's lease with its owner token, process again with fresh attestations past the
-permit window) and asserts: at most one effect and two adapter calls, an effect
-implies `FINALIZED` with usage `COMMITTED`, a terminal intent without an effect has
-released its budget unless the stop is settlement-derived, evidence verifies, and
-recovery never raises or ends non-terminal. Headline: 224 crash points, 0
+permit window) and asserts: at most one effect and the scenario-specific adapter-call
+ceiling; an uncontested effect implies `FINALIZED` with usage `COMMITTED`; a
+settlement contest or regressed cumulative fill implies `STOPPED` with the full
+budget `HELD`; other terminal intents release their budget unless the stop is
+settlement-derived; evidence verifies; and recovery never raises or ends
+non-terminal. Headline: 309 crash points, 0
 violations. This is a statement about the reference store and mock venue, not a
 proof.
 

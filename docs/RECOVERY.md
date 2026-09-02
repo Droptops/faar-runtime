@@ -149,10 +149,12 @@ authority. The default reference limit is intentionally small.
 `FINALIZED` and the usage commit are one store transaction, as are every
 terminal transition and its release. `evals/run_crash_injection.py` (`make crash`)
 kills a worker process immediately before each store call a clean run makes, for
-seven scenarios (success, timeout before and after the effect, ambiguous venue,
-deterministic rejection, partial fill then cancel), then recovers exactly as
-`OPERATIONS.md` §2 prescribes and asserts: at most one effect and two adapter
-calls, an effect implies `FINALIZED` with usage `COMMITTED`, a terminal intent
-without an effect has released its budget (unless the stop is settlement-derived),
-and recovery never raises or ends non-terminal. A replay of a `FINALIZED` intent
+nine scenarios (success, timeout before and after the effect, ambiguous venue,
+deterministic rejection, partial fill then cancel, open order then cancel,
+contradictory settlement, and cumulative-fill regression), then recovers exactly
+as `OPERATIONS.md` §2 prescribes and asserts: at most one effect and the
+scenario-specific adapter-call ceiling; an uncontested effect implies `FINALIZED`
+with usage `COMMITTED`; a settlement contest or fill regression stays `STOPPED`
+with usage `HELD`; other terminal intents release their budget unless the stop is
+settlement-derived; and recovery never raises or ends non-terminal. A replay of a `FINALIZED` intent
 whose budget is still `HELD` (a row written by an older version) commits it.

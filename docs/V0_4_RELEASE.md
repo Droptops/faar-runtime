@@ -53,7 +53,7 @@ Current `make check` headline results:
 | Seeded fuzz scenarios | 96; 0 duplicate-effect violations; 0 aggregate-budget violations |
 | Bounded permit model | 3940 states, 10047 transitions, 0 violations; stale permit unconsumable after revoke and after halt/resume; 223 violations without the permit-window rule, 399 without the consumed-permit ledger check |
 | Demo | mock execution FINALIZED once; keyed evidence chain and head commitment valid |
-| Crash injection | 224 worker kills before every store call across 7 scenarios; 0 duplicate effects, 0 lost effects, 0 stranded budget, every recovery terminal |
+| Crash injection | 309 worker kills before every store call across 9 scenarios; 0 duplicate effects, 0 unsafe budget releases, every recovery terminal; settlement contests/regressions stop with the budget held |
 
 ## Claim boundary
 
