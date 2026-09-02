@@ -80,6 +80,7 @@ def intent(**changes):
             "to_asset": "MEME",
             "amount_usd": "50",
             "target": "router:approved",
+            "max_slippage_bps": 50,
         },
     )
     return replace(base, **changes)

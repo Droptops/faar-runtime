@@ -31,6 +31,12 @@ These are the exact `RiskSnapshot` field names (`faar/models.py`) and the keys o
 `schemas/risk-snapshot.schema.json`. `parse_risk` rejects any other key, so a
 misspelled field is an error rather than a silently ignored control.
 
+`requested_slippage_bps` and `price_impact_bps` are the signer's claims about the
+snapshot; they gate the decision but are not enforced at the venue. The
+execution-side bound is the payload's `max_slippage_bps` (or an order's
+`limit_price`), which a slippage-capped grant requires and which travels in the
+permit-bound request (`ADAPTER_CONTRACT.md` A1, I-39).
+
 ## Versioning invariant
 
 For a `(grant_id, version, scope)`:

@@ -66,11 +66,11 @@ Before resubmission, FAAR rechecks intent expiry, grant expiry/status, signed au
 
 ## I-13 — Aggregate usage is atomic
 
-Turnover and velocity constraints are reserved transactionally across distinct intents. Both are trailing windows (24 h and `action_window_seconds`), never calendar buckets. A money-moving intent whose amount cannot be parsed as a bounded decimal cannot reserve.
+Turnover and velocity constraints are reserved transactionally across distinct intents. Both are trailing windows (24 h and `action_window_seconds`), never calendar buckets, and both span every version of a grant id (a new version never restarts a budget). Velocity bounds venue actions, not effects: an attempt that reached a venue keeps its slot for the window even after its budget was released. A money-moving intent whose amount cannot be parsed as a bounded decimal cannot reserve.
 
 ## I-14 — Risk state is single-consumption and monotonic
 
-A `(grant_id, version, risk_scope, state_version)` authorizes at most one new economic intent, and a version older than one already consumed by any intent or retry is refused in both ledgers.
+A `(grant_id, version, risk_scope, state_version)` authorizes at most one new economic intent, a version older than one already consumed by any intent or retry is refused in both ledgers, and reservation refuses the exact version another intent's retry bound in the permit ledger (`RISK_STATE_VERSION_ALREADY_CLAIMED`).
 
 ## I-15 — Upstream decisions are intent-bound
 
@@ -86,7 +86,7 @@ In-process: once `set_grant_status(REVOKED)` returns, no later adapter submissio
 
 ## I-18 — Malformed numeric/time data fails closed
 
-NaN, infinity, invalid negative ages/limits, naive timestamps, impossible TTLs, over-long identifiers, oversized integers, non-canonical numeric strings, and amounts beyond canonical precision/exponent bounds cannot be interpreted as a permissive value or exhaust memory.
+NaN, infinity, invalid negative ages/limits, naive timestamps, impossible TTLs, over-long identifiers, oversized integers, non-canonical numeric strings and numbers (a JSON number is admitted only when its shortest form satisfies the string grammar), and amounts beyond canonical precision/exponent bounds cannot be interpreted as a permissive value. Every untrusted document is bounded in nodes, depth and bytes (`MAX_CANONICAL_TOTAL_BYTES`) while it is frozen, so it cannot exhaust memory before it is rejected; gate reason codes never carry payload content verbatim, and the store refuses oversized reason-code lists and evidence rows.
 
 ## I-19 — Evidence is append-linked and head-committed
 
@@ -158,7 +158,7 @@ Attestation keys and permit signers carry optional validity windows and a revoca
 
 ## I-35 — Partial fills and cancellations never create a second attempt
 
-An authoritative `PARTIALLY_FILLED` record confirms the intent with the order's effect id and is reconciled again later; the unfilled remainder is never resubmitted. `CANCELLED` is terminal: with a fill it finalizes the intent, without one it fails safe and releases the budget, and it never contradicts a recorded fill silently (`test_partial_fills`).
+An authoritative `PARTIALLY_FILLED` record confirms the intent with the order's effect id and is reconciled again later; a zero cumulative amount is an admitted, open order (`SETTLEMENT_ORDER_OPEN`); the unfilled remainder is never resubmitted. The last accepted cumulative fill is persisted and never decreases (`SETTLEMENT_FILL_REGRESSED`). `CANCELLED` is terminal: with a fill it finalizes the intent, without one it fails safe and releases the budget (unless the record carries another intent's order identity, `EFFECT_ID_ALREADY_CLAIMED`), and it never contradicts a recorded fill silently (`test_partial_fills`, `test_economic_redteam`).
 
 ## I-36 — Abandoned adapter calls are bounded
 
@@ -171,3 +171,11 @@ An operator cap on trailing-window turnover per scope (`global`, `principal:<id>
 ## I-38 — Every persistence boundary is crash-safe
 
 Finalize-and-commit and terminalize-and-release are single store transactions, and a worker killed before any store call can be recovered by the documented runbook without a duplicate effect, a lost effect, or stranded budget (`evals/run_crash_injection.py`).
+
+## I-39 — A slippage cap is an execution-side bound
+
+When a grant sets `max_slippage_bps`, every SWAP/BUY/SELL/PLACE_ORDER request must carry `max_slippage_bps` (orders may carry `limit_price` instead), typed and no looser than the cap; the bound is part of the sanitized request and therefore of the permit's request hash, so the adapter cannot drop it without invalidating the permit. `RiskSnapshot.requested_slippage_bps` remains a signer claim about the snapshot (`test_economic_redteam.ExecutorSideSlippageBoundTests`).
+
+## I-40 — Terminal means no live capability and no forgotten block
+
+Every terminal stop voids the attempt's unconsumed permits before the transition, so a queued or late venue call cannot create an effect the ledger no longer attributes; the durable deterministic-failure block binds every entry point and travels with the row through `RECONCILING` (`test_state_machine_redteam`).

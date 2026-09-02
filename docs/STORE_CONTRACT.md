@@ -26,8 +26,8 @@ the single txn whose commit order decides a race.
 | Method | Guarantee | Notes |
 |---|---|---|
 | `register(intent, hash)` | First writer wins per `intent_id`; a different canonical hash or another principal under the same id is `IntentConflict`, never a replacement. Writes the `intent_registered` evidence event in the same txn. | I-1, I-2, I-29 |
-| `transition(id, expected, new, *, reason_codes, effect_id, release_usage, commit_usage, ambiguity_until)` | Compare-and-set on the stored state; only transitions in `_ALLOWED_TRANSITIONS`; `release_usage`/`commit_usage` update the reservation in the same txn; setting `effect_id` enforces uniqueness per `(venue, effect_id)` (`EffectConflict`). **LP** for terminalization. | I-3, I-11, I-38 |
-| `begin_submission(id, expected, *, max_attempts)` | CAS into SUBMITTED and increment the durable attempt counter atomically; resets `ambiguity_until`; refuses past the attempt limit. **LP** for "an attempt began". | I-5 |
+| `transition(id, expected, new, *, reason_codes, effect_id, release_usage, commit_usage, ambiguity_until, filled_amount_usd)` | Compare-and-set on the stored state; only transitions in `_ALLOWED_TRANSITIONS`; `release_usage`/`commit_usage` update the reservation in the same txn; setting `effect_id` enforces uniqueness per `(venue, effect_id)` (`EffectConflict`); `filled_amount_usd` records the last accepted cumulative fill; refuses an oversized reason-code list (`EvidenceRecordTooLarge`). **LP** for terminalization. | I-3, I-11, I-35, I-38 |
+| `begin_submission(id, expected, *, max_attempts)` | CAS into SUBMITTED and increment the durable attempt counter atomically; resets `ambiguity_until`; marks the reservation `submitted` (it keeps counting against velocity after any release); refuses past the attempt limit. **LP** for "an attempt began". | I-5, I-13 |
 | `get(id)` | Reads the row; unknown ids raise `UnknownIntent`. | |
 | `intent_guard(id, wait_seconds)` | Durable per-intent lease recording owner token, host and pid: at most one worker inside an intent's state machine across processes; the same owner may re-acquire its own lease; a dead worker's lease is never taken over automatically (`IntentBusy`); `clear_stale_intent_lease` needs the exact owner token and refuses a live local owner unless forced; a busy datastore raises `StoreUnavailable`, never a bare driver error. | I-6, OPERATIONS §2 |
 
@@ -35,7 +35,7 @@ the single txn whose commit order decides a race.
 
 | Method | Guarantee | Notes |
 |---|---|---|
-| `reserve_usage(intent, grant, risk, now)` | One txn that checks and inserts: risk-state version uniqueness and monotonicity across both risk ledgers, trailing-window turnover over HELD+COMMITTED rows, sliding-window velocity, scope exposure caps; inserts the HELD reservation and the risk claim together. **LP** for aggregate limits. | I-13, I-37 |
+| `reserve_usage(intent, grant, risk, now)` | One txn that checks and inserts: risk-state version uniqueness (exact version in both ledgers) and monotonicity across both risk ledgers, trailing-window turnover over HELD+COMMITTED rows of every version of the grant id, sliding-window velocity over HELD+COMMITTED+submitted rows of every version, scope exposure caps; inserts the HELD reservation and the risk claim together. **LP** for aggregate limits. | I-13, I-14, I-37 |
 | `commit_usage(id)` / `release_usage(id)` | Idempotent status changes on the HELD row only. | |
 | `claim_permit_risk_state(...)` | Permit-time risk ledger: one state version per intent per scope, monotonic across intents. | I-14 |
 | `set_exposure_cap(scope, max)` / `exposure_caps()` | Caps are read inside `reserve_usage`'s txn; changing a cap requires the anchor on an anchored datastore. | I-37 |
@@ -58,7 +58,8 @@ the single txn whose commit order decides a race.
 
 | Method | Guarantee | Notes |
 |---|---|---|
-| `add_evidence(id, type, payload)` | Appends one hash-linked (and, when keyed, MAC'd) event and updates the signed head in the same txn; refuses when the tail no longer matches the head (`EvidenceIntegrityError`). | I-27 |
+| `add_evidence(id, type, payload)` | Appends one hash-linked (and, when keyed, MAC'd) event and updates the signed head in the same txn; refuses when the tail no longer matches the head (`EvidenceIntegrityError`) and refuses an oversized row (`EvidenceRecordTooLarge`). | I-27 |
+| `effect_owner(venue, effect_id)` | Read-only lookup of the intent that owns an effect id in a venue namespace. | I-11 |
 | `assert_evidence_appendable(id)` | Read-only pre-check the runtime runs before advancing state. | I-27 |
 | `evidence_status(id)` / `verify_evidence_chain(id)` | Single read txn; fails closed for unknown or deleted chains; distinguishes `head_missing` from tampering. | I-27 |
 | `rebuild_evidence_head(s)` | Operator-only; never adopts a chain that does not verify. | OPERATIONS §6 |

@@ -144,9 +144,15 @@ class PermitBoundaryTests(unittest.TestCase):
 
         i2 = intent(intent_id="permit_risk_thief_000000001")
         self.store.register(i2, canonical_hash(i2))
-        # The legacy reservation ledger has not seen risk v21, so reservation can
-        # succeed; the permit-time risk ledger must still block cross-intent reuse.
+        # Both ledgers agree on ownership: the reservation ledger refuses the
+        # version the retry bound in the permit ledger (I-14) instead of letting a
+        # fresh intent burn a submission attempt on it.
         ok, reasons = self.store.reserve_usage(i2, self.grant, fresh, NOW)
+        self.assertFalse(ok)
+        self.assertIn("RISK_STATE_VERSION_ALREADY_CLAIMED", reasons)
+        # The permit-time ledger is an independent defence: a HELD reservation under
+        # a newer version still cannot mint a permit with the stolen one.
+        ok, reasons = self.store.reserve_usage(i2, self.grant, risk(state_version=22), NOW)
         self.assertTrue(ok, reasons)
         aa2, ra2 = attest_pair(self.trust, i2, AUTH, fresh, NOW)
         with self.assertRaises(PermitIssuanceError) as ctx:

@@ -92,6 +92,7 @@ def make_intent(iid: str, amount: int) -> Intent:
             "to_asset": "MEME",
             "amount_usd": str(amount),
             "target": "router:ok",
+            "max_slippage_bps": 50,
         },
     )
 

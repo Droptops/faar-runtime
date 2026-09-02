@@ -50,6 +50,12 @@ MAX_EFFECT_ID_CHARS = 512
 
 # Reason codes that durably block resubmission of an intent. They are persisted on
 # the intent row so the block survives across process() calls and worker restarts.
+# Abandoned adapter calls are counted per process (I-36): several runtimes over
+# one store (one per venue, per worker thread, or per CLI request) must not each
+# accept the cap on their own.
+_ORPHAN_LOCK = threading.Lock()
+_ORPHANED = [0]
+
 _DETERMINISTIC_FAILURE_BLOCK = "EXECUTION_DETERMINISTIC_FAILURE"
 _RESUBMIT_BLOCKING_REASONS = frozenset({
     _DETERMINISTIC_FAILURE_BLOCK,
@@ -124,8 +130,6 @@ class FAARRuntime:
         # Each one is a possible in-flight effect and a leaked thread; past this
         # many, the process stops submitting until they drain.
         self.max_orphaned_adapter_calls = max_orphaned_adapter_calls
-        self._orphan_lock = threading.Lock()
-        self._orphaned = 0
         if adapter_deadline_seconds is not None and not adapter_deadline_seconds > 0:
             raise ValueError("adapter_deadline_seconds must be positive or None")
         # Bounded adapter calls: a hung venue call must not hold the per-grant
@@ -175,18 +179,18 @@ class FAARRuntime:
             except BaseException as exc:  # propagated to the caller below
                 outcome["error"] = exc
             finally:
-                with self._orphan_lock:
+                with _ORPHAN_LOCK:
                     done.set()
                     if state["orphaned"]:
-                        self._orphaned -= 1
+                        _ORPHANED[0] -= 1
 
         worker = threading.Thread(target=run, name=f"faar-adapter-{request.intent_id}", daemon=True)
         worker.start()
         if not done.wait(self.adapter_deadline_seconds):
-            with self._orphan_lock:
+            with _ORPHAN_LOCK:
                 if not done.is_set():
                     state["orphaned"] = True
-                    self._orphaned += 1
+                    _ORPHANED[0] += 1
                     raise AdapterDeadlineExceeded(
                         f"adapter call exceeded {self.adapter_deadline_seconds}s; request may still be in flight"
                     )
@@ -196,9 +200,9 @@ class FAARRuntime:
 
     @property
     def orphaned_adapter_calls(self) -> int:
-        """Adapter calls abandoned at the deadline that are still running."""
-        with self._orphan_lock:
-            return self._orphaned
+        """Adapter calls abandoned at the deadline that are still running in this process."""
+        with _ORPHAN_LOCK:
+            return _ORPHANED[0]
 
     @staticmethod
     def _ambiguity_window_closes_at(stored, grant: CapabilityGrant) -> datetime | None:
@@ -845,6 +849,14 @@ class FAARRuntime:
         previous_effect_id = stored.effect_id
         if stored.state in TERMINAL_STATES:
             return self._stored_result(stored, decisions=decisions, replayed=True)
+        # The durable resubmission block lives on the row (RT-44) and binds every
+        # entry point, not only process(): a bare reconcile() must neither retry
+        # nor rewrite the row without it.
+        if _block_reason is None and any(r in _RESUBMIT_BLOCKING_REASONS for r in stored.reason_codes):
+            _block_reason = _DETERMINISTIC_FAILURE_BLOCK
+            _allow_resubmit = False
+        durable_block = tuple(r for r in stored.reason_codes if r in _RESUBMIT_BLOCKING_REASONS)
+        recorded_fill = self._recorded_fill(stored)
         self.store.assert_evidence_appendable(intent.intent_id)
 
         # The presented grant must be the provisioned envelope, and the intent's
@@ -870,12 +882,18 @@ class FAARRuntime:
             )
 
         # Move to RECONCILING from every non-terminal execution state where legal.
+        # The durable block travels with the row through RECONCILING, so a worker
+        # that dies during the settlement lookup leaves it in place for the next.
         if stored.state == IntentState.CONFIRMED:
-            self.store.transition(intent.intent_id, IntentState.CONFIRMED, IntentState.RECONCILING)
+            self.store.transition(intent.intent_id, IntentState.CONFIRMED, IntentState.RECONCILING, reason_codes=durable_block)
         elif stored.state in {IntentState.RESERVED, IntentState.SUBMITTED, IntentState.UNKNOWN}:
-            self.store.transition(intent.intent_id, stored.state, IntentState.RECONCILING)
+            self.store.transition(intent.intent_id, stored.state, IntentState.RECONCILING, reason_codes=durable_block)
         elif stored.state != IntentState.RECONCILING:
-            return self._stored_result(stored, decisions=decisions, replayed=True)
+            # PROPOSED/AUTHORIZED: nothing was submitted, process() is the entry
+            # point; say so instead of echoing an empty non-terminal result.
+            return self._stored_result(
+                stored, decisions=decisions, replayed=True, reason_codes=("RECONCILE_NOT_APPLICABLE_BEFORE_SUBMISSION",),
+            )
 
         verifier = self.settlement_verifiers[intent.venue]
         request = ExecutionRequest.from_intent(intent)
@@ -972,13 +990,36 @@ class FAARRuntime:
                 release_usage=False, replayed=True,
             )
 
+        # Cumulative fills never shrink. An authoritative amount below the last
+        # accepted one (venue bug, wrong-leg lookup, trade-id/order-id confusion)
+        # is contradictory history, not a newer truth: stop, budget held.
+        if (
+            settlement.authoritative and recorded_fill is not None and settlement.amount_usd is not None
+            and settlement.status in {
+                SettlementStatus.CONFIRMED, SettlementStatus.FINALIZED,
+                SettlementStatus.PARTIALLY_FILLED, SettlementStatus.CANCELLED,
+            }
+            and settlement.amount_usd < recorded_fill
+            # A cancel that reports nothing filled against a recorded fill keeps
+            # its own, more specific code below.
+            and not (settlement.status == SettlementStatus.CANCELLED and settlement.amount_usd == 0)
+        ):
+            return self._stop_execution_state(
+                intent.intent_id, ("SETTLEMENT_FILL_REGRESSED",), decisions, effect_id=previous_effect_id,
+                release_usage=False, replayed=True,
+                detail={
+                    "recorded_filled_amount_usd": format(recorded_fill, "f"),
+                    "reported_amount_usd": format(settlement.amount_usd, "f"),
+                },
+            )
+
         if settlement.status == SettlementStatus.FINALIZED:
             # Finalize and commit in one transaction: a crash between the two
             # would otherwise leave HELD budget on a FINALIZED intent forever.
             try:
                 self.store.transition(
                     intent.intent_id, IntentState.RECONCILING, IntentState.FINALIZED,
-                    effect_id=settlement.effect_id, commit_usage=True,
+                    effect_id=settlement.effect_id, commit_usage=True, filled_amount_usd=settlement.amount_usd,
                 )
             except EffectConflict:
                 return self._stop_execution_state(
@@ -987,33 +1028,40 @@ class FAARRuntime:
             return self._current_result(intent.intent_id, decisions=decisions, effect_id=settlement.effect_id, replayed=True)
         if settlement.status == SettlementStatus.CONFIRMED:
             try:
-                self.store.transition(intent.intent_id, IntentState.RECONCILING, IntentState.CONFIRMED, effect_id=settlement.effect_id)
+                self.store.transition(
+                    intent.intent_id, IntentState.RECONCILING, IntentState.CONFIRMED,
+                    effect_id=settlement.effect_id, filled_amount_usd=settlement.amount_usd,
+                )
             except EffectConflict:
                 return self._stop_execution_state(
                     intent.intent_id, ("EFFECT_ID_ALREADY_CLAIMED",), decisions, release_usage=False, replayed=True
                 )
             return self._current_result(intent.intent_id, decisions=decisions, effect_id=settlement.effect_id, replayed=True)
         if settlement.status == SettlementStatus.PARTIALLY_FILLED:
-            # An effect exists (the fill so far) and the order may fill further. The
-            # intent is CONFIRMED with that effect identity: reconciled again later,
-            # never resubmitted (a second attempt for the remainder would be a
-            # second order, I-3), budget held in full until the order is terminal.
+            # The order exists at the venue and may fill further. With a positive
+            # cumulative amount an effect exists (the fill so far); with zero the
+            # order is admitted and resting, nothing filled yet. Either way the
+            # intent is CONFIRMED with the order's effect identity: reconciled again
+            # later, never resubmitted (a second attempt for the remainder would be
+            # a second order, I-3), budget held in full until the order is terminal.
+            filled = settlement.amount_usd if settlement.amount_usd is not None else Decimal("0")
+            open_reason = "SETTLEMENT_PARTIAL_FILL_OPEN" if filled > 0 else "SETTLEMENT_ORDER_OPEN"
             try:
                 self.store.transition(
                     intent.intent_id, IntentState.RECONCILING, IntentState.CONFIRMED,
-                    reason_codes=("SETTLEMENT_PARTIAL_FILL_OPEN",), effect_id=settlement.effect_id,
+                    reason_codes=(open_reason,), effect_id=settlement.effect_id, filled_amount_usd=filled,
                 )
             except EffectConflict:
                 return self._stop_execution_state(
                     intent.intent_id, ("EFFECT_ID_ALREADY_CLAIMED",), decisions, release_usage=False, replayed=True
                 )
-            self.store.add_evidence(intent.intent_id, "partial_fill", {
+            self.store.add_evidence(intent.intent_id, "partial_fill" if filled > 0 else "order_open", {
                 "effect_id": settlement.effect_id,
-                "filled_amount_usd": format(settlement.amount_usd, "f") if settlement.amount_usd is not None else None,
+                "filled_amount_usd": format(filled, "f"),
             })
             return self._current_result(
                 intent.intent_id, decisions=decisions, effect_id=settlement.effect_id,
-                reason_codes=("SETTLEMENT_PARTIAL_FILL_OPEN",), replayed=True,
+                reason_codes=(open_reason,), replayed=True,
             )
         if settlement.status == SettlementStatus.CANCELLED:
             filled = settlement.amount_usd if settlement.amount_usd is not None else Decimal("0")
@@ -1025,7 +1073,7 @@ class FAARRuntime:
                     self.store.transition(
                         intent.intent_id, IntentState.RECONCILING, IntentState.FINALIZED,
                         reason_codes=("SETTLEMENT_CANCELLED_AFTER_PARTIAL_FILL",), effect_id=settlement.effect_id,
-                        commit_usage=True,
+                        commit_usage=True, filled_amount_usd=filled,
                     )
                 except EffectConflict:
                     return self._stop_execution_state(
@@ -1038,13 +1086,25 @@ class FAARRuntime:
                     intent.intent_id, decisions=decisions, effect_id=settlement.effect_id,
                     reason_codes=("SETTLEMENT_CANCELLED_AFTER_PARTIAL_FILL",), replayed=True,
                 )
-            if previous_effect_id is not None:
+            if previous_effect_id is not None and (recorded_fill is None or recorded_fill > 0):
                 # A fill was recorded earlier and the venue now reports nothing
-                # filled: contradictory history, a human decides.
+                # filled: contradictory history, a human decides. (An order that
+                # was recorded as open with nothing filled may be cancelled.)
                 return self._stop_execution_state(
                     intent.intent_id, ("SETTLEMENT_CANCEL_CONTRADICTS_RECORDED_EFFECT",), decisions,
                     effect_id=previous_effect_id, release_usage=False, replayed=True,
                 )
+            if settlement.effect_id is not None:
+                # The order identity belongs to this intent or to nobody. A cancel
+                # record carrying another intent's effect id at this venue is
+                # identity evidence that contradicts the venue namespace (I-11),
+                # not proof that nothing happened here.
+                owner = self.store.effect_owner(intent.venue, settlement.effect_id)
+                if owner is not None and owner != intent.intent_id:
+                    return self._stop_execution_state(
+                        intent.intent_id, ("EFFECT_ID_ALREADY_CLAIMED",), decisions,
+                        effect_id=previous_effect_id, release_usage=False, replayed=True,
+                    )
             # Cancelled before any fill: no economic effect, terminal at the venue.
             # The intent ends FAILED_SAFE with its budget released and is never
             # resubmitted under this id (a cancel/fill race at the venue is the
@@ -1058,13 +1118,16 @@ class FAARRuntime:
             self.store.transition(intent.intent_id, IntentState.RECONCILING, IntentState.FAILED_SAFE, reason_codes=reasons, release_usage=True)
             self.store.add_evidence(intent.intent_id, "cancelled_unfilled", {"effect_id": settlement.effect_id})
             return self._current_result(intent.intent_id, decisions=decisions, reason_codes=reasons, replayed=True)
-        if settlement.status in {SettlementStatus.UNKNOWN, SettlementStatus.CONTRADICTORY}:
-            state = IntentState.STOPPED if settlement.status == SettlementStatus.CONTRADICTORY else IntentState.UNKNOWN
-            reason = "SETTLEMENT_CONTRADICTORY" if settlement.status == SettlementStatus.CONTRADICTORY else "SETTLEMENT_UNKNOWN"
-            reasons = self._with_block(reason, _block_reason)
-            self.store.transition(intent.intent_id, IntentState.RECONCILING, state, reason_codes=reasons)
-            if state == IntentState.STOPPED:
-                self.store.add_evidence(intent.intent_id, "execution_stopped", {"reason_codes": list(reasons)})
+        if settlement.status == SettlementStatus.CONTRADICTORY:
+            # Terminal for a human; like every settlement-derived stop it voids the
+            # attempt's unconsumed permit so a late request cannot land afterwards.
+            return self._stop_execution_state(
+                intent.intent_id, self._with_block("SETTLEMENT_CONTRADICTORY", _block_reason), decisions,
+                effect_id=previous_effect_id, release_usage=False, replayed=True,
+            )
+        if settlement.status == SettlementStatus.UNKNOWN:
+            reasons = self._with_block("SETTLEMENT_UNKNOWN", _block_reason)
+            self.store.transition(intent.intent_id, IntentState.RECONCILING, IntentState.UNKNOWN, reason_codes=reasons)
             return self._current_result(intent.intent_id, decisions=decisions, reason_codes=reasons, replayed=True)
 
         if settlement.status == SettlementStatus.NONE:
@@ -1193,20 +1256,35 @@ class FAARRuntime:
             return None
         if actual_amount is None:
             return "SETTLED_AMOUNT_REQUIRED"
-        if not actual_amount.is_finite() or actual_amount <= 0:
+        if not actual_amount.is_finite() or actual_amount < 0:
             return "SETTLED_AMOUNT_INVALID"
         if status == SettlementStatus.PARTIALLY_FILLED:
+            # The cumulative fill of an open order: zero means admitted and
+            # resting, nothing filled yet.
             if intent.primitive.value == "PAY":
                 return "PAYMENT_PARTIAL_NOT_ALLOWED"
             if actual_amount > intended:
                 return "SETTLED_AMOUNT_EXCEEDS_AUTHORIZED"
             return None
+        if actual_amount == 0:
+            return "SETTLED_AMOUNT_INVALID"
         if intent.primitive.value == "PAY":
             if actual_amount != intended:
                 return "PAYMENT_AMOUNT_MISMATCH"
         elif actual_amount > intended:
             return "SETTLED_AMOUNT_EXCEEDS_AUTHORIZED"
         return None
+
+    @staticmethod
+    def _recorded_fill(stored) -> Decimal | None:
+        raw = getattr(stored, "filled_amount_usd", None)
+        if raw is None:
+            return None
+        try:
+            value = Decimal(str(raw))
+        except (ArithmeticError, ValueError, TypeError):
+            return None
+        return value if value.is_finite() and value >= 0 else None
 
     @staticmethod
     def _effect_integrity_reason(
@@ -1245,6 +1323,12 @@ class FAARRuntime:
         detail: dict | None = None,
     ) -> RuntimeResult:
         stored = self.store.get(intent_id)
+        # A terminal intent must not leave a live capability behind: a permit the
+        # venue has not consumed is voided first, so a queued or late request
+        # cannot create an effect the ledger can no longer attribute.
+        voided = self.store.void_unconsumed_permits(intent_id)
+        if voided:
+            self.store.add_evidence(intent_id, "permits_voided", {"count": voided})
         transitioned = False
         if stored.state not in TERMINAL_STATES and IntentState.STOPPED in self._allowed_from(stored.state):
             transitioned = self.store.transition(

@@ -107,9 +107,13 @@ when settlement is finalized.
 `SETTLEMENT_NONE_AFTER_PERMIT_CONSUMED` (the venue admitted the request but has
 no record of it), `SETTLEMENT_RECORD_MALFORMED`,
 `SETTLED_AMOUNT_*`, `PAYMENT_AMOUNT_MISMATCH`, `PAYMENT_PARTIAL_NOT_ALLOWED`,
-`EFFECT_ID_ALREADY_CLAIMED`, `SETTLED_EFFECT_ID_INVALID` and
+`EFFECT_ID_ALREADY_CLAIMED`, `SETTLED_EFFECT_ID_INVALID`, `SETTLEMENT_FILL_REGRESSED`
+(the venue reported a cumulative fill below one it reported earlier) and
 `SETTLEMENT_REQUEST_BINDING_MISMATCH` are terminal and keep the reservation HELD
-because an effect may exist that FAAR cannot attribute safely. These need a human:
+because an effect may exist that FAAR cannot attribute safely. Every such stop
+first voids the attempt's unconsumed permits (`permits_voided` in the evidence),
+so a venue request that lands later is refused with `PERMIT_VOIDED`; the ledger
+shows whether a permit was consumed before the stop. These need a human:
 reconcile at the venue, then decide whether to revoke the grant version. The
 trailing 24 h turnover window means the held amount stops counting on its own
 after a day; the velocity window ages it out after `action_window_seconds`.
@@ -119,6 +123,14 @@ after a day; the velocity window ages it out after `action_window_seconds`.
 All consumed authority lives in the store file: grant epochs, fence tokens,
 consumed permits, claimed risk states. Restoring an older copy resurrects all of
 it. Run the store with an authority anchor kept **outside** the backup set:
+
+Retention: nothing is purged automatically, and every per-intent lookup is
+indexed, so a large history is a disk-space matter rather than a latency one.
+When archiving, keep every intent whose usage row is inside the trailing
+turnover window (24 h) or whose grant's `action_window_seconds` has not passed,
+every non-terminal intent, and every row the evidence chain of a retained intent
+references; archive terminal intents older than that together with their
+evidence and permits, never by deleting rows from a live database.
 
 ```bash
 faar provision-grant --grant grant.json --db faar.sqlite --anchor /mnt/anchor/faar.anchor.json

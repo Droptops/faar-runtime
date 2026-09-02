@@ -29,7 +29,18 @@ Material changes require a new intent and a new authorization pass. Forbidden:
 
 The payload carries exactly one economic amount field; a BUY/SELL/PLACE_ORDER
 payload with both `amount_usd` and `notional_usd` is denied before the adapter
-sees it. Amount strings are plain ASCII decimals (`50`, `50.00`, `0.5`).
+sees it. Amounts are plain ASCII decimals (`50`, `50.00`, `0.5`); a JSON number
+is accepted only when its shortest form fits the same grammar.
+
+**Executor-side price bound.** When the grant sets `max_slippage_bps`, a
+SWAP/BUY/SELL/PLACE_ORDER payload carries `max_slippage_bps` (an integer, at most
+the grant's cap; orders may carry a positive decimal `limit_price` instead). The
+bound is part of the request hash the permit binds, so the adapter receives it
+unchanged and **must** enforce it at the venue (minimum output, limit price, or
+the venue's own slippage parameter) or refuse to execute. The risk snapshot's
+`requested_slippage_bps` is a signer claim and is not a substitute. The
+reference venues fill at a fixed reference price (zero slippage); a real
+adapter's review document states how the bound is enforced.
 
 ### A2. Stable logical identity
 
@@ -193,15 +204,19 @@ the order's effect id; `amount_usd` is the **cumulative** filled amount.
 
 | Verifier reports | Meaning at the venue | Runtime |
 |---|---|---|
-| `PARTIALLY_FILLED` | the order exists, has filled for `amount_usd` so far, and may fill further | `CONFIRMED` with that effect id (`SETTLEMENT_PARTIAL_FILL_OPEN`); reconciled again later; **never resubmitted**; usage HELD |
+| `PARTIALLY_FILLED`, amount > 0 | the order exists, has filled for `amount_usd` so far, and may fill further | `CONFIRMED` with that effect id (`SETTLEMENT_PARTIAL_FILL_OPEN`); reconciled again later; **never resubmitted**; usage HELD |
+| `PARTIALLY_FILLED`, amount 0 | the order is admitted and resting, nothing filled yet | `CONFIRMED` with that effect id (`SETTLEMENT_ORDER_OPEN`); reconciled again later; usage HELD |
+| any positive status, cumulative amount below the last accepted one | contradictory history (venue bug, wrong-leg lookup) | `STOPPED` (`SETTLEMENT_FILL_REGRESSED`); usage HELD |
 | `CANCELLED`, filled amount > 0 | terminal; the fill so far is the intent's one effect | `FINALIZED` (`SETTLEMENT_CANCELLED_AFTER_PARTIAL_FILL`); the authorized notional is committed |
-| `CANCELLED`, nothing filled, no fill recorded | terminal; no economic effect | `FAILED_SAFE` (`SETTLEMENT_CANCELLED_UNFILLED`); usage RELEASED; never resubmitted under this intent (a new intent is the caller's decision) |
+| `CANCELLED`, nothing filled, no fill recorded (an open order included) | terminal; no economic effect | `FAILED_SAFE` (`SETTLEMENT_CANCELLED_UNFILLED`); usage RELEASED; never resubmitted under this intent (a new intent is the caller's decision) |
+| `CANCELLED`, nothing filled, effect id owned by another intent at this venue | identity evidence contradicts the venue namespace | `STOPPED` (`EFFECT_ID_ALREADY_CLAIMED`); usage HELD |
 | `CANCELLED`, nothing filled, a fill was recorded earlier | contradictory history | `STOPPED` (`SETTLEMENT_CANCEL_CONTRADICTS_RECORDED_EFFECT`); usage HELD |
 | either, not authoritative | no weight | `UNKNOWN` (`SETTLEMENT_POSITIVE_NOT_AUTHORITATIVE` / `SETTLEMENT_CANCEL_NOT_AUTHORITATIVE`); usage HELD |
 
-Integrity rules: the filled amount must be finite, bounded by the authorized
-notional (`SETTLED_AMOUNT_EXCEEDS_AUTHORIZED`) and, for an open partial fill,
-positive; `PAY` cannot partially fill (`PAYMENT_PARTIAL_NOT_ALLOWED`); a missing
+Integrity rules: the filled amount must be finite, non-negative and bounded by
+the authorized notional (`SETTLED_AMOUNT_EXCEEDS_AUTHORIZED`); cumulative amounts
+never decrease across observations (the runtime persists the last accepted one);
+`PAY` cannot partially fill (`PAYMENT_PARTIAL_NOT_ALLOWED`); a missing
 effect id is `SETTLED_EFFECT_ID_REQUIRED`; a later authoritative `NONE` for a
 recorded partial fill is `SETTLEMENT_LOST_PREVIOUS_EFFECT`; a quorum votes on
 `(status, effect id, amount)`, so sources disagreeing about the filled amount or
@@ -224,8 +239,10 @@ Definition of done: a cancelled order never satisfies a task contract, even when
 the intent is `FINALIZED`, because the settlement status is not `FINALIZED`.
 
 The reference `MockVenue` implements this with `MockMode.PARTIAL_FILL`,
-`complete_fill()` and `cancel_order()`; `test/test_partial_fills.py` and the
-`partial_fill_then_cancel` scenario of `evals/run_crash_injection.py` exercise it.
+`MockMode.OPEN_ORDER`, `complete_fill()` and `cancel_order()` (a cancelled order
+never fills afterwards); `test/test_partial_fills.py`, `test/test_economic_redteam.py`
+and the `partial_fill_then_cancel` scenario of `evals/run_crash_injection.py`
+exercise it.
 
 ## Required review document
 

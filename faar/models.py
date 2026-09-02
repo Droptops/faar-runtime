@@ -47,6 +47,10 @@ def _require_mapping(name: str, value: object) -> None:
 # millions of nodes when copied; the shared budget makes the copy linear in what
 # the caller may legitimately send.
 MAX_CANONICAL_TOTAL_NODES = 10_000
+# Total UTF-8 bytes of string content (keys and values) one frozen structure may
+# carry. Node and string-length bounds alone admitted ~160 MB documents that were
+# canonicalised a dozen times and stored verbatim before any gate ran.
+MAX_CANONICAL_TOTAL_BYTES = 65_536
 # Upper bound on the canonical JSON size of an evidence payload accepted from a
 # settlement source or adapter and copied into the evidence chain.
 MAX_EVIDENCE_BYTES = 65_536
@@ -61,7 +65,7 @@ def _deep_freeze(value: Any, _depth: int = 0, _budget: list[int] | None = None) 
     memory/recursion denial of service.
     """
     if _budget is None:
-        _budget = [MAX_CANONICAL_TOTAL_NODES]
+        _budget = [MAX_CANONICAL_TOTAL_NODES, MAX_CANONICAL_TOTAL_BYTES]
     _budget[0] -= 1
     if _budget[0] < 0:
         raise ValueError("canonical data exceeds maximum total node count")
@@ -76,6 +80,9 @@ def _deep_freeze(value: Any, _depth: int = 0, _budget: list[int] | None = None) 
                 raise ValueError("mapping keys must be strings")
             if len(key) > MAX_CANONICAL_STRING_CHARS:
                 raise ValueError("canonical mapping key is too long")
+            _budget[1] -= len(key.encode("utf-8"))
+            if _budget[1] < 0:
+                raise ValueError("canonical data exceeds maximum total size")
             out[key] = _deep_freeze(item, _depth + 1, _budget)
         return MappingProxyType(out)
     if isinstance(value, (list, tuple)):
@@ -97,6 +104,9 @@ def _deep_freeze(value: Any, _depth: int = 0, _budget: list[int] | None = None) 
     if isinstance(value, str):
         if len(value) > MAX_CANONICAL_STRING_CHARS:
             raise ValueError("canonical string is too long")
+        _budget[1] -= len(value.encode("utf-8"))
+        if _budget[1] < 0:
+            raise ValueError("canonical data exceeds maximum total size")
         return value
     if isinstance(value, datetime):
         if not _aware(value):

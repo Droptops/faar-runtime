@@ -113,7 +113,9 @@ instant plus the grant's `max_clock_skew_seconds` has passed:
 When the window has closed and absence is about to be acted on, the runtime voids
 every unconsumed permit of the intent first (so a venue whose clock lags cannot
 consume it afterwards) and refuses to release or retry if the ledger shows a
-permit of the intent was consumed (`SETTLEMENT_NONE_AFTER_PERMIT_CONSUMED`).
+permit of the intent was consumed (`SETTLEMENT_NONE_AFTER_PERMIT_CONSUMED`). Every
+terminal stop voids the same way before it transitions, so no terminal intent
+leaves a live capability behind.
 
 - an authoritative `NONE` from the settlement verifier is **not** trusted
   (`SETTLEMENT_NONE_WITHIN_PERMIT_WINDOW`), the reservation stays HELD, and no

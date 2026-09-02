@@ -44,9 +44,11 @@ def parse_bounded_decimal(raw: object) -> Decimal | None:
     that is authorized, reserved, permitted and executed is one value. Returns
     None for anything that is not a finite, canonically serialisable amount:
     booleans, unsupported types, non-finite values, strings outside the plain
-    decimal grammar, and precisions/magnitudes beyond the canonical bounds (a
-    12-byte ``"1e-999999999"`` would otherwise make ``format(value, "f")``
-    allocate gigabytes).
+    decimal grammar, JSON numbers whose shortest form is outside that grammar
+    (exponents, more than 8 fractional digits, binary artefacts such as
+    ``0.30000000000000004``), and precisions/magnitudes beyond the canonical
+    bounds (a 12-byte ``"1e-999999999"`` would otherwise make
+    ``format(value, "f")`` allocate gigabytes).
     """
     if raw is None or isinstance(raw, bool):
         return None
@@ -55,13 +57,24 @@ def parse_bounded_decimal(raw: object) -> Decimal | None:
             return None
         value = Decimal(raw)
     elif isinstance(raw, int):
+        # JSON integers take the string grammar (at most 18 integer digits) so a
+        # number and its string form denote one bounded value.
         if raw.bit_length() > 256:
+            return None
+        if MONEY_STRING_PATTERN.fullmatch(str(raw).lstrip("-")) is None:
             return None
         value = Decimal(raw)
     elif isinstance(raw, float):
         if raw != raw or raw in (float("inf"), float("-inf")):
             return None
-        value = Decimal(repr(raw))
+        # A JSON number is admitted only when its shortest round-trip form already
+        # satisfies the string grammar: no exponent, at most 8 fractional digits.
+        # 1e-9, 50.123456789 and 0.1 + 0.2 are rejected exactly as their string
+        # forms are, so one economic value has one canonical amount.
+        text = repr(raw)
+        if MONEY_STRING_PATTERN.fullmatch(text.lstrip("-")) is None:
+            return None
+        value = Decimal(text)
     elif isinstance(raw, Decimal):
         # A plain copy: a Decimal subclass with overridden comparison or
         # formatting must not survive into gates, ledgers or evidence.

@@ -29,10 +29,10 @@ DEPLOYMENT and OPEN row is closed and the result has been independently reviewed
 | 4.1 | bounded adapter deadlines | DONE-IN-REPO | `adapter_deadline_seconds`; `test_runtime_hardening` deadline tests |
 | 4.2 | stable external intent identity | DEPLOYMENT (per venue; the contract is documented, no in-repo test can prove it for a real venue) | `ADAPTER_CONTRACT.md` A2; `test_runtime.test_adapter_without_exactly_once_contract_is_rejected` checks the declared profile only |
 | 4.3 | authoritative reconciliation by identity | DONE-IN-REPO (contract) / DEPLOYMENT | `test_runtime` settlement tests, `test_settlement` |
-| 4.4 | partial-fill / cancel semantics | DONE-IN-REPO (modelled: `PARTIALLY_FILLED`, `CANCELLED`) / DEPLOYMENT (venue guarantees cancel terminality) | `ADAPTER_CONTRACT.md` Part C; `test_partial_fills`; `evals/run_crash_injection.py` `partial_fill_then_cancel` |
+| 4.4 | partial-fill / cancel semantics | DONE-IN-REPO (modelled: `PARTIALLY_FILLED` including open orders, `CANCELLED`, monotone cumulative fills) / DEPLOYMENT (venue guarantees cancel terminality) | `ADAPTER_CONTRACT.md` Part C; `test_partial_fills`; `test_economic_redteam`; `evals/run_crash_injection.py` `partial_fill_then_cancel` |
 | 4.5 | effect ID definition | DONE-IN-REPO (contract, per venue) | `INVARIANTS.md` I-10/I-11 |
 | 4.6 | authoritative positive and negative reconciliation | DONE-IN-REPO | `test_runtime_hardening` weak-observation tests |
-| 4.7 | independent settled amount / asset / target verification | DONE-IN-REPO (amount) / DEPLOYMENT (venue evidence) | I-24 tests, `test_mutation_gaps.PayPrimitiveTests` |
+| 4.7 | independent settled amount / asset / target verification | DONE-IN-REPO (amount; executor-side slippage bound required and hash-bound when the grant caps slippage) / DEPLOYMENT (venue evidence; adapter enforces the bound) | I-24 tests, `test_mutation_gaps.PayPrimitiveTests`; I-39, `test_economic_redteam.ExecutorSideSlippageBoundTests` |
 | 4.8 | retry behaviour and maximum ambiguity window | DONE-IN-REPO | permit-bounded ambiguity window recorded at permit issuance for every adapter outcome; one live permit per intent; `test_runtime_hardening`, `test_permits`, model check |
 | 4.9 | finality definition | DEPLOYMENT (per venue) | `ADAPTER_CONTRACT.md` |
 | 5.1 | model cannot access signing secrets | DONE-IN-REPO (structure) / DEPLOYMENT (process isolation) | `UNPLUG_TEST.md` |
@@ -55,7 +55,7 @@ DEPLOYMENT and OPEN row is closed and the result has been independently reviewed
 | 7.5 | unauthenticated caller cannot squat another principal's id | DEPLOYMENT (ingress authentication) | R-10 |
 | 7.6 | collision never creates a replacement intent | DONE-IN-REPO | `IntentConflict` tests |
 | 8 | independent security review | OPEN | none |
-| 9 | capped first exposure and kill switch | DONE-IN-REPO (halt; scope exposure caps enforced at reservation) / DEPLOYMENT (funded balance at the venue) | `test_controls.KillSwitchTests`; `test_exposure_cap`; `OPERATIONS.md` §1 |
+| 9 | capped first exposure and kill switch | DONE-IN-REPO (halt; scope exposure caps enforced at reservation; velocity bounds venue actions across grant versions) / DEPLOYMENT (funded balance at the venue) | `test_controls.KillSwitchTests`; `test_exposure_cap`; `test_economic_redteam.VelocityBoundsVenueAttemptsTests`; `OPERATIONS.md` §1 |
 
 ## Residual risks
 

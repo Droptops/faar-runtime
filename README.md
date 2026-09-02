@@ -187,8 +187,8 @@ Operator commands (`python -m faar.cli --help`): `provision-grant`, `set-grant-s
 
 See [`docs/V0_4_RELEASE.md`](docs/V0_4_RELEASE.md). The deterministic release gate (`make check`) includes unit tests, adversarial denial/replay checks with adapter-call and permit-consumption metrics, a red-team matrix in which every attack class is mapped to named tests, seeded state-machine fuzz with an advancing clock, the demo CLI path with keyed evidence verification, and the bounded permit protocol model checker. Headline results:
 
-- 310/310 unit/invariant tests
-- 132 targeted red-team attack classes mapped to 178 named tests, 0 unmapped
+- 339/339 unit/invariant tests
+- 148 targeted red-team attack classes mapped to 207 named tests, 0 unmapped
 - 160 adversarial denial cases with 0 unauthorized economic effects and 0 adapter calls
 - 100 same-intent replay attempts with 1 economic effect, 1 adapter call, 1 permit issued and consumed
 - 96 seeded fuzz scenarios with 0 duplicate-effect and 0 aggregate-budget violations
@@ -197,4 +197,4 @@ See [`docs/V0_4_RELEASE.md`](docs/V0_4_RELEASE.md). The deterministic release ga
 
 These are deterministic regression, adversarial, fuzz, mutation-derived, and bounded-model results. They are not formal verification, an independent security audit, or a production-safety claim.
 
-Before any live-money adapter, the repository still requires the gates in [`docs/V0_2_RELEASE_GATES.md`](docs/V0_2_RELEASE_GATES.md); [`docs/GO_LIVE_CHECKLIST.md`](docs/GO_LIVE_CHECKLIST.md) records which are closed in-repo (key rotation, cross-process fencing, restore safety, kill switch, exposure caps, bounded deadlines and abandoned-call cap, ambiguity window, partial fills and cancellation, crash recovery), which belong to a deployment (key custody, venue-side permit verification, credential scoping, authenticated ingress, anchor placement, capped exposure), and which remain open (datastore failover beyond SQLite, independent security review). Do not add a real-money adapter until every row is closed and independently reviewed.
+Before any live-money adapter, the repository still requires the gates in [`docs/V0_2_RELEASE_GATES.md`](docs/V0_2_RELEASE_GATES.md); [`docs/GO_LIVE_CHECKLIST.md`](docs/GO_LIVE_CHECKLIST.md) records which are closed in-repo (key rotation, cross-process fencing, restore safety, kill switch, exposure caps, velocity that counts venue actions, executor-side slippage bounds, bounded deadlines and abandoned-call cap, ambiguity window, partial fills, open orders and cancellation, crash recovery), which belong to a deployment (key custody, venue-side permit verification, credential scoping, authenticated ingress, anchor placement, capped exposure), and which remain open (datastore failover beyond SQLite, independent security review). Do not add a real-money adapter until every row is closed and independently reviewed.

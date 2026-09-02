@@ -18,7 +18,7 @@ from typing import Iterable, Iterator
 
 from .anchor import AnchorMismatch, AnchorUnavailable, AuthorityAnchor, AuthorityRegression, regressed
 from .canonical import canonical_json, parse_bounded_decimal
-from .models import CapabilityGrant, Intent, IntentState, MONETARY_PRIMITIVES, RiskSnapshot
+from .models import CapabilityGrant, Intent, IntentState, MONETARY_PRIMITIVES, RiskSnapshot, MAX_EVIDENCE_BYTES
 
 GLOBAL_CONTROL_SCOPE = "global"
 PRINCIPAL_CONTROL_PREFIX = "principal:"
@@ -32,6 +32,9 @@ TURNOVER_WINDOW_SECONDS = 86_400
 # persist permit expiry (pre-0.4). Generous relative to the 5 s default permit TTL.
 LEGACY_AMBIGUITY_WINDOW_SECONDS = 60
 BUSY_TIMEOUT_MS = 30_000
+# One evidence row may carry a bounded settlement/receipt evidence mapping plus
+# the runtime's own fields; anything larger is a bug upstream, never persisted.
+MAX_EVIDENCE_ROW_CHARS = 4 * MAX_EVIDENCE_BYTES
 
 # Per-grant execution fences are shared by every store instance opened on the same
 # database file inside one process. Keying them per instance would let an
@@ -65,6 +68,13 @@ class StoredIntent:
     # venue (the permit expiry of an in-flight, ambiguous attempt). Absence of an
     # effect is not authoritative before this instant has passed.
     ambiguity_until: str | None = None
+    # Last authoritative cumulative filled amount accepted for this intent's
+    # effect (decimal string). Later authoritative amounts may never fall below it.
+    filled_amount_usd: str | None = None
+
+
+class EvidenceRecordTooLarge(ValueError):
+    """An evidence event or reason-code list exceeded the persisted-size bound."""
 
 
 class IntentConflict(RuntimeError):
@@ -223,6 +233,7 @@ class SQLiteIntentStore:
                 velocity_ts INTEGER,
                 amount_usd TEXT NOT NULL,
                 status TEXT NOT NULL CHECK(status IN ('HELD','COMMITTED','RELEASED')),
+                submitted INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -265,6 +276,7 @@ class SQLiteIntentStore:
                 reason_codes TEXT NOT NULL DEFAULT '[]',
                 submission_count INTEGER NOT NULL DEFAULT 0,
                 ambiguity_until TEXT,
+                filled_amount_usd TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -441,6 +453,7 @@ class SQLiteIntentStore:
         ("intents", "principal_id", "TEXT NOT NULL DEFAULT 'legacy:unknown'"),
         ("intents", "venue", "TEXT NOT NULL DEFAULT ''"),
         ("intents", "ambiguity_until", "TEXT"),
+        ("intents", "filled_amount_usd", "TEXT"),
         ("evidence", "event_mac", "TEXT"),
         ("evidence", "principal_id", "TEXT NOT NULL DEFAULT 'legacy:unknown'"),
         ("grants", "principal_id", "TEXT NOT NULL DEFAULT 'legacy:unknown'"),
@@ -448,6 +461,7 @@ class SQLiteIntentStore:
         ("grants", "fence_counter", "INTEGER NOT NULL DEFAULT 0"),
         ("usage_reservations", "principal_id", "TEXT NOT NULL DEFAULT 'legacy:unknown'"),
         ("usage_reservations", "velocity_ts", "INTEGER"),
+        ("usage_reservations", "submitted", "INTEGER NOT NULL DEFAULT 0"),
         ("risk_claims", "principal_id", "TEXT NOT NULL DEFAULT 'legacy:unknown'"),
         ("execution_permits", "consumed_at", "TEXT"),
         ("execution_permits", "expires_at", "TEXT"),
@@ -528,6 +542,12 @@ class SQLiteIntentStore:
                 raise MigrationError(f"intent {row['intent_id']} has an unreadable updated_at; refusing to open")
             until = updated + timedelta(seconds=LEGACY_AMBIGUITY_WINDOW_SECONDS)
             self._conn.execute("UPDATE intents SET ambiguity_until=? WHERE intent_id=?", (until.isoformat(), row["intent_id"]))
+        # Action velocity counts every attempt that reached a venue (I-13); rows
+        # written before `submitted` existed derive it from the attempt count.
+        self._conn.execute(
+            "UPDATE usage_reservations SET submitted=1 WHERE submitted=0 "
+            "AND intent_id IN (SELECT intent_id FROM intents WHERE submission_count>0)"
+        )
 
     def _create_dependent_indexes(self) -> None:
         """Indexes over columns that may only exist after `_migrate_columns`.
@@ -546,6 +566,14 @@ class SQLiteIntentStore:
                 self._conn.execute(
                     "CREATE INDEX IF NOT EXISTS ix_usage_principal_velocity_ts "
                     "ON usage_reservations(principal_id, velocity_ts, status)"
+                )
+                # Per-intent chain, permit and fleet-wide window lookups run inside
+                # the write lock on every append/issuance/reservation; without these
+                # they are full-table scans that grow with un-purged history.
+                self._conn.execute("CREATE INDEX IF NOT EXISTS ix_evidence_intent_id ON evidence(intent_id, id)")
+                self._conn.execute("CREATE INDEX IF NOT EXISTS ix_permits_intent ON execution_permits(intent_id)")
+                self._conn.execute(
+                    "CREATE INDEX IF NOT EXISTS ix_usage_velocity_status ON usage_reservations(velocity_ts, status)"
                 )
                 # Effect identity is a per-venue namespace (ADAPTER_CONTRACT §3):
                 # exchange fill/order identifiers legitimately collide across venues.
@@ -1075,6 +1103,14 @@ class SQLiteIntentStore:
                 (principal_id, since_ts),
             ).fetchall()
         return sum((Decimal(r["amount_usd"]) for r in rows), Decimal("0"))
+
+    def effect_owner(self, venue: str, effect_id: str) -> str | None:
+        """Intent that owns `effect_id` in this venue's namespace, if any (I-11)."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT intent_id FROM intents WHERE venue=? AND effect_id=?", (venue, effect_id)
+            ).fetchone()
+        return None if row is None else str(row["intent_id"])
 
     def is_halted(self, principal_id: str) -> str | None:
         with self._lock:
@@ -1629,6 +1665,17 @@ class SQLiteIntentStore:
                 ).fetchone()
                 if prior_claim is not None and prior_claim["intent_id"] != intent.intent_id:
                     reasons.append("RISK_STATE_VERSION_ALREADY_CLAIMED")
+                else:
+                    # A version a retry already bound in the permit ledger belongs
+                    # to that intent; refusing it here keeps a fresh intent from
+                    # burning a submission attempt on a permit the authority will
+                    # refuse anyway (I-14).
+                    permit_claim = self._conn.execute(
+                        "SELECT intent_id FROM permit_risk_claims WHERE grant_id=? AND grant_version=? AND risk_scope=? AND state_version=?",
+                        (grant.grant_id, grant.version, risk.scope, risk.state_version),
+                    ).fetchone()
+                    if permit_claim is not None and permit_claim["intent_id"] != intent.intent_id:
+                        reasons.append("RISK_STATE_VERSION_ALREADY_CLAIMED")
                 # The monotonic ceiling spans both ledgers: a fresher state version
                 # consumed by a retry (permit_risk_claims) supersedes older versions
                 # exactly as an initial claim does. Both ledgers must agree on what
@@ -1646,13 +1693,16 @@ class SQLiteIntentStore:
                 if ceilings and risk.state_version < max(ceilings):
                     reasons.append("RISK_STATE_VERSION_NOT_MONOTONIC")
                 if grant.limits.max_daily_turnover_usd is not None:
-                    # Trailing window. Rows written before `velocity_ts` existed fall
-                    # back to their calendar day so an upgrade never under-counts.
+                    # Trailing window over every version of the grant: provisioning
+                    # a new version (renewal, tightening) must not restart the
+                    # budget. The current version's limit applies to the total.
+                    # Rows written before `velocity_ts` existed fall back to their
+                    # calendar day so an upgrade never under-counts.
                     rows = self._conn.execute(
-                        "SELECT amount_usd FROM usage_reservations WHERE grant_id=? AND grant_version=? "
+                        "SELECT amount_usd FROM usage_reservations WHERE grant_id=? "
                         "AND status IN ('HELD','COMMITTED') "
                         "AND ((velocity_ts IS NOT NULL AND velocity_ts >= ?) OR (velocity_ts IS NULL AND day_key=?))",
-                        (grant.grant_id, grant.version, velocity_ts - TURNOVER_WINDOW_SECONDS, day_key),
+                        (grant.grant_id, velocity_ts - TURNOVER_WINDOW_SECONDS, day_key),
                     ).fetchall()
                     current = sum((Decimal(r["amount_usd"]) for r in rows), Decimal("0"))
                     if current + amount > grant.limits.max_daily_turnover_usd:
@@ -1683,9 +1733,14 @@ class SQLiteIntentStore:
                     # Sliding window over the trailing `window` seconds. A fixed
                     # tumbling bucket (timestamp // window) would let up to 2x the
                     # limit fire across a bucket boundary.
+                    # Velocity bounds venue actions, not effects: an attempt that
+                    # reached a venue (`submitted`) keeps its slot for the window
+                    # even after its budget was released (cancelled unfilled,
+                    # deterministic rejection). The count spans grant versions.
                     count = self._conn.execute(
-                        "SELECT COUNT(*) AS n FROM usage_reservations WHERE grant_id=? AND grant_version=? AND velocity_ts >= ? AND status IN ('HELD','COMMITTED')",
-                        (grant.grant_id, grant.version, velocity_ts - window),
+                        "SELECT COUNT(*) AS n FROM usage_reservations WHERE grant_id=? AND velocity_ts >= ? "
+                        "AND (status IN ('HELD','COMMITTED') OR submitted=1)",
+                        (grant.grant_id, velocity_ts - window),
                     ).fetchone()["n"]
                     if count + 1 > grant.limits.max_actions_per_window:
                         reasons.append("ATOMIC_ACTION_VELOCITY_EXCEEDED")
@@ -1785,6 +1840,7 @@ class SQLiteIntentStore:
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             ambiguity_until=row["ambiguity_until"],
+            filled_amount_usd=row["filled_amount_usd"],
         )
 
     def transition(
@@ -1798,6 +1854,7 @@ class SQLiteIntentStore:
         release_usage: bool = False,
         commit_usage: bool = False,
         ambiguity_until: datetime | None = None,
+        filled_amount_usd: Decimal | None = None,
     ) -> bool:
         """Compare-and-set the intent state.
 
@@ -1818,6 +1875,13 @@ class SQLiteIntentStore:
             raise ValueError("a transition cannot both release and commit usage")
         if ambiguity_until is not None and (ambiguity_until.tzinfo is None or ambiguity_until.utcoffset() is None):
             raise ValueError("ambiguity_until must be timezone-aware")
+        if filled_amount_usd is not None and (
+            not isinstance(filled_amount_usd, Decimal) or not filled_amount_usd.is_finite() or filled_amount_usd < 0
+        ):
+            raise ValueError("filled_amount_usd must be a finite, non-negative Decimal")
+        reasons_json = json.dumps(list(reason_codes))
+        if len(reasons_json) > MAX_EVIDENCE_BYTES:
+            raise EvidenceRecordTooLarge("reason codes exceed the maximum persisted size")
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
@@ -1834,12 +1898,17 @@ class SQLiteIntentStore:
                 ts = self._now()
                 self._conn.execute(
                     "UPDATE intents SET state=?, effect_id=?, reason_codes=?, updated_at=? WHERE intent_id=?",
-                    (new_state.value, final_effect, json.dumps(list(reason_codes)), ts, intent_id),
+                    (new_state.value, final_effect, reasons_json, ts, intent_id),
                 )
                 if ambiguity_until is not None:
                     self._conn.execute(
                         "UPDATE intents SET ambiguity_until=? WHERE intent_id=?",
                         (ambiguity_until.isoformat(), intent_id),
+                    )
+                if filled_amount_usd is not None:
+                    self._conn.execute(
+                        "UPDATE intents SET filled_amount_usd=? WHERE intent_id=?",
+                        (format(filled_amount_usd, "f"), intent_id),
                     )
                 if release_usage:
                     self._conn.execute(
@@ -1900,6 +1969,10 @@ class SQLiteIntentStore:
                     "UPDATE intents SET state=?, submission_count=?, reason_codes='[]', ambiguity_until=NULL, updated_at=? WHERE intent_id=?",
                     (IntentState.SUBMITTED.value, count, self._now(), intent_id),
                 )
+                # The reservation now backs an attempt that may reach the venue:
+                # it keeps counting against action velocity whatever happens to
+                # its budget later.
+                self._conn.execute("UPDATE usage_reservations SET submitted=1 WHERE intent_id=?", (intent_id,))
                 self._conn.execute("COMMIT")
                 return True, False, count
             except Exception:
@@ -1960,6 +2033,8 @@ class SQLiteIntentStore:
 
         created_at = self._now()
         payload_json = canonical_json(payload)
+        if len(payload_json) > MAX_EVIDENCE_ROW_CHARS:
+            raise EvidenceRecordTooLarge(f"evidence event {event_type!r} exceeds the maximum persisted size")
         envelope = canonical_json({
             "intent_id": intent_id,
             "event_type": event_type,

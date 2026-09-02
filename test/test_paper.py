@@ -67,7 +67,7 @@ class PaperVenueTests(unittest.TestCase):
             intent_id="paper_intent_00000000001", actor_id="agent:q", grant_id="g-paper", grant_version=1,
             primitive=EconomicPrimitive.SWAP, venue="paper-dex", created_at=NOW,
             expires_at=NOW + timedelta(seconds=30),
-            payload={"from_asset": "USDC", "to_asset": "MEME", "amount_usd": "50", "target": "paper-router"},
+            payload={"from_asset": "USDC", "to_asset": "MEME", "amount_usd": "50", "target": "paper-router", "max_slippage_bps": 50},
         )
         result = self.execute_case(i)
         self.assertEqual(IntentState.FINALIZED, result.state)
@@ -84,7 +84,7 @@ class PaperVenueTests(unittest.TestCase):
             intent_id="paper_intent_00000000002", actor_id="agent:q", grant_id="g-paper", grant_version=1,
             primitive=EconomicPrimitive.SWAP, venue="paper-dex", created_at=NOW,
             expires_at=NOW + timedelta(seconds=30),
-            payload={"from_asset": "USDC", "to_asset": "MEME", "amount_usd": "50", "target": "paper-router"},
+            payload={"from_asset": "USDC", "to_asset": "MEME", "amount_usd": "50", "target": "paper-router", "max_slippage_bps": 50},
         )
         result = self.execute_case(i)
         # The venue admitted the request (permit consumed) and rejected it. Its

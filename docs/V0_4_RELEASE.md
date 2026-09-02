@@ -26,7 +26,11 @@ Out of scope:
 
 ## What changed since v0.3.1
 
-See [`RED_TEAM_REPORT.md`](RED_TEAM_REPORT.md) RT-42..RT-79 and the CHANGELOG. Breaking changes for integrators:
+See [`RED_TEAM_REPORT.md`](RED_TEAM_REPORT.md) RT-42..RT-116 and the CHANGELOG. Breaking changes for integrators:
+
+- a grant that sets `max_slippage_bps` now requires `max_slippage_bps` in every SWAP/BUY/SELL/PLACE_ORDER payload (orders may carry `limit_price` instead); the bound is inside the permit's request hash and the adapter must enforce it (I-39);
+- JSON-number amounts are admitted only when their shortest form fits the money grammar;
+- intent payload and metadata carry a 64 KiB string-content budget each.
 
 - `schema_version` must be `"0.3"`; unknown document/limit keys are rejected; `intent_id` is 16..128 characters; payloads must be JSON objects; amount strings must be plain ASCII decimals with at most 8 fraction digits; BUY/SELL/PLACE_ORDER payloads carry exactly one amount field.
 - Proven risk-limit breaches are `DENIED` (were `DEFERRED`); missing or stale data still defers.
@@ -42,8 +46,8 @@ Current `make check` headline results:
 
 | Gate | Result |
 |---|---|
-| Unit/invariant tests | 310/310 pass |
-| Targeted red-team | 132 attack classes mapped to 178 named tests, 0 unmapped |
+| Unit/invariant tests | 339/339 pass |
+| Targeted red-team | 148 attack classes mapped to 207 named tests, 0 unmapped |
 | Adversarial denial cases | 160; 0 unauthorized economic effects; 0 adapter calls |
 | Same-intent replay attempts | 100; 1 effect, 1 adapter call, 1 permit issued and consumed |
 | Seeded fuzz scenarios | 96; 0 duplicate-effect violations; 0 aggregate-budget violations |

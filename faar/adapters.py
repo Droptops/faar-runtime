@@ -74,6 +74,9 @@ class MockMode(StrEnum):
     # The order rests on the book half filled; `complete_fill` / `cancel_order`
     # move it to its terminal state.
     PARTIAL_FILL = "PARTIAL_FILL"
+    # The order is admitted and rests with nothing filled (PARTIALLY_FILLED with a
+    # zero cumulative amount); `complete_fill` / `cancel_order` terminate it.
+    OPEN_ORDER = "OPEN_ORDER"
 
 
 class ExecutionAdapter(Protocol):
@@ -162,6 +165,8 @@ class MockVenue:
                 full = self._authorized_amount(request)
                 half = (full / 2).quantize(Decimal("0.00000001")) if full is not None else None
                 receipt = self._receipt(request, status=SettlementStatus.PARTIALLY_FILLED, amount=half)
+            elif self.mode == MockMode.OPEN_ORDER:
+                receipt = self._receipt(request, status=SettlementStatus.PARTIALLY_FILLED, amount=Decimal("0"))
             else:
                 receipt = self._receipt(request)
             self._effects[key] = receipt
@@ -176,6 +181,10 @@ class MockVenue:
             current = self._effects.get(key)
             if current is None:
                 return None
+            if current.status == SettlementStatus.CANCELLED:
+                # Terminal by contract (ADAPTER_CONTRACT Part C): a venue never
+                # fills an order after it acknowledged the cancel.
+                return current
             receipt = self._receipt(request, status=SettlementStatus.FINALIZED)
             self._effects[key] = receipt
             return receipt
@@ -207,7 +216,7 @@ class MockVenue:
         receipt = self._effects.get(f"{principal_id}\x1f{intent_id}")
         if receipt is None:
             return 0
-        if receipt.status == SettlementStatus.CANCELLED and not (receipt.amount_usd or 0) > 0:
+        if receipt.status in {SettlementStatus.CANCELLED, SettlementStatus.PARTIALLY_FILLED} and not (receipt.amount_usd or 0) > 0:
             return 0
         return 1
 

@@ -164,7 +164,7 @@ class PartialFillTests(unittest.TestCase):
     def test_partial_fill_integrity_checks(self):
         cases = (
             (_auth(SettlementStatus.PARTIALLY_FILLED, "order-1", "60"), "SETTLED_AMOUNT_EXCEEDS_AUTHORIZED"),
-            (_auth(SettlementStatus.PARTIALLY_FILLED, "order-1", "0"), "SETTLED_AMOUNT_INVALID"),
+            (_auth(SettlementStatus.PARTIALLY_FILLED, "order-1", "-1"), "SETTLED_AMOUNT_INVALID"),
             (_auth(SettlementStatus.PARTIALLY_FILLED, None, "20"), "SETTLED_EFFECT_ID_REQUIRED"),
             (_auth(SettlementStatus.CANCELLED, None, "0"), "SETTLED_EFFECT_ID_REQUIRED"),
             (_auth(SettlementStatus.CANCELLED, "order-1", "60"), "SETTLED_AMOUNT_EXCEEDS_AUTHORIZED"),

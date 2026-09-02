@@ -277,6 +277,70 @@ ATTACK_CLASSES: dict[str, tuple[str, ...]] = {
     "evidence truncation laundered through the head rebuild": ("test_operator_redteam.EvidenceLaunderingTests.test_a_deleted_head_is_tampering_not_a_legacy_chain",),
     "halt or cap on a mistyped principal reporting success": ("test_operator_redteam.ControlScopeTests.test_controls_refuse_scopes_that_match_nothing",),
     "restore reinstating a looser exposure cap": ("test_operator_redteam.ControlScopeTests.test_exposure_caps_are_anchored_against_restore",),
+    # --- live-money pass: economic logic ----------------------------------------------
+    "velocity slot freed by cancelled or rejected attempts (order spam through FAAR)": (
+        "test_economic_redteam.VelocityBoundsVenueAttemptsTests.test_cancelled_unfilled_attempts_keep_their_velocity_slot",
+        "test_economic_redteam.VelocityBoundsVenueAttemptsTests.test_store_counts_submitted_rows_after_release_but_not_unsubmitted_ones",
+    ),
+    "grant re-provisioning restarting the trailing windows": (
+        "test_economic_redteam.WindowsSpanGrantVersionsTests.test_new_grant_version_does_not_restart_turnover_or_velocity_windows",
+    ),
+    "slippage cap enforced only on a signer claim, not at execution": (
+        "test_economic_redteam.ExecutorSideSlippageBoundTests.test_capped_grant_requires_a_bound_no_looser_than_the_cap",
+        "test_economic_redteam.ExecutorSideSlippageBoundTests.test_orders_may_carry_a_limit_price_instead",
+        "test_economic_redteam.ExecutorSideSlippageBoundTests.test_bound_travels_in_the_hash_bound_request",
+        "test_economic_redteam.ExecutorSideSlippageBoundTests.test_runtime_denies_an_unbounded_swap_before_the_adapter",
+    ),
+    "risk state version owned by a retry reserved by another intent": (
+        "test_economic_redteam.RiskVersionOwnershipTests.test_reservation_refuses_a_version_the_permit_ledger_bound_to_another_intent",
+        "test_permits.PermitBoundaryTests.test_fresh_retry_risk_state_cannot_be_reused_by_different_intent",
+    ),
+    "shrinking cumulative fill accepted as newer truth": (
+        "test_economic_redteam.FillMonotonicityTests.test_a_shrinking_cumulative_fill_stops_the_intent",
+        "test_economic_redteam.FillMonotonicityTests.test_equal_or_growing_fills_progress",
+        "test_economic_redteam.FillMonotonicityTests.test_cancel_with_nothing_filled_after_a_fill_keeps_its_own_code",
+    ),
+    "admitted unfilled order stopped before it fills": (
+        "test_economic_redteam.OpenOrderTests.test_an_admitted_unfilled_order_is_open_not_a_stop",
+        "test_economic_redteam.OpenOrderTests.test_an_open_order_cancelled_unfilled_fails_safe_and_releases",
+        "test_economic_redteam.OpenOrderTests.test_an_open_order_that_starts_filling_becomes_a_partial_fill",
+        "test_economic_redteam.OpenOrderTests.test_an_open_order_that_vanishes_is_a_lost_effect",
+        "test_economic_redteam.OpenOrderTests.test_mock_venue_open_order_end_to_end",
+    ),
+    "JSON numbers bypassing the money grammar": (
+        "test_economic_redteam.JsonNumberGrammarTests.test_json_numbers_take_the_string_grammar",
+        "test_economic_redteam.JsonNumberGrammarTests.test_gate_and_ledger_reject_numbers_outside_the_grammar",
+    ),
+    # --- live-money pass: state machine and resources ---------------------------------
+    "public reconcile() ignoring the durable resubmission block": (
+        "test_state_machine_redteam.DurableBlockTests.test_public_reconcile_with_fresh_authorization_honours_the_block",
+        "test_state_machine_redteam.DurableBlockTests.test_bare_reconcile_keeps_the_block_on_the_row",
+    ),
+    "resubmission block wiped by the RECONCILING transition": (
+        "test_state_machine_redteam.DurableBlockTests.test_block_survives_a_worker_dying_during_the_settlement_lookup",
+    ),
+    "reconcile before submission without a reason code": (
+        "test_state_machine_redteam.DurableBlockTests.test_reconcile_before_submission_is_machine_readable_and_mutates_nothing",
+    ),
+    "terminal stop leaving a live permit for a late venue call": (
+        "test_state_machine_redteam.StopVoidsPermitsTests.test_settlement_derived_stops_void_the_live_permit",
+    ),
+    "unfilled cancel carrying another intent's order identity released as absence": (
+        "test_state_machine_redteam.StopVoidsPermitsTests.test_cancel_carrying_another_intents_order_identity_stops",
+    ),
+    "untrusted payload content copied into reason codes and evidence": (
+        "test_state_machine_redteam.ReasonCodeBoundsTests.test_gate_reason_codes_never_carry_untrusted_content_verbatim",
+        "test_state_machine_redteam.ReasonCodeBoundsTests.test_store_refuses_oversized_reason_codes_and_evidence_rows",
+    ),
+    "multi-megabyte intent document accepted, canonicalised and stored": (
+        "test_state_machine_redteam.IntentByteBudgetTests.test_intent_documents_are_bounded_in_bytes_not_only_nodes",
+    ),
+    "per-intent lookups degrading to table scans with history": (
+        "test_state_machine_redteam.IndexCoverageTests.test_per_intent_and_window_lookups_use_indexes",
+    ),
+    "orphaned-call cap multiplied by runtime instances": (
+        "test_state_machine_redteam.OrphanCapScopeTests.test_the_orphan_cap_is_process_wide",
+    ),
 }
 
 

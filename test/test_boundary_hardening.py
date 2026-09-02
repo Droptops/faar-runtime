@@ -34,7 +34,7 @@ from support import AUTH, NOW, PRINCIPAL, attest_pair, grant, intent, permit_sta
 
 
 def _payload(**changes):
-    base = {"from_asset": "USDC", "to_asset": "MEME", "amount_usd": "50", "target": "router:approved"}
+    base = {"from_asset": "USDC", "to_asset": "MEME", "amount_usd": "50", "target": "router:approved", "max_slippage_bps": 50}
     base.update(changes)
     return base
 
@@ -69,7 +69,7 @@ class AmountGrammarTests(unittest.TestCase):
         decision = evaluate_capability(i, g, NOW)
         self.assertEqual(Verdict.DENY, decision.verdict)
         self.assertIn("AMOUNT_FIELDS_AMBIGUOUS", decision.reason_codes)
-        ok = intent(primitive=EconomicPrimitive.BUY, payload={"base_asset": "BTC", "quote_asset": "USD", "notional_usd": "10"})
+        ok = intent(primitive=EconomicPrimitive.BUY, payload={"base_asset": "BTC", "quote_asset": "USD", "notional_usd": "10", "limit_price": "60000"})
         self.assertEqual(Verdict.ALLOW, evaluate_capability(ok, g, NOW).verdict)
 
     def test_swap_identical_assets_detected_on_normalised_value(self):

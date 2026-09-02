@@ -13,7 +13,8 @@
     "from_asset": "USDC",
     "to_asset": "MEME",
     "amount_usd": "50.00",
-    "target": "router:approved-v1"
+    "target": "router:approved-v1",
+    "max_slippage_bps": 50
   },
   "metadata": {
     "strategy": "demo"

@@ -43,7 +43,9 @@ ACTIVE/PAUSED -> REVOKED
 REVOKED -X-> ACTIVE
 ```
 
-A revoked version cannot be resurrected; create a new version instead.
+A revoked version cannot be resurrected; create a new version instead. Trailing
+turnover and velocity windows are summed over every version of a grant id, so a
+new version never restarts a budget; its own limits apply to the total.
 
 ## Revocation and ambiguous effects
 

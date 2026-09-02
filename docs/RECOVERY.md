@@ -26,8 +26,11 @@ Both reconcile first. Submitter output never decides which.
 | `FINALIZED`, authoritative, bound to this request, valid effect id, amount inside envelope | | `FINALIZED`, usage COMMITTED |
 | `CONFIRMED`, same conditions | | `CONFIRMED` (reconciles again later) |
 | `PARTIALLY_FILLED`, authoritative, bound, valid effect id, 0 < amount <= authorized | | `CONFIRMED (SETTLEMENT_PARTIAL_FILL_OPEN)`, usage HELD; reconciled again later, never resubmitted |
+| `PARTIALLY_FILLED`, authoritative, bound, valid effect id, amount 0 | | `CONFIRMED (SETTLEMENT_ORDER_OPEN)`, usage HELD; the order is admitted and resting |
+| any positive status or `CANCELLED`, authoritative, amount below the last accepted cumulative fill | a fill was recorded | `STOPPED (SETTLEMENT_FILL_REGRESSED)`, usage HELD |
 | `CANCELLED`, authoritative, filled amount > 0 | | `FINALIZED (SETTLEMENT_CANCELLED_AFTER_PARTIAL_FILL)`, usage COMMITTED |
-| `CANCELLED`, authoritative, nothing filled | no fill recorded | `FAILED_SAFE (SETTLEMENT_CANCELLED_UNFILLED)`, usage RELEASED, no resubmission under this intent |
+| `CANCELLED`, authoritative, nothing filled | no fill recorded (an open order counts as none) | `FAILED_SAFE (SETTLEMENT_CANCELLED_UNFILLED)`, usage RELEASED, no resubmission under this intent |
+| `CANCELLED`, authoritative, nothing filled | effect id owned by another intent at this venue | `STOPPED (EFFECT_ID_ALREADY_CLAIMED)`, usage HELD |
 | `CANCELLED`, authoritative, nothing filled | a fill was recorded | `STOPPED (SETTLEMENT_CANCEL_CONTRADICTS_RECORDED_EFFECT)`, usage HELD |
 | `CONFIRMED`/`FINALIZED`/`PARTIALLY_FILLED`, not authoritative | | `UNKNOWN (SETTLEMENT_POSITIVE_NOT_AUTHORITATIVE)`, usage HELD |
 | `CANCELLED`, not authoritative | | `UNKNOWN (SETTLEMENT_CANCEL_NOT_AUTHORITATIVE)`, usage HELD |

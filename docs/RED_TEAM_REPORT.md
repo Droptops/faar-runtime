@@ -138,6 +138,27 @@ Before release, five independent reviewers (fail-closed regressions, new-code co
 | RT-98 | Deleting the head row together with the tail made a truncated 0.4 chain look like a pre-head legacy chain (`head_missing`), and the documented `rebuild-evidence-head` laundered the truncation | Medium | Chains that start at `intent_registered` were born with a head: their missing head is `head_deleted` and the rebuild refuses them |
 | RT-99 | `halt` and `set-exposure-cap` accepted any `principal:<text>` and reported success while fencing or capping nothing; a mistyped principal left the fleet unprotected with exit 0 | Low | Scopes with whitespace are rejected; a principal without a provisioned grant is `UnknownPrincipal` unless `--allow-unprovisioned-principal`; the cap command reports the grant versions in scope |
 | RT-100 | Exposure caps were not anchored: a restore silently reinstated the pre-incident (looser) cap once the grants were recovered | Low | The cap table version is anchored; a regressed datastore refuses reservations with `EXPOSURE_CAPS_REGRESSED` until caps are re-applied |
+| RT-101 | Action velocity counted effects, not venue actions: every released reservation (cancelled unfilled, deterministic rejection, retry-predicate stop) gave its slot back at once, so a compromised model could place an unbounded number of admit-and-cancel orders inside one window | Medium | The reservation is marked `submitted` in the `begin_submission` transaction and keeps counting against `max_actions_per_window` for the window whatever happens to its budget; legacy rows derive the flag from the attempt count |
+| RT-102 | Provisioning a new grant version restarted the trailing turnover and velocity windows (2x the daily cap for one grant id) | Medium | Both windows are summed over every version of the grant id; the current version's limits apply to the total |
+| RT-103 | `max_slippage_bps` constrained only a risk-signer claim; neither the sanitized request nor the permit carried an executor-side bound, so a swap venue could return any output for the authorized input | Medium | A grant that caps slippage requires `max_slippage_bps` in every SWAP/BUY/SELL/PLACE_ORDER payload (`PAYLOAD_FIELD_REQUIRED:max_slippage_bps`, orders may carry `limit_price` instead), no looser than the cap (`SLIPPAGE_BOUND_EXCEEDS_GRANT`), typed (`SLIPPAGE_BOUND_INVALID`, `LIMIT_PRICE_INVALID`); the bound travels in the hash-bound request the adapter must enforce |
+| RT-104 | `reserve_usage` checked exact-version ownership only in the initial risk ledger; a version a retry bound in the permit ledger reserved budget for another intent and burned a submission attempt | Low | Reservation consults both ledgers for the exact version (`RISK_STATE_VERSION_ALREADY_CLAIMED`) |
+| RT-105 | Cumulative fills were never checked for monotonicity: `PARTIALLY_FILLED 40 -> 10 -> CANCELLED 5` finalized with three contradictory fills in evidence | Low | The last accepted cumulative fill is persisted (`filled_amount_usd`); any later authoritative amount below it is `SETTLEMENT_FILL_REGRESSED` (STOP, budget held) |
+| RT-106 | An admitted, resting, unfilled order had no authoritative non-terminal encoding: `PARTIALLY_FILLED` with amount 0 was `SETTLED_AMOUNT_INVALID`, a terminal STOP that lost the fill when it arrived | Low | `PARTIALLY_FILLED` with a zero cumulative amount is an open order (`SETTLEMENT_ORDER_OPEN`, CONFIRMED with the effect id, budget held); cancelled unfilled it fails safe; `MockMode.OPEN_ORDER` |
+| RT-107 | JSON numbers bypassed the money grammar: `1e-9`, `50.123456789` and `0.1 + 0.2` were reservable while their string forms were denied | Low | Ints and floats take the same grammar as strings through their shortest round-trip form |
+| RT-108 | Gate reason codes copied payload content verbatim (unknown field names, asset values) into the intent row and evidence, bypassing the evidence bound; a large enough value hit `SQLITE_MAX_LENGTH` and left the intent stuck PROPOSED | Medium | Offending names are sanitised, truncated and counted; the store refuses oversized reason-code lists and evidence rows (`EvidenceRecordTooLarge`) |
+| RT-109 | Intent payload and metadata were bounded in nodes but not bytes: a 160-640 MB document was accepted, canonicalised a dozen times and stored before any gate ran | Medium | Every frozen untrusted structure carries a 64 KiB budget of string content (`MAX_CANONICAL_TOTAL_BYTES`), enforced while freezing |
+| RT-110 | Per-intent evidence and permit lookups and the fleet-wide exposure scan were full-table scans inside the write lock; at millions of un-purged rows every submission expired its permit before the venue could consume it | Low | Indexes on `evidence(intent_id, id)`, `execution_permits(intent_id)` and `usage_reservations(velocity_ts, status)`; retention step in `OPERATIONS.md` §5 |
+| RT-111 | `max_orphaned_adapter_calls` was enforced per runtime instance while I-36 promised per process | Low | The counter is process-wide |
+| RT-112 | Public `reconcile()` ignored the durable deterministic-failure block: with fresh authorization it resubmitted, and a bare call rewrote the row without the block | Medium | Every entry point derives the block from the row |
+| RT-113 | The `UNKNOWN -> RECONCILING` transition wiped the block; a worker dying during the settlement lookup left a retriable row | Medium | The block travels with the row through RECONCILING |
+| RT-114 | Settlement-derived terminal stops left the attempt's unconsumed permit live; a late venue call could create an effect the terminal intent never records | Medium | Every stop voids unconsumed permits first (`permits_voided` evidence); `SETTLEMENT_CONTRADICTORY` goes through the same path |
+| RT-115 | An unfilled `CANCELLED` record carrying another intent's order identity at the same venue released the budget as absence | Low | Checked against the venue namespace before release (`EFFECT_ID_ALREADY_CLAIMED`, budget held) |
+| RT-116 | `reconcile()` on a PROPOSED/AUTHORIZED intent returned a non-terminal result with no reason code | Info | `RECONCILE_NOT_APPLICABLE_BEFORE_SUBMISSION`, nothing mutated |
+
+Three further reports from the same personas were confirmed already closed on the
+current head by RT-88 (quorum aggregates that exceed the evidence bound), RT-89
+(zero-notional actions under a tightened exposure cap) and RT-93 (an anchor lock
+holder hanging every worker); their reproductions were re-run against the fixes.
 
 Documentation corrections from the same pass: halt semantics for in-flight intents, the persisted deterministic-failure code, the residual-risk table (partial fills OPEN, orphan threads under R-09), adapter-contract references, HMAC statements, the lifecycle diagram (`RECONCILING -> FAILED_SAFE`, retry edge), and the invariants header.
 
@@ -146,8 +167,8 @@ Documentation corrections from the same pass: halt semantics for in-flight inten
 Current `make check` result for v0.4.0:
 
 ```text
-310 unit/invariant tests -> PASS
-132 targeted red-team attack classes, each mapped to named tests (178 tests) -> PASS, 0 unmapped
+339 unit/invariant tests -> PASS
+148 targeted red-team attack classes, each mapped to named tests (207 tests) -> PASS, 0 unmapped
 160 deterministic denial mutations -> 0 unauthorized economic effects, 0 adapter calls
 100 retries of one logical intent -> 1 successful effect, 1 adapter call, 1 permit issued and consumed
 ambiguous timeout-after-effect recovery -> 1 successful effect, 1 adapter call
