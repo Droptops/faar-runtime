@@ -180,7 +180,7 @@ class LeaseAndBusyStoreTests(unittest.TestCase):
     def test_owner_can_reacquire_its_own_lease_after_a_failed_release(self):
         i = intent(intent_id="intent_chaos_000000000011")
         self.store.register(i, canonical_hash(i))
-        owner = f"{self.store._instance_id}:{threading.get_ident()}"
+        owner = self.store._instance_id  # the durable owner is the store instance, not a thread
         self.store._conn.execute(
             "INSERT INTO intent_leases(intent_id,owner_token,acquired_at,host,pid) VALUES(?,?,?,?,?)",
             (i.intent_id, owner, NOW.isoformat(), self.store._host, os.getpid()),

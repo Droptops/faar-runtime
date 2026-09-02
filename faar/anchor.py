@@ -46,6 +46,11 @@ class AnchorUnavailable(RuntimeError):
     """The anchor could not be read or written; authority checks must fail closed."""
 
 
+class AnchorUnavailableAfterCommit(AnchorUnavailable):
+    """The stop-direction change committed to the datastore; the anchor mark could not
+    be raised. The next anchored open (or a re-run of the same command) repairs it."""
+
+
 class AnchorMismatch(RuntimeError):
     """The datastore is bound to a different anchor than the one presented (a fresh,
     replaced or wrong anchor file); opening with it would silently un-regress a

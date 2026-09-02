@@ -452,7 +452,9 @@ class LegacyChainTests(unittest.TestCase):
         # existing event as legacy (exactly what a real 0.3.x upgrade sees).
         conn = sqlite3.connect(path)
         conn.execute("DELETE FROM evidence_head")
-        conn.execute("DELETE FROM store_settings WHERE key='heads_since'")
+        # Every chain here starts at registration, which a real pre-head database's
+        # chains never did; the watermark is pushed past them explicitly.
+        conn.execute("UPDATE store_settings SET value='1000000000' WHERE key='heads_since'")
         if empty_intent is not None:
             conn.execute("DELETE FROM evidence WHERE intent_id=?", (empty_intent,))
         conn.commit()

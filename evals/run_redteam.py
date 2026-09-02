@@ -341,6 +341,41 @@ ATTACK_CLASSES: dict[str, tuple[str, ...]] = {
     "orphaned-call cap multiplied by runtime instances": (
         "test_state_machine_redteam.OrphanCapScopeTests.test_the_orphan_cap_is_process_wide",
     ),
+    # --- self-review of the live-money pass ------------------------------------------
+    "unfilled-cancel identity check overtaken by a concurrent claim": (
+        "test_selfreview_redteam.AtomicIdentityClaimTests.test_unfilled_cancel_release_cannot_be_overtaken_by_a_concurrent_claim",
+    ),
+    "grant id shared across principals exhausting another tenant's window": (
+        "test_selfreview_redteam.PrincipalScopedWindowsTests.test_windows_are_per_principal_and_grant_id_and_count_legacy_rows",
+    ),
+    "anchor left behind by a committed stop, re-run a silent no-op": (
+        "test_selfreview_redteam.AnchorRepairTests.test_a_stop_whose_anchor_write_failed_is_repaired_on_rerun_and_on_open",
+    ),
+    "pause or revoke rolled back by an unreadable anchor": (
+        "test_selfreview_redteam.AnchorRepairTests.test_stops_commit_under_an_unreadable_anchor_and_loosening_does_not",
+        "test_selfreview_redteam.AnchorRepairTests.test_cli_reports_whether_a_stop_committed",
+    ),
+    "lease token bound to a thread wedging a pooled worker": (
+        "test_selfreview_redteam.LeaseTokenTests.test_any_thread_of_the_owning_instance_reacquires_its_lease",
+        "test_selfreview_redteam.LeaseTokenTests.test_release_wait_is_bounded_and_the_owner_recovers",
+    ),
+    "pre-release head-writing databases classified as legacy chains": (
+        "test_selfreview_redteam.HeadsSinceTests.test_databases_written_by_an_earlier_head_writing_build_are_not_legacy",
+    ),
+    "authority reason codes too large to persist a terminal decision": (
+        "test_selfreview_redteam.BoundedAuthorityAndOutcomeTests.test_authority_reason_codes_are_bounded_at_construction",
+    ),
+    "task-outcome evaluation record exceeding the canonical budget": (
+        "test_selfreview_redteam.BoundedAuthorityAndOutcomeTests.test_an_outcome_evaluation_past_the_budget_is_not_done",
+    ),
+    "trade grant without a slippage cap, or a market order with a decorative limit price": (
+        "test_selfreview_redteam.TradeGrantsRequireSlippageCapTests.test_a_trade_grant_cannot_omit_the_cap",
+        "test_selfreview_redteam.TradeGrantsRequireSlippageCapTests.test_a_limit_price_only_bounds_a_declared_limit_order",
+    ),
+    "operator commands dying on a write-locked datastore": (
+        "test_selfreview_redteam.ReadOnlyOpenTests.test_operator_reads_do_not_need_the_write_lock",
+        "test_selfreview_redteam.ReadOnlyOpenTests.test_a_busy_datastore_is_a_typed_refusal_for_the_cli",
+    ),
 }
 
 

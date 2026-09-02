@@ -1094,28 +1094,31 @@ class FAARRuntime:
                     intent.intent_id, ("SETTLEMENT_CANCEL_CONTRADICTS_RECORDED_EFFECT",), decisions,
                     effect_id=previous_effect_id, release_usage=False, replayed=True,
                 )
-            if settlement.effect_id is not None:
-                # The order identity belongs to this intent or to nobody. A cancel
-                # record carrying another intent's effect id at this venue is
-                # identity evidence that contradicts the venue namespace (I-11),
-                # not proof that nothing happened here.
-                owner = self.store.effect_owner(intent.venue, settlement.effect_id)
-                if owner is not None and owner != intent.intent_id:
-                    return self._stop_execution_state(
-                        intent.intent_id, ("EFFECT_ID_ALREADY_CLAIMED",), decisions,
-                        effect_id=previous_effect_id, release_usage=False, replayed=True,
-                    )
             # Cancelled before any fill: no economic effect, terminal at the venue.
             # The intent ends FAILED_SAFE with its budget released and is never
             # resubmitted under this id (a cancel/fill race at the venue is the
             # venue's contract to exclude; see ADAPTER_CONTRACT.md Part C). A permit
             # the venue has not consumed is voided first so it cannot be used after
-            # the release.
+            # the release. The order identity is claimed in the same transaction as
+            # the release: a cancel record carrying another intent's effect id at
+            # this venue is identity evidence that contradicts the venue namespace
+            # (I-11), not proof that nothing happened here, and the unique index
+            # decides that atomically rather than a lookup a concurrent claim could
+            # overtake.
             voided = self.store.void_unconsumed_permits(intent.intent_id)
             if voided:
                 self.store.add_evidence(intent.intent_id, "permits_voided", {"count": voided})
             reasons = ("SETTLEMENT_CANCELLED_UNFILLED",)
-            self.store.transition(intent.intent_id, IntentState.RECONCILING, IntentState.FAILED_SAFE, reason_codes=reasons, release_usage=True)
+            try:
+                self.store.transition(
+                    intent.intent_id, IntentState.RECONCILING, IntentState.FAILED_SAFE,
+                    reason_codes=reasons, effect_id=settlement.effect_id, release_usage=True,
+                )
+            except EffectConflict:
+                return self._stop_execution_state(
+                    intent.intent_id, ("EFFECT_ID_ALREADY_CLAIMED",), decisions,
+                    effect_id=previous_effect_id, release_usage=False, replayed=True,
+                )
             self.store.add_evidence(intent.intent_id, "cancelled_unfilled", {"effect_id": settlement.effect_id})
             return self._current_result(intent.intent_id, decisions=decisions, reason_codes=reasons, replayed=True)
         if settlement.status == SettlementStatus.CONTRADICTORY:

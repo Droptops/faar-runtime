@@ -32,9 +32,10 @@ payload with both `amount_usd` and `notional_usd` is denied before the adapter
 sees it. Amounts are plain ASCII decimals (`50`, `50.00`, `0.5`); a JSON number
 is accepted only when its shortest form fits the same grammar.
 
-**Executor-side price bound.** When the grant sets `max_slippage_bps`, a
-SWAP/BUY/SELL/PLACE_ORDER payload carries `max_slippage_bps` (an integer, at most
-the grant's cap; orders may carry a positive decimal `limit_price` instead). The
+**Executor-side price bound.** A grant that allows SWAP/BUY/SELL/PLACE_ORDER
+sets `max_slippage_bps`, and every such payload carries `max_slippage_bps` (an
+integer, at most the grant's cap; an order declared `order_type: limit` may carry
+a positive decimal `limit_price` instead, a market order may not). The
 bound is part of the request hash the permit binds, so the adapter receives it
 unchanged and **must** enforce it at the venue (minimum output, limit price, or
 the venue's own slippage parameter) or refuse to execute. The risk snapshot's
@@ -209,7 +210,7 @@ the order's effect id; `amount_usd` is the **cumulative** filled amount.
 | any positive status, cumulative amount below the last accepted one | contradictory history (venue bug, wrong-leg lookup) | `STOPPED` (`SETTLEMENT_FILL_REGRESSED`); usage HELD |
 | `CANCELLED`, filled amount > 0 | terminal; the fill so far is the intent's one effect | `FINALIZED` (`SETTLEMENT_CANCELLED_AFTER_PARTIAL_FILL`); the authorized notional is committed |
 | `CANCELLED`, nothing filled, no fill recorded (an open order included) | terminal; no economic effect | `FAILED_SAFE` (`SETTLEMENT_CANCELLED_UNFILLED`); usage RELEASED; never resubmitted under this intent (a new intent is the caller's decision) |
-| `CANCELLED`, nothing filled, effect id owned by another intent at this venue | identity evidence contradicts the venue namespace | `STOPPED` (`EFFECT_ID_ALREADY_CLAIMED`); usage HELD |
+| `CANCELLED`, nothing filled, effect id owned by another intent at this venue | identity evidence contradicts the venue namespace | `STOPPED` (`EFFECT_ID_ALREADY_CLAIMED`); usage HELD; the claim and the release are one transaction |
 | `CANCELLED`, nothing filled, a fill was recorded earlier | contradictory history | `STOPPED` (`SETTLEMENT_CANCEL_CONTRADICTS_RECORDED_EFFECT`); usage HELD |
 | either, not authoritative | no weight | `UNKNOWN` (`SETTLEMENT_POSITIVE_NOT_AUTHORITATIVE` / `SETTLEMENT_CANCEL_NOT_AUTHORITATIVE`); usage HELD |
 

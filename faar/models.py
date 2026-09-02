@@ -27,6 +27,9 @@ MAX_CANONICAL_INT_BITS = 256
 MAX_IDENTIFIER_CHARS = 128
 MIN_INTENT_ID_CHARS = 16
 MAX_SAFE_INT = 2**63 - 1
+# Reason codes carried by a signed authority decision.
+MAX_REASON_CODES = 64
+MAX_REASON_CODE_CHARS = 256
 SUPPORTED_INTENT_SCHEMA_VERSIONS = frozenset({"0.3"})
 
 
@@ -180,6 +183,9 @@ class EconomicPrimitive(StrEnum):
     CANCEL_ORDER = "CANCEL_ORDER"
 
 
+SLIPPAGE_BOUND_PRIMITIVES = frozenset({
+    EconomicPrimitive.SWAP, EconomicPrimitive.BUY, EconomicPrimitive.SELL, EconomicPrimitive.PLACE_ORDER,
+})
 MONETARY_PRIMITIVES = frozenset({
     EconomicPrimitive.PAY,
     EconomicPrimitive.SWAP,
@@ -261,6 +267,19 @@ class AuthorityDecision:
     primitive: AuthorityPrimitive
     reason_codes: tuple[str, ...] = ()
     source: str = "external"
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "posture", AuthorityPosture(self.posture))
+        object.__setattr__(self, "primitive", AuthorityPrimitive(self.primitive))
+        # Reason codes are persisted on the intent row and copied into evidence;
+        # even a trusted signer cannot make a terminal transition unpersistable.
+        codes = tuple(self.reason_codes)
+        if len(codes) > MAX_REASON_CODES:
+            raise ValueError(f"authority reason_codes exceed {MAX_REASON_CODES} entries")
+        for code in codes:
+            if not isinstance(code, str) or len(code) > MAX_REASON_CODE_CHARS:
+                raise ValueError(f"authority reason codes must be strings of at most {MAX_REASON_CODE_CHARS} characters")
+        object.__setattr__(self, "reason_codes", codes)
 
 
 @dataclass(frozen=True)
@@ -359,6 +378,11 @@ class CapabilityGrant:
             raise ValueError("all grants require max_actions_per_window and action_window_seconds")
         if self.limits.max_actions_per_window <= 0:
             raise ValueError("max_actions_per_window must be > 0")
+        # A missing financial limit never reads as infinity: a grant that allows a
+        # traded primitive must state the slippage cap that turns the executor-side
+        # bound on (I-39).
+        if self.allowed_primitives.intersection(SLIPPAGE_BOUND_PRIMITIVES) and self.limits.max_slippage_bps is None:
+            raise ValueError("SWAP/BUY/SELL/PLACE_ORDER grants require max_slippage_bps")
 
         if self.valid_until is not None and not _aware(self.valid_until):
             raise ValueError("grant valid_until must be timezone-aware")

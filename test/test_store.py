@@ -27,7 +27,7 @@ def _velocity_grant() -> CapabilityGrant:
         allowed_assets=frozenset({"BTC", "USD"}),
         limits=CapabilityLimits(
             max_order_usd=Decimal("100"), max_daily_turnover_usd=Decimal("1000"),
-            max_actions_per_window=1, action_window_seconds=100,
+            max_actions_per_window=1, action_window_seconds=100, max_slippage_bps=100,
         ),
     )
 

@@ -116,8 +116,17 @@ def verify_task_outcome(
             failures.append(f"OUTCOME_CRITERION_FAILED:{idx}:{criterion.path}:{criterion.op}")
 
     if failures:
-        return OutcomeResult(OutcomeVerdict.NOT_MET, tuple(failures), evaluated)
-    return OutcomeResult(OutcomeVerdict.MET, (), evaluated)
+        try:
+            return OutcomeResult(OutcomeVerdict.NOT_MET, tuple(failures), evaluated)
+        except ValueError:
+            # The addressed subtrees overlap past the canonical budget; the failures
+            # stand on their own, the evaluation record is omitted.
+            return OutcomeResult(OutcomeVerdict.NOT_MET, tuple(failures) + ("OUTCOME_EVALUATION_UNBOUNDED",))
+    try:
+        return OutcomeResult(OutcomeVerdict.MET, (), evaluated)
+    except ValueError:
+        # MET must carry its evidence; an evaluation that cannot be recorded is not done.
+        return OutcomeResult(OutcomeVerdict.UNKNOWN, ("OUTCOME_EVALUATION_UNBOUNDED",))
 
 
 def verify_attested_task_outcome(

@@ -69,7 +69,7 @@ class AmountGrammarTests(unittest.TestCase):
         decision = evaluate_capability(i, g, NOW)
         self.assertEqual(Verdict.DENY, decision.verdict)
         self.assertIn("AMOUNT_FIELDS_AMBIGUOUS", decision.reason_codes)
-        ok = intent(primitive=EconomicPrimitive.BUY, payload={"base_asset": "BTC", "quote_asset": "USD", "notional_usd": "10", "limit_price": "60000"})
+        ok = intent(primitive=EconomicPrimitive.BUY, payload={"base_asset": "BTC", "quote_asset": "USD", "notional_usd": "10", "order_type": "limit", "limit_price": "60000"})
         self.assertEqual(Verdict.ALLOW, evaluate_capability(ok, g, NOW).verdict)
 
     def test_swap_identical_assets_detected_on_normalised_value(self):
@@ -136,7 +136,7 @@ class ParsingBoundaryTests(unittest.TestCase):
     GRANT = {
         "schema_version": "0.3", "principal_id": "p", "grant_id": "g", "version": 1, "actor_id": "a", "status": "ACTIVE",
         "allowed_primitives": ["SWAP"], "allowed_venues": ["v"], "allowed_assets": ["USDC", "MEME"], "allowed_targets": ["r"],
-        "limits": {"max_order_usd": "75", "max_daily_turnover_usd": "1500", "max_actions_per_window": 10, "action_window_seconds": 60},
+        "limits": {"max_order_usd": "75", "max_daily_turnover_usd": "1500", "max_actions_per_window": 10, "action_window_seconds": 60, "max_slippage_bps": 75},
     }
 
     def test_misspelled_limit_or_top_level_key_is_rejected(self):

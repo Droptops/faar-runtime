@@ -217,6 +217,35 @@
           "allowed_primitives": {
             "contains": {
               "enum": [
+                "SWAP",
+                "BUY",
+                "SELL",
+                "PLACE_ORDER"
+              ]
+            }
+          }
+        },
+        "required": [
+          "allowed_primitives"
+        ]
+      },
+      "then": {
+        "properties": {
+          "limits": {
+            "type": "object",
+            "required": [
+              "max_slippage_bps"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "allowed_primitives": {
+            "contains": {
+              "enum": [
                 "PAY",
                 "SWAP"
               ]

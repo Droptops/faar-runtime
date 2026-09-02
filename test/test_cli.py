@@ -121,7 +121,7 @@ class OperatorCliTests(unittest.TestCase):
         conn = sqlite3.connect(self.db)
         conn.execute("DELETE FROM evidence_head")
         conn.execute("DELETE FROM evidence WHERE intent_id=?", (empty.intent_id,))
-        conn.execute("DELETE FROM store_settings WHERE key='heads_since'")  # a pre-head database
+        conn.execute("UPDATE store_settings SET value='1000000000' WHERE key='heads_since'")  # a pre-head database
         conn.commit()
         conn.close()
         with mock.patch.dict(os.environ, {"FAAR_TEST_EVIDENCE_KEY": key}):

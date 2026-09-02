@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import sqlite3
 import os
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from .adapters import MockMode, MockVenue
-from .anchor import AnchorMismatch, AnchorUnavailable, AuthorityRegression, FileAuthorityAnchor
+from .anchor import AnchorMismatch, AnchorUnavailable, AnchorUnavailableAfterCommit, AuthorityRegression, FileAuthorityAnchor
 from .attestation import Ed25519TrustStore
 from .canonical import canonical_hash
 from .gates import evaluate_authority, evaluate_capability, evaluate_risk
@@ -203,7 +204,18 @@ def main(argv=None) -> None:
     try:
         _main(argv)
     except _OPERATOR_ERRORS as exc:
-        _emit({"error": type(exc).__name__, "message": str(exc)})
+        payload = {"error": type(exc).__name__, "message": str(exc)}
+        if isinstance(exc, AnchorUnavailable):
+            # A stop that committed but could not raise the anchor is an alert to
+            # act on, not a failed stop; scripts must be able to tell the two apart.
+            payload["committed"] = isinstance(exc, AnchorUnavailableAfterCommit)
+        _emit(payload)
+        raise SystemExit(2)
+    except sqlite3.OperationalError as exc:
+        text = str(exc).lower()
+        if "locked" not in text and "busy" not in text:
+            raise
+        _emit({"error": "StoreUnavailable", "message": f"datastore busy: {exc}"})
         raise SystemExit(2)
 
 

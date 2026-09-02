@@ -107,7 +107,9 @@ class PartialFillTests(unittest.TestCase):
         result = self.run_case(runtime, i)
         self.assertEqual(IntentState.FAILED_SAFE, result.state)
         self.assertEqual(("SETTLEMENT_CANCELLED_UNFILLED",), result.reason_codes)
-        self.assertIsNone(self.store.get(i.intent_id).effect_id)
+        # The order identity is claimed with the release so no other intent can
+        # settle against it later; it is not an economic effect.
+        self.assertEqual("order-1", self.store.get(i.intent_id).effect_id)
         self.assertEqual("RELEASED", self.usage_status(i.intent_id))
         replay = self.run_case(runtime, i)
         self.assertEqual(IntentState.FAILED_SAFE, replay.state)

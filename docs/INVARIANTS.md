@@ -66,7 +66,7 @@ Before resubmission, FAAR rechecks intent expiry, grant expiry/status, signed au
 
 ## I-13 — Aggregate usage is atomic
 
-Turnover and velocity constraints are reserved transactionally across distinct intents. Both are trailing windows (24 h and `action_window_seconds`), never calendar buckets, and both span every version of a grant id (a new version never restarts a budget). Velocity bounds venue actions, not effects: an attempt that reached a venue keeps its slot for the window even after its budget was released. A money-moving intent whose amount cannot be parsed as a bounded decimal cannot reserve.
+Turnover and velocity constraints are reserved transactionally across distinct intents. Both are trailing windows (24 h and `action_window_seconds`), never calendar buckets, and both span every version of a grant id for the principal that owns it (a new version never restarts a budget; rows migrated without a principal count for every principal of the grant id). Velocity bounds venue actions, not effects: a reservation that began an attempt keeps its slot for the window even after its budget was released. A retry of the same intent is the same row, so venue attempts per window are bounded by `max_actions_per_window x max_submission_attempts`. A money-moving intent whose amount cannot be parsed as a bounded decimal cannot reserve.
 
 ## I-14 — Risk state is single-consumption and monotonic
 
@@ -150,7 +150,7 @@ With `adapter_deadline_seconds` configured, a hung adapter call cannot hold the 
 
 ## I-33 — Consumed authority cannot be resurrected by restore
 
-With an authority anchor kept outside the backup set, a grant version whose `(runtime_epoch, fence_counter)` regressed behind the anchor is `REGRESSED`: no permit is issued or consumed under it and its lifecycle cannot be changed except by `revoke_after_restore`. The fence counter advances at issuance and at consumption, so a snapshot between the two is detected; the mark is raised inside the datastore transaction, so authority never exists without it (stop-direction changes commit even when the anchor is unreachable and report it). Once a database has been opened with an anchor, an instance without one cannot consume or change authority (`ANCHOR_REQUIRED`), and an unreadable anchor fails closed (`ANCHOR_UNAVAILABLE`). Without an anchor this invariant does not hold; the test suite documents that ceiling.
+With an authority anchor kept outside the backup set, a grant version whose `(runtime_epoch, fence_counter)` regressed behind the anchor is `REGRESSED`: no permit is issued or consumed under it and its lifecycle cannot be changed except by `revoke_after_restore`. The fence counter advances at issuance and at consumption, so a snapshot between the two is detected; the mark is raised inside the datastore transaction, so authority never exists without it. Stop-direction changes (pause, revoke, halt, cap tightening, `revoke_after_restore`) commit even when the anchor is unreachable or unreadable and report `AnchorUnavailableAfterCommit`; the mark they could not raise is raised by re-running the stop and at every anchored open, so the anchor can never stay behind the datastore. Loosening (re-activation, cap loosening) rolls back on any anchor failure. Once a database has been opened with an anchor, an instance without one cannot consume or change authority (`ANCHOR_REQUIRED`), and an unreadable anchor fails closed (`ANCHOR_UNAVAILABLE`). Without an anchor this invariant does not hold; the test suite documents that ceiling.
 
 ## I-34 — Key lifecycle is enforced at verification
 
@@ -158,7 +158,7 @@ Attestation keys and permit signers carry optional validity windows and a revoca
 
 ## I-35 — Partial fills and cancellations never create a second attempt
 
-An authoritative `PARTIALLY_FILLED` record confirms the intent with the order's effect id and is reconciled again later; a zero cumulative amount is an admitted, open order (`SETTLEMENT_ORDER_OPEN`); the unfilled remainder is never resubmitted. The last accepted cumulative fill is persisted and never decreases (`SETTLEMENT_FILL_REGRESSED`). `CANCELLED` is terminal: with a fill it finalizes the intent, without one it fails safe and releases the budget (unless the record carries another intent's order identity, `EFFECT_ID_ALREADY_CLAIMED`), and it never contradicts a recorded fill silently (`test_partial_fills`, `test_economic_redteam`).
+An authoritative `PARTIALLY_FILLED` record confirms the intent with the order's effect id and is reconciled again later; a zero cumulative amount is an admitted, open order (`SETTLEMENT_ORDER_OPEN`); the unfilled remainder is never resubmitted. The last accepted cumulative fill is persisted and never decreases (`SETTLEMENT_FILL_REGRESSED`). `CANCELLED` is terminal: with a fill it finalizes the intent, without one it fails safe and releases the budget while claiming the order identity in the same transaction (another owner is `EFFECT_ID_ALREADY_CLAIMED`, budget held), and it never contradicts a recorded fill silently (`test_partial_fills`, `test_economic_redteam`, `test_selfreview_redteam`).
 
 ## I-36 — Abandoned adapter calls are bounded
 
@@ -174,7 +174,7 @@ Finalize-and-commit and terminalize-and-release are single store transactions, a
 
 ## I-39 — A slippage cap is an execution-side bound
 
-When a grant sets `max_slippage_bps`, every SWAP/BUY/SELL/PLACE_ORDER request must carry `max_slippage_bps` (orders may carry `limit_price` instead), typed and no looser than the cap; the bound is part of the sanitized request and therefore of the permit's request hash, so the adapter cannot drop it without invalidating the permit. `RiskSnapshot.requested_slippage_bps` remains a signer claim about the snapshot (`test_economic_redteam.ExecutorSideSlippageBoundTests`).
+A grant that allows SWAP/BUY/SELL/PLACE_ORDER must set `max_slippage_bps` (a missing financial limit never reads as infinity), and every such request must carry `max_slippage_bps` (an order declared `order_type: limit` may carry `limit_price` instead), typed and no looser than the cap; the bound is part of the sanitized request and therefore of the permit's request hash, so the adapter cannot drop it without invalidating the permit. `RiskSnapshot.requested_slippage_bps` remains a signer claim about the snapshot (`test_economic_redteam.ExecutorSideSlippageBoundTests`, `test_selfreview_redteam`).
 
 ## I-40 — Terminal means no live capability and no forgotten block
 

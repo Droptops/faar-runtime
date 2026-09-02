@@ -53,7 +53,10 @@ faar set-exposure-cap --scope global --clear --db faar.sqlite --anchor faar.anch
 
 A worker that dies inside `process()`/`reconcile()` leaves its durable lease in
 place. By design nothing takes the lease over automatically; every later call
-returns `INTENT_BUSY` after `wait_seconds`.
+returns `INTENT_BUSY` after `wait_seconds`. The lease is owned by the store
+instance (not a thread), so a live worker whose release failed on a busy
+datastore re-acquires its own lease on its next call from any thread; a release
+waits about five seconds at most before it reports `StoreUnavailable`.
 
 ```bash
 faar list-leases --db faar.sqlite          # shows owner_token, host, pid, acquired_at
@@ -131,6 +134,19 @@ turnover window (24 h) or whose grant's `action_window_seconds` has not passed,
 every non-terminal intent, and every row the evidence chain of a retained intent
 references; archive terminal intents older than that together with their
 evidence and permits, never by deleting rows from a live database.
+
+Anchor behind the datastore: a stop (`set-grant-status PAUSED|REVOKED`, `halt`,
+`set-exposure-cap` tightening, `revoke-after-restore`) that could not raise the
+anchor mark still commits and exits 2 with `"error": "AnchorUnavailableAfterCommit",
+"committed": true`. Treat it as an alert: re-run the same command once the anchor
+is reachable (a re-run is never a no-op: it raises the mark), or simply open the
+store with `--anchor` (every anchored open raises marks that are behind their
+rows); `list-grants` shows `anchor_behind` per grant version. `"committed":
+false` means nothing changed. Do not take a backup while any grant shows
+`anchor_behind: true`. The opposite case, an anchor ahead of the datastore after a
+transient failure between the anchor write and the commit at issuance or
+consumption, reports `REGRESSED` for that grant version; the only continuation is
+`revoke-after-restore` and a new grant version (fail closed by design).
 
 ```bash
 faar provision-grant --grant grant.json --db faar.sqlite --anchor /mnt/anchor/faar.anchor.json

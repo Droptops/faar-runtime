@@ -26,11 +26,11 @@ Both reconcile first. Submitter output never decides which.
 | `FINALIZED`, authoritative, bound to this request, valid effect id, amount inside envelope | | `FINALIZED`, usage COMMITTED |
 | `CONFIRMED`, same conditions | | `CONFIRMED` (reconciles again later) |
 | `PARTIALLY_FILLED`, authoritative, bound, valid effect id, 0 < amount <= authorized | | `CONFIRMED (SETTLEMENT_PARTIAL_FILL_OPEN)`, usage HELD; reconciled again later, never resubmitted |
-| `PARTIALLY_FILLED`, authoritative, bound, valid effect id, amount 0 | | `CONFIRMED (SETTLEMENT_ORDER_OPEN)`, usage HELD; the order is admitted and resting |
+| `PARTIALLY_FILLED`, authoritative, bound, valid effect id, amount 0 | not `PAY` (`PAYMENT_PARTIAL_NOT_ALLOWED` stops) | `CONFIRMED (SETTLEMENT_ORDER_OPEN)`, usage HELD; the order is admitted and resting |
 | any positive status or `CANCELLED`, authoritative, amount below the last accepted cumulative fill | a fill was recorded | `STOPPED (SETTLEMENT_FILL_REGRESSED)`, usage HELD |
 | `CANCELLED`, authoritative, filled amount > 0 | | `FINALIZED (SETTLEMENT_CANCELLED_AFTER_PARTIAL_FILL)`, usage COMMITTED |
 | `CANCELLED`, authoritative, nothing filled | no fill recorded (an open order counts as none) | `FAILED_SAFE (SETTLEMENT_CANCELLED_UNFILLED)`, usage RELEASED, no resubmission under this intent |
-| `CANCELLED`, authoritative, nothing filled | effect id owned by another intent at this venue | `STOPPED (EFFECT_ID_ALREADY_CLAIMED)`, usage HELD |
+| `CANCELLED`, authoritative, nothing filled | effect id owned by another intent at this venue (decided by the unique index in the release transaction) | `STOPPED (EFFECT_ID_ALREADY_CLAIMED)`, usage HELD |
 | `CANCELLED`, authoritative, nothing filled | a fill was recorded | `STOPPED (SETTLEMENT_CANCEL_CONTRADICTS_RECORDED_EFFECT)`, usage HELD |
 | `CONFIRMED`/`FINALIZED`/`PARTIALLY_FILLED`, not authoritative | | `UNKNOWN (SETTLEMENT_POSITIVE_NOT_AUTHORITATIVE)`, usage HELD |
 | `CANCELLED`, not authoritative | | `UNKNOWN (SETTLEMENT_CANCEL_NOT_AUTHORITATIVE)`, usage HELD |
@@ -149,7 +149,7 @@ authority. The default reference limit is intentionally small.
 `FINALIZED` and the usage commit are one store transaction, as are every
 terminal transition and its release. `evals/run_crash_injection.py` (`make crash`)
 kills a worker process immediately before each store call a clean run makes, for
-six scenarios (success, timeout before and after the effect, ambiguous venue,
+seven scenarios (success, timeout before and after the effect, ambiguous venue,
 deterministic rejection, partial fill then cancel), then recovers exactly as
 `OPERATIONS.md` §2 prescribes and asserts: at most one effect and two adapter
 calls, an effect implies `FINALIZED` with usage `COMMITTED`, a terminal intent

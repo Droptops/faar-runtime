@@ -54,6 +54,8 @@ SCENARIOS = (
     ("ambiguous_admission_then_recovered", MockMode.AMBIGUOUS, MockMode.SUCCESS, None),
     ("deterministic_rejection", MockMode.SUCCESS, MockMode.SUCCESS, "reject"),
     ("partial_fill_then_cancel", MockMode.PARTIAL_FILL, MockMode.PARTIAL_FILL, None),
+    # The order is admitted and rests unfilled; recovery cancels it at the venue.
+    ("open_order_then_cancel", MockMode.OPEN_ORDER, MockMode.OPEN_ORDER, None),
 )
 
 # Per scenario: the largest legitimate number of venue calls, and the acceptable
@@ -74,6 +76,7 @@ EXPECTED = {
     # itself. A persisted deterministic block ends FAILED_SAFE with budget released.
     "deterministic_rejection": (1, {("FINALIZED", "COMMITTED", 1), ("FAILED_SAFE", "RELEASED", 0)}),
     "partial_fill_then_cancel": (1, {("FINALIZED", "COMMITTED", 1)}),
+    "open_order_then_cancel": (1, {("FAILED_SAFE", "RELEASED", 0)}),
 }
 
 
@@ -229,7 +232,7 @@ def _recover(db: str, venue_path: str, scenario: str) -> dict:
         aa, ra = attest_pair(t, i, AUTH, rs, clock["now"])
         result = runtime.process(i, AUTH, grant(), rs, authority_attestation=aa, risk_attestation=ra, now=clock["now"])
         results.append({"state": result.state.value, "reason_codes": list(result.reason_codes)})
-        if scenario == "partial_fill_then_cancel" and result.state == IntentState.CONFIRMED:
+        if scenario in ("partial_fill_then_cancel", "open_order_then_cancel") and result.state == IntentState.CONFIRMED:
             venue.cancel_order(__import__("faar.models", fromlist=["ExecutionRequest"]).ExecutionRequest.from_intent(i))
         if result.state in TERMINAL_STATES:
             break

@@ -28,7 +28,7 @@ Out of scope:
 
 See [`RED_TEAM_REPORT.md`](RED_TEAM_REPORT.md) RT-42..RT-116 and the CHANGELOG. Breaking changes for integrators:
 
-- a grant that sets `max_slippage_bps` now requires `max_slippage_bps` in every SWAP/BUY/SELL/PLACE_ORDER payload (orders may carry `limit_price` instead); the bound is inside the permit's request hash and the adapter must enforce it (I-39);
+- a grant that allows SWAP/BUY/SELL/PLACE_ORDER must set `max_slippage_bps` (construction and schema), and every such payload must carry `max_slippage_bps` (an order declared `order_type: limit` may carry `limit_price` instead); the bound is inside the permit's request hash and the adapter must enforce it (I-39);
 - JSON-number amounts are admitted only when their shortest form fits the money grammar;
 - intent payload and metadata carry a 64 KiB string-content budget each.
 
@@ -46,14 +46,14 @@ Current `make check` headline results:
 
 | Gate | Result |
 |---|---|
-| Unit/invariant tests | 339/339 pass |
-| Targeted red-team | 148 attack classes mapped to 207 named tests, 0 unmapped |
+| Unit/invariant tests | 353/353 pass |
+| Targeted red-team | 158 attack classes mapped to 221 named tests, 0 unmapped |
 | Adversarial denial cases | 160; 0 unauthorized economic effects; 0 adapter calls |
 | Same-intent replay attempts | 100; 1 effect, 1 adapter call, 1 permit issued and consumed |
 | Seeded fuzz scenarios | 96; 0 duplicate-effect violations; 0 aggregate-budget violations |
 | Bounded permit model | 3940 states, 10047 transitions, 0 violations; stale permit unconsumable after revoke and after halt/resume; 223 violations without the permit-window rule, 399 without the consumed-permit ledger check |
 | Demo | mock execution FINALIZED once; keyed evidence chain and head commitment valid |
-| Crash injection | 191 worker kills before every store call across 6 scenarios; 0 duplicate effects, 0 lost effects, 0 stranded budget, every recovery terminal |
+| Crash injection | 224 worker kills before every store call across 7 scenarios; 0 duplicate effects, 0 lost effects, 0 stranded budget, every recovery terminal |
 
 ## Claim boundary
 

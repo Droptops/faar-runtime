@@ -240,7 +240,13 @@ def evaluate_capability(intent: Intent, grant: CapabilityGrant, now: datetime) -
     slippage_cap = grant.limits.max_slippage_bps
     if slippage_cap is not None and intent.primitive in _SLIPPAGE_BOUND_PRIMITIVES:
         bound = intent.payload.get("max_slippage_bps")
-        has_limit_price = intent.primitive != EconomicPrimitive.SWAP and intent.payload.get("limit_price") is not None
+        # A limit price bounds the fill only for an order declared as a limit order;
+        # a market order with a decorative limit_price has no executor-side bound.
+        has_limit_price = (
+            intent.primitive != EconomicPrimitive.SWAP
+            and intent.payload.get("limit_price") is not None
+            and str(intent.payload.get("order_type", "")).lower() == "limit"
+        )
         if bound is None:
             if not has_limit_price:
                 reasons.append("PAYLOAD_FIELD_REQUIRED:max_slippage_bps")

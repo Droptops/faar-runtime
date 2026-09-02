@@ -15,7 +15,7 @@ from decimal import Decimal
 from faar.adapters import MockMode
 from faar.canonical import canonical_hash, parse_bounded_decimal
 from faar.gates import evaluate_capability
-from faar.models import EconomicPrimitive, ExecutionReceipt, ExecutionRequest, IntentState, SettlementStatus, Verdict
+from faar.models import EconomicPrimitive, ExecutionReceipt, ExecutionRequest, IntentState, SettlementRecord, SettlementStatus, Verdict
 from faar.runtime import FAARRuntime
 from faar.store import SQLiteIntentStore
 from support import AUTH, NOW, attest_pair, build_mock_runtime, grant, intent, permit_stack, risk, temp_path, trust, verification_trust
@@ -23,6 +23,13 @@ from test_runtime_hardening import ScriptedAdapter, ScriptedVerifier, _auth
 
 RECEIPT = ExecutionReceipt("order-1", SettlementStatus.PARTIALLY_FILLED, {"venue": "mock-dex"}, Decimal("20"))
 RECEIPT_OPEN = ExecutionReceipt("order-1", SettlementStatus.PARTIALLY_FILLED, {"venue": "mock-dex"}, Decimal("0"))
+
+
+def _cancelled_per_intent(request):
+    return SettlementRecord(
+        SettlementStatus.CANCELLED, effect_id="order-" + request.intent_id[-4:], amount_usd=None,
+        evidence={"source": "independent"}, authoritative=True, verified_request_hash=canonical_hash(request),
+    )
 
 
 class _RuntimeCase(unittest.TestCase):
@@ -61,7 +68,8 @@ class VelocityBoundsVenueAttemptsTests(_RuntimeCase):
     def test_cancelled_unfilled_attempts_keep_their_velocity_slot(self):
         tight = grant(grant_id="grant:velocity", limits=replace(grant().limits, max_actions_per_window=2))
         self.store.provision_grant(tight, canonical_hash(tight))
-        adapter = ScriptedAdapter([RECEIPT, RECEIPT, RECEIPT], [_auth(SettlementStatus.CANCELLED, "order-1", None)])
+        # Each intent's order has its own identity at the venue.
+        adapter = ScriptedAdapter([RECEIPT, RECEIPT, RECEIPT], [_cancelled_per_intent])
         runtime = self.runtime_for(adapter)
         for n in (1, 2):
             i = intent(intent_id=f"intent_econ_00000000000{n}", grant_id="grant:velocity")
@@ -161,23 +169,27 @@ class ExecutorSideSlippageBoundTests(_RuntimeCase):
             decision = evaluate_capability(intent(payload={**intent().payload, "max_slippage_bps": bad}), g, NOW)
             self.assertEqual(Verdict.DENY, decision.verdict, repr(bad))
             self.assertIn("SLIPPAGE_BOUND_INVALID", decision.reason_codes, repr(bad))
-        # Without a grant cap the field is optional but still typed.
-        uncapped = grant(limits=replace(grant().limits, max_slippage_bps=None))
-        self.assertEqual(Verdict.ALLOW, evaluate_capability(without, uncapped, NOW).verdict)
-        self.assertIn(
-            "SLIPPAGE_BOUND_INVALID",
-            evaluate_capability(intent(payload={**intent().payload, "max_slippage_bps": "50"}), uncapped, NOW).reason_codes,
-        )
+        # A grant that allows a traded primitive cannot omit the cap: a missing
+        # financial limit never reads as infinity.
+        with self.assertRaisesRegex(ValueError, "max_slippage_bps"):
+            grant(limits=replace(grant().limits, max_slippage_bps=None))
+        pay_only = grant(allowed_primitives=frozenset({EconomicPrimitive.PAY}), limits=replace(grant().limits, max_slippage_bps=None))
+        self.assertIsNone(pay_only.limits.max_slippage_bps)
 
     def test_orders_may_carry_a_limit_price_instead(self):
         g = grant(allowed_primitives=frozenset({EconomicPrimitive.BUY}), allowed_assets=frozenset({"BTC", "USD"}))
         base = {"base_asset": "BTC", "quote_asset": "USD", "notional_usd": "10", "target": "router:approved"}
         market = evaluate_capability(intent(primitive=EconomicPrimitive.BUY, payload=base), g, NOW)
         self.assertIn("PAYLOAD_FIELD_REQUIRED:max_slippage_bps", market.reason_codes)
-        for bounded in ({**base, "limit_price": "60000"}, {**base, "max_slippage_bps": 10}):
+        for bounded in ({**base, "order_type": "limit", "limit_price": "60000"}, {**base, "max_slippage_bps": 10}):
             self.assertEqual(Verdict.ALLOW, evaluate_capability(intent(primitive=EconomicPrimitive.BUY, payload=bounded), g, NOW).verdict)
+        # A limit price only bounds a limit order; a market order carrying one still
+        # needs the slippage bound.
+        for market in ({**base, "limit_price": "60000"}, {**base, "order_type": "market", "limit_price": "60000"}):
+            decision = evaluate_capability(intent(primitive=EconomicPrimitive.BUY, payload=market), g, NOW)
+            self.assertIn("PAYLOAD_FIELD_REQUIRED:max_slippage_bps", decision.reason_codes)
         for bad in ("0", "-1", "abc", "1e5", 60000.123456789):
-            decision = evaluate_capability(intent(primitive=EconomicPrimitive.BUY, payload={**base, "limit_price": bad}), g, NOW)
+            decision = evaluate_capability(intent(primitive=EconomicPrimitive.BUY, payload={**base, "order_type": "limit", "limit_price": bad}), g, NOW)
             self.assertIn("LIMIT_PRICE_INVALID", decision.reason_codes, repr(bad))
 
     def test_bound_travels_in_the_hash_bound_request(self):
