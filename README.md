@@ -152,7 +152,8 @@ faar/
   anchor.py           # external authority high-water mark (restore safety)
   adapters.py         # execution adapter contract and deterministic mock venue
   settlement.py       # independent settlement verifiers (mock, quorum)
-  paper.py            # safe paper-trading adapter
+  paper.py            # safe paper-trading adapter (shares book with its verifier)
+  paper_gateway.py    # paper venue with split submit/query credentials
   outcomes.py         # definition-of-done verification
   cli.py              # demo, provisioning, and operator commands
 
@@ -163,6 +164,7 @@ docs/
   GRANT_PROVISIONING.md   DEFINITION_OF_DONE.md    UNPLUG_TEST.md
   RED_TEAM_REPORT.md      GO_LIVE_CHECKLIST.md     V0_4_RELEASE.md
   V0_2_RELEASE_GATES.md   V0_3_RELEASE.md (historical)
+  adapters/PAPER_GATEWAY.md   # paper-gateway review record (not live-money)
 
 schemas/              # intent, grant, risk, attestation, task contract (0.3 documents)
 evals/                # adversarial, mapped red-team matrix, fuzz, bounded-model harnesses
@@ -195,4 +197,4 @@ See [`docs/V0_4_RELEASE.md`](docs/V0_4_RELEASE.md). The deterministic release ga
 
 These are deterministic regression, adversarial, fuzz, mutation-derived, and bounded-model results. They are not formal verification, an independent security audit, or a production-safety claim.
 
-Before any live-money adapter, the repository still requires the gates in [`docs/V0_2_RELEASE_GATES.md`](docs/V0_2_RELEASE_GATES.md); [`docs/GO_LIVE_CHECKLIST.md`](docs/GO_LIVE_CHECKLIST.md) records which are closed in-repo (key rotation, cross-process fencing, restore safety, kill switch, bounded deadlines, ambiguity window), which belong to a deployment (key custody, venue-side permit verification, credential scoping, authenticated ingress, anchor placement, capped exposure), and which remain open (partial-fill/cancel semantics, datastore failover, independent security review). Do not add a real-money adapter until every row is closed and independently reviewed.
+Before any live-money adapter, the repository still requires the gates in [`docs/V0_2_RELEASE_GATES.md`](docs/V0_2_RELEASE_GATES.md); [`docs/GO_LIVE_CHECKLIST.md`](docs/GO_LIVE_CHECKLIST.md) records which are closed in-repo (including the paper-gateway venue's stable identity, finality, cancel-never-fills, and split query path), which belong to a deployment (key custody, live venue-side permit verification, credential scoping, authenticated ingress, anchor placement, capped exposure), and which remain open (runtime partial-fill/cancel semantics, datastore failover, independent security review). Do not add a real-money adapter until every row is closed and independently reviewed.

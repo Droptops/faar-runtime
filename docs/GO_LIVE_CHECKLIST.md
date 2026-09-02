@@ -27,14 +27,14 @@ DEPLOYMENT and OPEN row is closed and the result has been independently reviewed
 | 3.2 | authoritative portfolio / market semantics | DEPLOYMENT | `RISK_ENGINE_CONTRACT.md` (external risk signer) |
 | 3.3 | no aggregate oversubscription under concurrency | DONE-IN-REPO | `test_runtime`, `test_multiprocess`, `evals/run_state_fuzz.py`, `test_store_hardening.TurnoverWindowTests` |
 | 4.1 | bounded adapter deadlines | DONE-IN-REPO | `adapter_deadline_seconds`; `test_runtime_hardening` deadline tests |
-| 4.2 | stable external intent identity | DEPLOYMENT (per venue; the contract is documented, no in-repo test can prove it for a real venue) | `ADAPTER_CONTRACT.md` A2; `test_runtime.test_adapter_without_exactly_once_contract_is_rejected` checks the declared profile only |
+| 4.2 | stable external intent identity | DONE-IN-REPO (paper-gateway `client_order_id`) / DEPLOYMENT (live venue) | `docs/adapters/PAPER_GATEWAY.md`; `test_paper_gateway.PaperGatewayTests.test_stable_client_order_id_is_principal_and_intent` |
 | 4.3 | authoritative reconciliation by identity | DONE-IN-REPO (contract) / DEPLOYMENT | `test_runtime` settlement tests, `test_settlement` |
 | 4.4 | partial-fill / cancel semantics | OPEN (documented, unmodelled) | `ADAPTER_CONTRACT.md` Part C; `test_mutation_gaps.SettlementPathTests.test_partial_fill_below_authorized_finalizes_and_commits_authorized_amount` pins current behaviour |
 | 4.5 | effect ID definition | DONE-IN-REPO (contract, per venue) | `INVARIANTS.md` I-10/I-11 |
 | 4.6 | authoritative positive and negative reconciliation | DONE-IN-REPO | `test_runtime_hardening` weak-observation tests |
 | 4.7 | independent settled amount / asset / target verification | DONE-IN-REPO (amount) / DEPLOYMENT (venue evidence) | I-24 tests, `test_mutation_gaps.PayPrimitiveTests` |
 | 4.8 | retry behaviour and maximum ambiguity window | DONE-IN-REPO | permit-bounded ambiguity window recorded at permit issuance for every adapter outcome; one live permit per intent; `test_runtime_hardening`, `test_permits`, model check |
-| 4.9 | finality definition | DEPLOYMENT (per venue) | `ADAPTER_CONTRACT.md` |
+| 4.9 | finality definition | DONE-IN-REPO (paper-gateway: fill is immediately FINALIZED; pending is non-authoritative UNKNOWN; cancel is authoritative NONE) / DEPLOYMENT (live venue) | `docs/adapters/PAPER_GATEWAY.md`; `test_paper_gateway` |
 | 5.1 | model cannot access signing secrets | DONE-IN-REPO (structure) / DEPLOYMENT (process isolation) | `UNPLUG_TEST.md` |
 | 5.2 | credential scope narrower than root authority | DEPLOYMENT | venue configuration |
 | 5.3 | withdrawal authority disabled for trading credentials | DEPLOYMENT | venue configuration |
@@ -46,7 +46,7 @@ DEPLOYMENT and OPEN row is closed and the result has been independently reviewed
 | 6.4 | datastore failover | OPEN (not testable against SQLite) | `V0_4_RELEASE.md` not-tested list |
 | 6.5 | stale / malicious RPC or provider | DONE-IN-REPO (fail closed; a transient single-source error is retriable, a contest stops) | non-authoritative settlement tests, quorum tests |
 | 6.6 | revocation during submission | DONE-IN-REPO | fence and cross-process tests |
-| 6.7 | partial fill + cancellation race | OPEN | see 4.4 |
+| 6.7 | partial fill + cancellation race | DONE-IN-REPO (paper-gateway: a cancelled GTC order cannot fill after a later match) / OPEN (runtime still has no partial-fill/cancel state) | `test_paper_gateway.PaperGatewayTests.test_cancelled_gtc_order_never_fills_after_the_book_moves`; see 4.4 |
 | 6.8 | venue returns changing identifiers / states | DONE-IN-REPO | effect continuity tests |
 | 7.1 | authenticated intent creation | DEPLOYMENT (ingress) | `THREAT_MODEL.md` intent-namespace section |
 | 7.2 | separately authorized provisioning / pause / resume / revoke | DEPLOYMENT (ingress); in-repo the runtime cannot provision or change lifecycle | `test_mutation_gaps.GrantProvisioningTests` |
@@ -72,7 +72,7 @@ DEPLOYMENT and OPEN row is closed and the result has been independently reviewed
 | R-09 hung adapter delays revocation; orphaned adapter threads | DONE-IN-REPO | deadline + kill switch; a cancelled Python call cannot be killed, the venue refuses its expired or superseded permit |
 | R-10 intent namespace squatting | DEPLOYMENT | ingress authentication |
 | R-11 trusted clock | DEPLOYMENT | |
-| R-12 mock verifier shares ground truth with mock venue | DEPLOYMENT | independent read path or quorum per venue |
+| R-12 mock verifier shares ground truth with mock venue | DONE-IN-REPO (paper-gateway query credential / HTTP reconcile path) / DEPLOYMENT (mock venue and live venues) | `test_paper_gateway` query-cannot-submit and HTTP token-split tests |
 | R-13 anchor placement | DEPLOYMENT | anchor restored with the DB detects nothing |
 | R-14 partial fills and cancellation | OPEN | see gates 4.4 and 6.7; `ADAPTER_CONTRACT.md` Part C |
 

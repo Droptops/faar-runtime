@@ -59,10 +59,10 @@ Do **not** describe FAAR v0.4.0 as formally verified, independently audited, pro
 
 - datastore failover (the reference store is SQLite);
 - partial fill and cancellation races;
-- venue-side permit verification against a real venue;
+- venue-side permit verification against a live venue (the paper gateway verifies permits in-process / on loopback HTTP only);
 - key custody in KMS/HSM;
 - authenticated ingress.
 
 ## Remaining blockers before live-money use
 
-[`GO_LIVE_CHECKLIST.md`](GO_LIVE_CHECKLIST.md) maps every gate in [`V0_2_RELEASE_GATES.md`](V0_2_RELEASE_GATES.md) and every residual risk to its status and evidence. The OPEN rows are partial-fill/cancel semantics, datastore failover, and the independent security review; the DEPLOYMENT rows are key custody, venue-side permit verification, credential scoping, authenticated ingress, anchor placement, and a capped first exposure. Do not add a real-money adapter, seed phrase, private key, or production credential to this repository until those are met.
+[`GO_LIVE_CHECKLIST.md`](GO_LIVE_CHECKLIST.md) maps every gate in [`V0_2_RELEASE_GATES.md`](V0_2_RELEASE_GATES.md) and every residual risk to its status and evidence. The OPEN rows are runtime partial-fill/cancel semantics, datastore failover, and the independent security review; the paper gateway makes the paper-venue rows of gates 4.2, 4.9, 6.7 and residual R-12 testable in-repo. The remaining DEPLOYMENT rows are key custody, live venue-side permit verification, credential scoping, authenticated ingress, anchor placement, and a capped first exposure. Do not add a real-money adapter, seed phrase, private key, or production credential to this repository until those are met.

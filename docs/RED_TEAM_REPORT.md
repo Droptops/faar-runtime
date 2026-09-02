@@ -182,7 +182,7 @@ Caller-provided time cannot roll the security clock backwards, but a compromised
 
 ### R-12 — Reference settlement verifier shares ground truth with the mock venue
 
-The runtime enforces a distinct, trusted verifier per adapter, but `MockSettlementVerifier` reads the same in-memory ledger as `MockVenue`; independence in the reference is structural, not evidential. Live venues need an independently authenticated read path or a quorum.
+The runtime enforces a distinct, trusted verifier per adapter, but `MockSettlementVerifier` reads the same in-memory ledger as `MockVenue`; independence in the mock is structural, not evidential. The paper gateway (`faar/paper_gateway.py`) is the first in-repo venue whose verifier holds only a query credential and cannot submit; the mock path and any live venue still need an independently authenticated read path or a quorum.
 
 ### R-13 — Anchor placement
 
@@ -199,3 +199,14 @@ The strongest supportable claim is narrow:
 > Under the current deterministic mock/paper adapter model and the encoded fault classes, FAAR v0.4.0 preserves the tested authorization, bounded-capability, replay/recovery, permit-fencing, aggregate-usage, settlement-integrity, restore-safety and key-lifecycle invariants.
 
 It is **not** a production-security claim, live-venue claim, custody claim, or proof that a compromised trusted adapter cannot move funds incorrectly.
+
+## Paper gateway venue (unreleased)
+
+The paper gateway is a loopback/paper book, not a funded venue. New attack classes mapped in `evals/run_redteam.py`:
+
+- a query credential creating an order;
+- a fill worse than the request `limit_price`;
+- a cancelled GTC order filling after the book moves;
+- a rebound payload reconciling as the original fill.
+
+These are regression tests for that venue. They do not close gate 8 and they do not authorize a live-money adapter.

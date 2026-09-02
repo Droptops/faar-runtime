@@ -32,7 +32,7 @@ timeout_after_effect_successful_effects = 1
 
 ## Targeted red team
 
-`run_redteam.py` maps 100 named attack classes to 131 concrete unit tests, loads the suite in-process, asserts that every mapped test exists and passes, and reports any `unmapped_tests`. The headline count therefore cannot drift from real coverage: deleting a mapped test fails the gate.
+`run_redteam.py` maps named attack classes to concrete unit tests, loads the suite in-process, asserts that every mapped test exists and passes, and reports any `unmapped_tests`. The headline count therefore cannot drift from real coverage: deleting a mapped test fails the gate. The paper-gateway venue adds classes for query-credential submission, a fill worse than `limit_price`, a cancelled order filling after a later match, and a rebound request hash.
 
 ## Seeded state-machine fuzz
 

@@ -125,6 +125,12 @@ def _validate_intent_shape(intent: Intent) -> list[str]:
         # ceiling be enforced on one while an adapter executes the other.
         if "amount_usd" in payload and "notional_usd" in payload:
             reasons.append("AMOUNT_FIELDS_AMBIGUOUS")
+        # A present limit_price is the request's venue-side price/slippage bound.
+        # Garbage here must not reach an adapter that could ignore or reinterpret it.
+        if "limit_price" in payload:
+            limit_price = _decimal(payload.get("limit_price"))
+            if limit_price is None or limit_price <= 0:
+                reasons.append("LIMIT_PRICE_INVALID")
     elif intent.primitive == EconomicPrimitive.CANCEL_ORDER:
         if payload.get("order_id") in (None, ""):
             reasons.append("PAYLOAD_FIELD_REQUIRED:order_id")

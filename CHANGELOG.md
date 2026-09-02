@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+Paper gateway venue (not a live-money adapter):
+
+- `faar/paper_gateway.py`: venue-side permit consumption, `limit_price` envelope, GTC cancel-never-fills, and a query credential that cannot submit. Optional loopback HTTP (`127.0.0.1` only) with a 2 s client timeout.
+- Capability gate denies a present but non-canonical `limit_price` (`LIMIT_PRICE_INVALID`).
+- Review record: `docs/adapters/PAPER_GATEWAY.md`. Tests in `test/test_paper_gateway.py`.
+- In-repo evidence for paper-gateway rows of gates 4.2, 4.9, 6.7 and residual R-12. Gate 8, live venues, and funded credentials remain closed.
+
 ## 0.4.0 — 2026-09-02
 
 Third adversarial pass over v0.3.1 plus the operator controls a first bounded deployment needs, followed by an independent five-lens review of the change set itself. Still **pre-alpha and not approved for live funds or production credentials**. See [`docs/RED_TEAM_REPORT.md`](docs/RED_TEAM_REPORT.md) findings RT-42..RT-79 and [`docs/GO_LIVE_CHECKLIST.md`](docs/GO_LIVE_CHECKLIST.md).

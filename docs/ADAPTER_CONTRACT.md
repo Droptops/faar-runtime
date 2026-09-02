@@ -177,6 +177,12 @@ and late-fill linkage is out of scope for v0.4 and is an open go-live item.
 
 ## Required review document
 
+The paper gateway (`faar/paper_gateway.py`) is the in-repo example of this
+split: venue-side permit consumption, a `limit_price` envelope, and a query
+credential that cannot submit. Its review record is
+[`adapters/PAPER_GATEWAY.md`](adapters/PAPER_GATEWAY.md). It is not a live-money
+adapter.
+
 Before merge, every live adapter and its verifier must document:
 
 ```text
