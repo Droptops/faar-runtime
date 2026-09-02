@@ -4,8 +4,10 @@ import unittest
 from dataclasses import replace
 from decimal import Decimal
 
+from faar.canonical import canonical_hash
 from faar.models import (
     AttestationKind,
+    ExecutionRequest,
     OutcomeCriterion,
     OutcomeVerdict,
     SettlementRecord,
@@ -48,16 +50,22 @@ class OutcomeTests(unittest.TestCase):
             issued_at=NOW,
             expires_at=NOW.replace(hour=19),
         )
+        # The attested path binds the settlement to this intent's execution request;
+        # a record carrying any other binding is UNKNOWN, never MET.
         settlement = SettlementRecord(
             SettlementStatus.FINALIZED,
             effect_id="fx-2",
             evidence={"fill": {"to_quantity": "100", "to_asset": "MEME"}},
-            authoritative=True, verified_request_hash="outcome-test-request",
+            authoritative=True, verified_request_hash=canonical_hash(ExecutionRequest.from_intent(i)),
         )
         t = trust()
         att = t.sign("task-test", AttestationKind.TASK, contract, i, issued_at=NOW, ttl_seconds=30)
         result = verify_attested_task_outcome(contract, settlement, attestation=att, intent=i, trust=verification_trust(t), now=NOW)
         self.assertEqual(OutcomeVerdict.MET, result.verdict)
+        unbound = replace(settlement, verified_request_hash="outcome-test-request")
+        result = verify_attested_task_outcome(contract, unbound, attestation=att, intent=i, trust=verification_trust(t), now=NOW)
+        self.assertEqual(OutcomeVerdict.UNKNOWN, result.verdict)
+        self.assertIn("TASK_SETTLEMENT_INTENT_MISMATCH", result.reason_codes)
 
     def test_agent_cannot_rewrite_attested_done_criteria(self):
         i = intent()

@@ -1,15 +1,14 @@
 from __future__ import annotations
 
-import base64
 import hashlib
 import hmac
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 from typing import Protocol
 
-from .attestation import AttestationVerifier, has_signing_api
-from .canonical import canonical_hash, canonical_json
+from .attestation import AttestationVerifier, decode_ed25519_signature, encode_ed25519_signature, has_signing_api
+from .canonical import canonical_hash, canonical_json, parse_bounded_decimal
 from .gates import evaluate_authority, evaluate_capability, evaluate_risk
 from .models import (
     Attestation,
@@ -52,13 +51,28 @@ class PermitSigner(Protocol):
 
 
 def _ed25519_verify(public_key, payload: bytes, signature: str) -> bool:
-    pad = "=" * (-len(signature) % 4)
+    raw = decode_ed25519_signature(signature)
+    if raw is None:
+        return False
     try:
-        raw = base64.urlsafe_b64decode(signature + pad)
         public_key.verify(raw, payload)
         return True
     except Exception:
         return False
+
+
+def signed_permit_payload(permit: ExecutionPermit, signer_id: str, algorithm: PermitAlgorithm) -> bytes:
+    """Bytes covered by a permit signature.
+
+    The signer identity and algorithm are inside the signed payload (as they are
+    for attestations) so a permit cannot be re-labelled to another key or
+    algorithm once multi-key or rotating verifiers exist.
+    """
+    return canonical_json({
+        "permit": permit,
+        "signer_id": signer_id,
+        "algorithm": PermitAlgorithm(algorithm).value,
+    }).encode("utf-8")
 
 
 @dataclass(frozen=True)
@@ -126,8 +140,7 @@ class Ed25519PermitSigner:
         self._public_key = private_key.public_key()
 
     def sign(self, payload: bytes) -> str:
-        raw = self._private_key.sign(payload)
-        return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+        return encode_ed25519_signature(self._private_key.sign(payload))
 
     def public_verifier(self) -> Ed25519PermitVerifier:
         return Ed25519PermitVerifier(self.signer_id, self._public_key)
@@ -161,14 +174,10 @@ class PermitControlStore(Protocol):
 
 
 def _amount(request: ExecutionRequest) -> Decimal | None:
-    raw = request.payload.get("amount_usd", request.payload.get("notional_usd"))
-    if raw is None:
-        return None
-    try:
-        value = Decimal(str(raw))
-    except (InvalidOperation, TypeError, ValueError):
-        return None
-    return value if value.is_finite() else None
+    # Same bounded parser as the gates and the store: an amount that cannot be
+    # canonicalized is rejected here, before any fence token or risk-state claim
+    # is consumed, instead of failing at signature time.
+    return parse_bounded_decimal(request.payload.get("amount_usd", request.payload.get("notional_usd")))
 
 
 class ConstrainedPermitAuthority:
@@ -295,9 +304,13 @@ class ConstrainedPermitAuthority:
         if status != "ACTIVE" or current_epoch != epoch:
             raise PermitIssuanceError(("PERMIT_GRANT_EPOCH_CHANGED",))
 
+        # A derived permit never outlives the credentials it was derived from: the
+        # intent, the grant, and both signed upstream attestations.
         expires_at = min(
             intent.expires_at,
             grant.valid_until if grant.valid_until is not None else intent.expires_at,
+            authority_attestation.expires_at,
+            risk_attestation.expires_at,
             now + timedelta(seconds=self.max_permit_ttl_seconds),
         )
         if expires_at <= now:
@@ -330,7 +343,7 @@ class ConstrainedPermitAuthority:
             issued_at=now,
             expires_at=expires_at,
         )
-        payload = canonical_json(permit).encode("utf-8")
+        payload = signed_permit_payload(permit, self.signature.signer_id, self.signature.algorithm)
         signed = SignedExecutionPermit(
             permit=permit,
             signer_id=self.signature.signer_id,
@@ -375,13 +388,29 @@ class ExecutionPermitVerifier:
         *,
         now: datetime,
     ) -> tuple[bool, tuple[str, ...]]:
+        # Transport-supplied input: any structural surprise is a deterministic
+        # rejection, never an exception the venue would have to classify.
+        try:
+            return self._verify_checked(signed, request, now=now)
+        except Exception:
+            return False, ("PERMIT_MALFORMED",)
+
+    def _verify_checked(
+        self,
+        signed: SignedExecutionPermit,
+        request: ExecutionRequest,
+        *,
+        now: datetime,
+    ) -> tuple[bool, tuple[str, ...]]:
         reasons: list[str] = []
+        if not isinstance(signed, SignedExecutionPermit) or not isinstance(request, ExecutionRequest):
+            return False, ("PERMIT_MALFORMED",)
         permit = signed.permit
         if signed.signer_id != self.signature.signer_id:
             reasons.append("PERMIT_SIGNER_UNKNOWN")
         if signed.algorithm != self.signature.algorithm:
             reasons.append("PERMIT_ALGORITHM_MISMATCH")
-        payload = canonical_json(permit).encode("utf-8")
+        payload = signed_permit_payload(permit, signed.signer_id, signed.algorithm)
         if not self.signature.verify(payload, signed.signature):
             reasons.append("PERMIT_SIGNATURE_INVALID")
         if permit.request_hash != canonical_hash(request):

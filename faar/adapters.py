@@ -4,10 +4,9 @@ import hashlib
 from dataclasses import dataclass
 from enum import StrEnum
 from threading import RLock
-from decimal import Decimal, InvalidOperation
 from typing import Callable, Protocol
 
-from .canonical import canonical_hash, canonical_json
+from .canonical import canonical_hash, canonical_json, parse_bounded_decimal
 from .models import ExecutionReceipt, ExecutionRequest, SettlementRecord, SettlementStatus, SignedExecutionPermit, utcnow
 from .permits import ExecutionPermitVerifier
 
@@ -95,13 +94,7 @@ class MockVenue:
     def _receipt(self, request: ExecutionRequest) -> ExecutionReceipt:
         seed = request.principal_id + "\x1f" + request.intent_id + canonical_json(request.payload)
         effect_id = "fx_" + hashlib.sha256(seed.encode()).hexdigest()[:24]
-        amount = None
-        raw_amount = request.payload.get("amount_usd", request.payload.get("notional_usd"))
-        if raw_amount is not None:
-            try:
-                amount = Decimal(str(raw_amount))
-            except (InvalidOperation, ValueError, TypeError):
-                amount = None
+        amount = parse_bounded_decimal(request.payload.get("amount_usd", request.payload.get("notional_usd")))
         return ExecutionReceipt(
             effect_id=effect_id,
             status=SettlementStatus.FINALIZED,

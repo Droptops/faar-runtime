@@ -6,6 +6,7 @@
   "additionalProperties": false,
   "required": [
     "schema_version",
+    "principal_id",
     "intent_id",
     "actor_id",
     "grant_id",
@@ -18,7 +19,12 @@
   ],
   "properties": {
     "schema_version": {
-      "const": "0.2"
+      "const": "0.3"
+    },
+    "principal_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
     },
     "intent_id": {
       "type": "string",

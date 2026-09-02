@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import hashlib
 import hmac
 from datetime import datetime, timedelta
@@ -11,6 +12,11 @@ from .canonical import canonical_hash, canonical_json
 from .models import Attestation, AttestationAlgorithm, AttestationKind, Intent
 
 
+ED25519_SIGNATURE_BYTES = 64
+ED25519_SIGNATURE_CHARS = 86  # unpadded base64url of 64 bytes
+_B64URL_TO_STD = str.maketrans("-_", "+/")
+
+
 def has_signing_api(obj: object) -> bool:
     """True if `obj` exposes a callable `sign` minting path.
 
@@ -18,6 +24,29 @@ def has_signing_api(obj: object) -> bool:
     not sufficient: a compromised verifier must not have an API that can mint.
     """
     return callable(getattr(obj, "sign", None))
+
+
+def encode_ed25519_signature(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def decode_ed25519_signature(signature: object) -> bytes | None:
+    """Strictly decode the one canonical encoding of an Ed25519 signature.
+
+    `urlsafe_b64decode` alone discards foreign characters, tolerates padding and
+    ignores trailing bits, so one signature would have many accepted encodings that
+    all hash differently. A verifier must accept exactly the encoding the signer
+    produced; anything else is treated as an invalid signature.
+    """
+    if not isinstance(signature, str) or len(signature) != ED25519_SIGNATURE_CHARS:
+        return None
+    try:
+        raw = base64.b64decode(signature.translate(_B64URL_TO_STD) + "==", validate=True)
+    except (binascii.Error, ValueError):
+        return None
+    if len(raw) != ED25519_SIGNATURE_BYTES or encode_ed25519_signature(raw) != signature:
+        return None
+    return raw
 
 
 class AttestationVerifier(Protocol):
@@ -170,18 +199,24 @@ class HMACTrustStore:
             reasons.append("ATTESTATION_SUBJECT_MISMATCH")
         if attestation.intent_hash != canonical_hash(intent):
             reasons.append("ATTESTATION_INTENT_MISMATCH")
+        # Skew tolerance applies to issuance drift only. Extending the signed
+        # expiry by the skew would lengthen the authority the signer granted.
         skew = timedelta(seconds=self.max_clock_skew_seconds)
         if attestation.issued_at > now + skew:
             reasons.append("ATTESTATION_FROM_FUTURE")
-        if now > attestation.expires_at + skew:
+        if now > attestation.expires_at:
             reasons.append("ATTESTATION_EXPIRED")
-        payload = _payload(
-            algorithm=attestation.algorithm, kind=attestation.kind, key_id=attestation.key_id,
-            subject_hash=attestation.subject_hash, intent_hash=attestation.intent_hash,
-            issued_at=attestation.issued_at, expires_at=attestation.expires_at,
-        )
+        try:
+            payload = _payload(
+                algorithm=attestation.algorithm, kind=attestation.kind, key_id=attestation.key_id,
+                subject_hash=attestation.subject_hash, intent_hash=attestation.intent_hash,
+                issued_at=attestation.issued_at, expires_at=attestation.expires_at,
+            )
+        except Exception:
+            reasons.append("ATTESTATION_MALFORMED")
+            return False, tuple(reasons)
         expected = hmac.new(key, payload, hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(expected, attestation.signature):
+        if not isinstance(attestation.signature, str) or not hmac.compare_digest(expected, attestation.signature):
             reasons.append("ATTESTATION_SIGNATURE_INVALID")
         return not reasons, tuple(reasons)
 
@@ -212,19 +247,26 @@ def _verify_ed25519_attestation(
         reasons.append("ATTESTATION_SUBJECT_MISMATCH")
     if attestation.intent_hash != canonical_hash(intent):
         reasons.append("ATTESTATION_INTENT_MISMATCH")
+    # Skew tolerance applies to issuance drift only; the signed expiry is exact.
     skew = timedelta(seconds=max_clock_skew_seconds)
     if attestation.issued_at > now + skew:
         reasons.append("ATTESTATION_FROM_FUTURE")
-    if now > attestation.expires_at + skew:
+    if now > attestation.expires_at:
         reasons.append("ATTESTATION_EXPIRED")
-    payload = _payload(
-        algorithm=attestation.algorithm, kind=attestation.kind, key_id=attestation.key_id,
-        subject_hash=attestation.subject_hash, intent_hash=attestation.intent_hash,
-        issued_at=attestation.issued_at, expires_at=attestation.expires_at,
-    )
-    pad = "=" * (-len(attestation.signature) % 4)
     try:
-        raw = base64.urlsafe_b64decode(attestation.signature + pad)
+        payload = _payload(
+            algorithm=attestation.algorithm, kind=attestation.kind, key_id=attestation.key_id,
+            subject_hash=attestation.subject_hash, intent_hash=attestation.intent_hash,
+            issued_at=attestation.issued_at, expires_at=attestation.expires_at,
+        )
+    except Exception:
+        reasons.append("ATTESTATION_MALFORMED")
+        return False, tuple(reasons)
+    raw = decode_ed25519_signature(attestation.signature)
+    if raw is None:
+        reasons.append("ATTESTATION_SIGNATURE_INVALID")
+        return False, tuple(reasons)
+    try:
         public = key.public_key() if hasattr(key, "public_key") else key
         public.verify(raw, payload)
     except Exception:
@@ -317,7 +359,7 @@ class Ed25519TrustStore:
             issued_at=issued_at, expires_at=expires_at,
         )
         raw = key.sign(payload)
-        signature = base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+        signature = encode_ed25519_signature(raw)
         return Attestation(
             kind, key_id, self.algorithm, subject_hash, intent_hash,
             issued_at, expires_at, signature,

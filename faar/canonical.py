@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Mapping
 from dataclasses import fields, is_dataclass
 from datetime import datetime
@@ -16,6 +17,12 @@ from typing import Any
 MAX_DECIMAL_DIGITS = 100
 MAX_DECIMAL_ABS_EXPONENT = 100
 
+# Monetary amounts supplied as strings must use a plain ASCII decimal grammar.
+# Decimal() itself accepts surrounding whitespace, underscores, exponents, signs
+# and any Unicode digit script; those forms would be forwarded verbatim to an
+# adapter and admit unboundedly many encodings of one economic value.
+MONEY_STRING_PATTERN = re.compile(r"\A(0|[1-9][0-9]{0,17})(\.[0-9]{1,8})?\Z", re.ASCII)
+
 
 def _canonical_decimal(value: Decimal) -> str:
     if not value.is_finite():
@@ -27,6 +34,45 @@ def _canonical_decimal(value: Decimal) -> str:
     if abs(adjusted) > MAX_DECIMAL_ABS_EXPONENT:
         raise ValueError("Decimal magnitude exceeds canonical bounds")
     return format(value, "f")
+
+
+def parse_bounded_decimal(raw: object) -> Decimal | None:
+    """Parse an untrusted economic amount into a canonically bounded Decimal.
+
+    Every component that reads an amount (gates, usage reservation, permit signer,
+    settlement integrity, reference venues) must share this parser so the amount
+    that is authorized, reserved, permitted and executed is one value. Returns
+    None for anything that is not a finite, canonically serialisable amount:
+    booleans, unsupported types, non-finite values, strings outside the plain
+    decimal grammar, and precisions/magnitudes beyond the canonical bounds (a
+    12-byte ``"1e-999999999"`` would otherwise make ``format(value, "f")``
+    allocate gigabytes).
+    """
+    if raw is None or isinstance(raw, bool):
+        return None
+    if isinstance(raw, str):
+        if MONEY_STRING_PATTERN.fullmatch(raw) is None:
+            return None
+        value = Decimal(raw)
+    elif isinstance(raw, int):
+        if raw.bit_length() > 256:
+            return None
+        value = Decimal(raw)
+    elif isinstance(raw, float):
+        if raw != raw or raw in (float("inf"), float("-inf")):
+            return None
+        value = Decimal(repr(raw))
+    elif isinstance(raw, Decimal):
+        value = raw
+    else:
+        return None
+    if not value.is_finite():
+        return None
+    try:
+        _canonical_decimal(value)
+    except ValueError:
+        return None
+    return value
 
 
 def _canonicalize(value: Any) -> Any:
