@@ -65,7 +65,7 @@ FAAR therefore binds two upstream decisions to the exact canonical intent:
 - **authority attestation**: posture and work primitive;
 - **risk attestation**: portfolio/market state and risk-state version.
 
-Reference attestations and execution permits are Ed25519 (the `cryptography` package is a required dependency). Signers hold private keys; the runtime, the permit authority and the execution gateway hold public keys only and refuse any object that exposes a signing API. Symmetric HMAC classes survive solely as test fixtures. Keys carry optional lifecycle windows and revocation (`KeyValidity`).
+Reference attestations and execution permits are Ed25519 (the `cryptography` package is a required dependency). Signers hold private keys; the runtime and the execution gateway hold public keys only and refuse any object that exposes a signing API; the permit authority holds exactly one private key (the permit signer) plus verify-only upstream trust. Symmetric HMAC classes survive solely as test fixtures and are refused by the permit authority and the gateway. Keys carry optional lifecycle windows and revocation (`KeyValidity`), and verifiers bound every artifact's own lifetime.
 
 ## Intent lifecycle
 
@@ -73,8 +73,10 @@ The durable state machine distinguishes authorization, reservation, submission, 
 
 ```text
 PROPOSED ─► AUTHORIZED ─► RESERVED ─► SUBMITTED ─► UNKNOWN ─► RECONCILING ─► CONFIRMED ─► FINALIZED
-   │            │            │            │                        │
-   └─► DENIED / DEFERRED / STOPPED        └─► FAILED_SAFE          └─► STOPPED
+   │            │            │            │            ▲            │  │
+   └─► DENIED / DEFERRED / STOPPED        └─► FAILED_SAFE          │  ├─► STOPPED
+                                                       │            │  └─► FAILED_SAFE (authoritative absence, retry blocked)
+                                                       └────────────┘  (retry: RECONCILING ─► SUBMITTED, new permit)
 ```
 
 Important properties:
@@ -83,7 +85,8 @@ Important properties:
 - every terminal decision leaves an event in the evidence chain, and every chain starts atomically with registration;
 - a process restart resumes the same intent unless the crashed worker still owns the durable lease (`INTENT_BUSY`, operator recovery in `OPERATIONS.md`);
 - ambiguous execution never creates a new logical intent;
-- an ambiguous attempt records its permit expiry as `ambiguity_until`; absence is not trusted and no retry is issued until that window has closed;
+- every recorded permit sets the intent's `ambiguity_until` to its expiry in the same transaction, whatever the adapter reports afterwards; absence is not trusted and no retry is issued until that window has closed, and the store refuses a second live permit for one intent;
+- a decision is never recorded without evidence: if the chain refuses an append (`EVIDENCE_INTEGRITY_FAILURE`) no state advances;
 - resubmission requires authoritative proof of absence after the window, fresh authorization/risk, unexpired authority, ACTIVE grant status, remaining retry budget, and no durable resubmission block;
 - settlement verification and retries run outside the per-grant revocation fence; only the adapter call is fenced, and it can be bounded by `adapter_deadline_seconds`.
 

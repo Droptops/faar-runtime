@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 
 from .adapters import MockMode, MockVenue
-from .anchor import FileAuthorityAnchor
+from .anchor import AnchorUnavailable, AuthorityRegression, FileAuthorityAnchor
 from .attestation import Ed25519TrustStore
 from .canonical import canonical_hash
 from .gates import evaluate_authority, evaluate_capability, evaluate_risk
@@ -15,7 +15,14 @@ from .parsing import parse_authority, parse_grant, parse_intent, parse_risk
 from .runtime import FAARRuntime
 from .permits import ConstrainedPermitAuthority, Ed25519PermitSignature, ExecutionPermitVerifier
 from .settlement import MockSettlementVerifier
-from .store import SQLiteIntentStore
+from .store import (
+    AuthorityAnchorRequired,
+    EvidenceIntegrityError,
+    GrantConflict,
+    MigrationError,
+    SQLiteIntentStore,
+    UnknownGrant,
+)
 
 
 _DEMO_KEY_KINDS = {
@@ -124,8 +131,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_ev.add_argument("--evidence-key-env", help="name of the environment variable holding the evidence MAC key")
     p_ev.add_argument("--demo-evidence-key", action="store_true", help="DEMO ONLY: verify with the embedded demo key")
 
-    p_rebuild = with_db(sub.add_parser("rebuild-evidence-head", help="OPERATOR: commit a signed head for a pre-0.4 chain that verifies"), anchor=False)
-    p_rebuild.add_argument("--intent-id", required=True)
+    p_rebuild = with_db(sub.add_parser("rebuild-evidence-head", help="OPERATOR: commit a signed head for pre-0.4 chains that verify"), anchor=False)
+    p_rebuild.add_argument("--intent-id", help="one intent; or use --all for every intent without a head")
+    p_rebuild.add_argument("--all", action="store_true", help="every intent that has no head commitment")
+    p_rebuild.add_argument("--adopt-empty", action="store_true", help="also adopt legacy chains with zero events (records the adoption as the first event)")
     p_rebuild.add_argument("--evidence-key-env", required=True)
 
     p_usage = with_db(sub.add_parser("usage", help="show grant-level atomic usage reservations"), anchor=False)
@@ -166,7 +175,23 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+# Typed store/anchor refusals are operator-facing outcomes, not crashes: they are
+# printed as JSON and exit 2 so scripts can branch on them.
+_OPERATOR_ERRORS = (
+    AuthorityAnchorRequired, AuthorityRegression, AnchorUnavailable, EvidenceIntegrityError,
+    GrantConflict, MigrationError, UnknownGrant,
+)
+
+
 def main(argv=None) -> None:
+    try:
+        _main(argv)
+    except _OPERATOR_ERRORS as exc:
+        _emit({"error": type(exc).__name__, "message": str(exc)})
+        raise SystemExit(2)
+
+
+def _main(argv=None) -> None:
     args = build_parser().parse_args(argv)
     command = args.command
 
@@ -199,13 +224,21 @@ def main(argv=None) -> None:
     if command == "verify-evidence":
         key = _evidence_key(args)
         store = SQLiteIntentStore(args.db, evidence_key=key)
-        ok = store.verify_evidence_chain(args.intent_id)
-        _emit({"intent_id": args.intent_id, "evidence_chain_valid": ok, "keyed": key is not None})
-        raise SystemExit(0 if ok else 2)
+        status = store.evidence_status(args.intent_id)
+        _emit({
+            "intent_id": args.intent_id, "evidence_chain_valid": status["valid"], "status": status["status"],
+            "events": status["events"], "keyed": status["keyed"],
+        })
+        raise SystemExit(0 if status["valid"] else 2)
 
     if command == "rebuild-evidence-head":
+        if bool(args.all) == bool(args.intent_id):
+            raise SystemExit("rebuild-evidence-head needs exactly one of --intent-id or --all")
         store = SQLiteIntentStore(args.db, evidence_key=_evidence_key(args))
-        _emit({"intent_id": args.intent_id, "head_committed": store.rebuild_evidence_head(args.intent_id)})
+        if args.all:
+            _emit({"outcomes": store.rebuild_evidence_heads(allow_empty=args.adopt_empty)})
+            return
+        _emit({"intent_id": args.intent_id, "head_committed": store.rebuild_evidence_head(args.intent_id, allow_empty=args.adopt_empty)})
         return
 
     if command == "usage":

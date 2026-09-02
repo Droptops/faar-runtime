@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import tempfile
 import unittest
 from dataclasses import replace
 from datetime import datetime, timedelta
@@ -28,10 +27,10 @@ from faar.models import (
 from faar.outcomes import verify_attested_task_outcome, verify_task_outcome
 from faar.paper import PaperTradingVenue
 from faar.parsing import parse_attestation, parse_grant, parse_intent, parse_risk
-from faar.permits import ExecutionPermitVerifier
+from faar.permits import Ed25519PermitVerifier, ExecutionPermitVerifier
 from faar.settlement import QuorumSettlementVerifier, REFERENCE_SETTLEMENT_PROFILE
 from faar.store import SQLiteIntentStore
-from support import AUTH, NOW, PRINCIPAL, attest_pair, grant, intent, permit_stack, risk, trust, verification_trust
+from support import AUTH, NOW, PRINCIPAL, attest_pair, grant, intent, permit_stack, risk, temp_path, trust, verification_trust
 
 
 def _payload(**changes):
@@ -171,9 +170,7 @@ class ParsingBoundaryTests(unittest.TestCase):
 
 class AttestationLifetimeTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False)
-        self.tmp.close()
-        self.store = SQLiteIntentStore(self.tmp.name)
+        self.store = SQLiteIntentStore(temp_path(self))
         self.store.provision_grant(grant(), canonical_hash(grant()))
         self.trust = trust()
 
@@ -210,25 +207,35 @@ class AttestationLifetimeTests(unittest.TestCase):
         aa, _ = attest_pair(self.trust, i, AUTH, rs, NOW)
         verifier = verification_trust(self.trust)
         self.assertIsNotNone(decode_ed25519_signature(aa.signature))
+        # 86 urlsafe-base64 characters carry 516 bits for a 512-bit signature: the
+        # last character's low 4 bits are padding. Every character sharing the top
+        # 2 bits of the real last character decodes to the *same* bytes, so only the
+        # canonical-encoding round-trip check (not Ed25519 itself) can reject those
+        # 15 aliases. They are derived deterministically here so the check is
+        # exercised on every run, not only when the random signature happens to
+        # end in A..P.
+        alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
         last = aa.signature[-1]
-        alternates = [c for c in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_" if c != last]
-        variants = [aa.signature + "==", aa.signature + "!!!!", aa.signature.replace("-", "+").replace("_", "/") + "=="]
-        variants += [aa.signature[:-1] + c for c in alternates[:8]]
-        rejected = 0
-        for variant in variants:
-            if variant == aa.signature:
-                continue
+        group = alphabet.index(last) >> 4
+        aliases = [c for c in alphabet if alphabet.index(c) >> 4 == group and c != last]
+        self.assertEqual(15, len(aliases))
+        for c in aliases:
+            variant = aa.signature[:-1] + c
+            self.assertIsNone(decode_ed25519_signature(variant), variant[-2:])
             ok, reasons = verifier.verify(replace(aa, signature=variant), kind=AttestationKind.AUTHORITY, subject=AUTH, intent=i, now=NOW)
-            if not ok and "ATTESTATION_SIGNATURE_INVALID" in reasons:
-                rejected += 1
-        self.assertEqual(len([v for v in variants if v != aa.signature]), rejected)
+            self.assertFalse(ok)
+            self.assertIn("ATTESTATION_SIGNATURE_INVALID", reasons)
+        # Length/alphabet variants are rejected by the grammar.
+        for variant in (aa.signature + "==", aa.signature + "!!!!", aa.signature.replace("-", "+").replace("_", "/") + "=="):
+            self.assertIsNone(decode_ed25519_signature(variant))
+            ok, reasons = verifier.verify(replace(aa, signature=variant), kind=AttestationKind.AUTHORITY, subject=AUTH, intent=i, now=NOW)
+            self.assertFalse(ok)
+            self.assertIn("ATTESTATION_SIGNATURE_INVALID", reasons)
 
 
 class PermitVerifierBoundaryTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False)
-        self.tmp.close()
-        self.store = SQLiteIntentStore(self.tmp.name)
+        self.store = SQLiteIntentStore(temp_path(self))
         self.store.provision_grant(grant(), canonical_hash(grant()))
         self.trust = trust()
         self.authority, self.verifier = permit_stack(self.store, self.trust)
@@ -255,12 +262,19 @@ class PermitVerifierBoundaryTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertEqual(("PERMIT_SIGNER_UNKNOWN",), reasons)
         # With a second trusted signer, relabelling a permit to that signer must
-        # fail the signature itself: signer_id is inside the signed payload.
-        other = Ed25519PermitSigner("other-trusted-signer")
-        gateway = ExecutionPermitVerifier(
-            {self.verifier.signature.signer_id: self.verifier.signature, other.signer_id: other.public_verifier()}, self.store,
-        )
+        # fail the signature itself. Registering the *same* public key under a
+        # second id isolates the property under test: only signer_id being inside
+        # the signed payload can make the relabelled permit fail.
+        real = self.verifier.signature
+        alias = Ed25519PermitVerifier("alias-of-the-same-key", real._public_key)
+        gateway = ExecutionPermitVerifier({real.signer_id: real, alias.signer_id: alias}, self.store)
         self.assertTrue(gateway.verify(signed, request, now=NOW)[0])
+        ok, reasons = gateway.verify(replace(signed, signer_id=alias.signer_id), request, now=NOW)
+        self.assertFalse(ok)
+        self.assertEqual(("PERMIT_SIGNATURE_INVALID",), reasons)
+        # A genuinely different trusted key fails as well, for the obvious reason.
+        other = Ed25519PermitSigner("other-trusted-signer")
+        gateway = ExecutionPermitVerifier({real.signer_id: real, other.signer_id: other.public_verifier()}, self.store)
         ok, reasons = gateway.verify(replace(signed, signer_id=other.signer_id), request, now=NOW)
         self.assertFalse(ok)
         self.assertIn("PERMIT_SIGNATURE_INVALID", reasons)
@@ -324,7 +338,12 @@ class SettlementHardeningTests(unittest.TestCase):
         short = QuorumSettlementVerifier(
             [_src("a", self._final("50")), _src("b", TimeoutError("down")), _src("c", TimeoutError("down"))], quorum=2,
         ).verify(self.request)
-        self.assertEqual(SettlementStatus.CONTRADICTORY, short.status, "one authoritative vote below quorum stays contested")
+        # One uncontested vote below quorum is insufficient evidence: a weak UNKNOWN
+        # the runtime retries, never an authoritative CONTRADICTORY that would
+        # terminally STOP an intent whose effect exists because two sources timed out.
+        self.assertEqual(SettlementStatus.UNKNOWN, short.status)
+        self.assertFalse(short.authoritative)
+        self.assertEqual({"b": "TimeoutError", "c": "TimeoutError"}, dict(short.evidence["errors"]))
 
     def test_quorum_carries_agreeing_evidence_for_definition_of_done(self):
         record = QuorumSettlementVerifier([_src("a", self._final("50")), _src("b", self._final("50"))], quorum=2).verify(self.request)

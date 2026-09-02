@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import multiprocessing as mp
 import sqlite3
-import tempfile
 import threading
 import time
 import unittest
@@ -12,16 +11,10 @@ from decimal import Decimal
 
 from faar.canonical import canonical_hash
 from faar.models import EconomicPrimitive, IntentState
-from faar.store import EffectConflict, EvidenceIntegrityError, IntentBusy, SQLiteIntentStore
-from support import NOW, PRINCIPAL, grant, intent, risk
+from faar.store import EffectConflict, EvidenceIntegrityError, IntentBusy, MigrationError, SQLiteIntentStore
+from support import AUTH, NOW, PRINCIPAL, attest_pair, build_mock_runtime, grant, intent, risk, temp_path, trust
 
 EVIDENCE_KEY = b"evidence-test-key-32-bytes-long!!!!!"
-
-
-def _tmp_db() -> str:
-    f = tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False)
-    f.close()
-    return f.name
 
 
 def _open_worker(path, barrier, queue):
@@ -35,22 +28,51 @@ def _open_worker(path, barrier, queue):
 
 
 class SchemaMigrationTests(unittest.TestCase):
-    def _make_legacy(self, path: str) -> None:
-        """Downgrade a fresh database to the v0.3.0 shape (no velocity_ts column)."""
+    LEGACY_EFFECT = "fx_legacy_000000000000001"
+    LEGACY_FINAL = "legacy_final_00000000001"
+    LEGACY_INFLIGHT = "legacy_inflight_000000001"
+    LEGACY_UPDATED_AT = (NOW - timedelta(seconds=20)).isoformat()
+
+    def _make_legacy(self, path: str, *, created_at: str | None = None) -> None:
+        """Downgrade a fresh database to the v0.3.0 shape.
+
+        No `velocity_ts`, `consumed_at`, `expires_at`, `venue` or `ambiguity_until`
+        columns, the global effect-id index, and rows an old worker would have left
+        behind: a FINALIZED intent with an effect id, an in-flight UNKNOWN intent,
+        and HELD reservations keyed by calendar day only.
+        """
         store = SQLiteIntentStore(path)
         g = grant(limits=replace(grant().limits, max_daily_turnover_usd=Decimal("75")))
         store.provision_grant(g, canonical_hash(g))
+        for iid in (self.LEGACY_FINAL, self.LEGACY_INFLIGHT):
+            i = intent(intent_id=iid)
+            store.register(i, canonical_hash(i))
         store.close()
         conn = sqlite3.connect(path)
         conn.execute("DROP INDEX IF EXISTS ix_usage_grant_velocity_ts")
+        conn.execute("DROP INDEX IF EXISTS ux_effect_id_per_venue")
         conn.execute("ALTER TABLE usage_reservations DROP COLUMN velocity_ts")
         conn.execute("ALTER TABLE execution_permits DROP COLUMN consumed_at")
-        # A HELD reservation written by the old version: calendar-day keyed only.
+        conn.execute("ALTER TABLE execution_permits DROP COLUMN expires_at")
+        conn.execute("ALTER TABLE intents DROP COLUMN venue")
+        conn.execute("ALTER TABLE intents DROP COLUMN ambiguity_until")
+        conn.execute("DROP TABLE store_settings")
+        conn.execute("CREATE UNIQUE INDEX ux_effect_id_nonnull ON intents(effect_id) WHERE effect_id IS NOT NULL")
         conn.execute(
-            "INSERT INTO usage_reservations(intent_id,principal_id,grant_id,grant_version,day_key,velocity_bucket,amount_usd,status,created_at,updated_at) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?)",
-            ("legacy_held_000000000001", PRINCIPAL, "grant:test", 1, NOW.date().isoformat(), 0, "50", "HELD", "x", "x"),
+            "UPDATE intents SET state='FINALIZED', effect_id=?, submission_count=1, updated_at=? WHERE intent_id=?",
+            (self.LEGACY_EFFECT, self.LEGACY_UPDATED_AT, self.LEGACY_FINAL),
         )
+        conn.execute(
+            "UPDATE intents SET state='UNKNOWN', reason_codes='[\"SETTLEMENT_UNKNOWN\"]', submission_count=1, updated_at=? WHERE intent_id=?",
+            (self.LEGACY_UPDATED_AT, self.LEGACY_INFLIGHT),
+        )
+        stamp = created_at if created_at is not None else (NOW - timedelta(seconds=30)).isoformat()
+        for iid, amount in (("legacy_held_000000000001", "50"), ("legacy_held_000000000002", "20")):
+            conn.execute(
+                "INSERT INTO usage_reservations(intent_id,principal_id,grant_id,grant_version,day_key,velocity_bucket,amount_usd,status,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (iid, PRINCIPAL, "grant:test", 1, NOW.date().isoformat(), 0, amount, "HELD", stamp, stamp),
+            )
         conn.commit()
         conn.close()
 
@@ -58,8 +80,14 @@ class SchemaMigrationTests(unittest.TestCase):
         if sqlite3.sqlite_version_info < (3, 35, 0):
             self.skipTest("ALTER TABLE DROP COLUMN requires SQLite >= 3.35")
 
+    def _walk_to_reconciling(self, store, i):
+        store.register(i, canonical_hash(i))
+        self.assertTrue(store.transition(i.intent_id, IntentState.PROPOSED, IntentState.AUTHORIZED))
+        self.assertTrue(store.transition(i.intent_id, IntentState.AUTHORIZED, IntentState.RESERVED))
+        self.assertTrue(store.transition(i.intent_id, IntentState.RESERVED, IntentState.RECONCILING))
+
     def test_v030_database_opens_migrates_and_still_counts_legacy_holds(self):
-        path = _tmp_db()
+        path = temp_path(self)
         self._make_legacy(path)
         store = SQLiteIntentStore(path)  # v0.3.1 raised OperationalError here
         try:
@@ -74,8 +102,63 @@ class SchemaMigrationTests(unittest.TestCase):
         finally:
             store.close()
 
+    def test_legacy_effect_ids_stay_bound_to_their_venue_after_upgrade(self):
+        # The per-venue effect-id index only protects rows in their real venue
+        # namespace; without the backfill every legacy effect would be claimable
+        # again by a new intent at the same venue (I-11).
+        path = temp_path(self)
+        self._make_legacy(path)
+        store = SQLiteIntentStore(path)
+        try:
+            venues = {r[0]: r[1] for r in store._conn.execute("SELECT intent_id, venue FROM intents")}
+            self.assertEqual("mock-dex", venues[self.LEGACY_FINAL])
+            same_venue = intent(intent_id="post_upgrade_00000000002")
+            self._walk_to_reconciling(store, same_venue)
+            with self.assertRaises(EffectConflict):
+                store.transition(same_venue.intent_id, IntentState.RECONCILING, IntentState.FINALIZED, effect_id=self.LEGACY_EFFECT)
+            other_venue = intent(intent_id="post_upgrade_00000000003", venue="other-dex")
+            self._walk_to_reconciling(store, other_venue)
+            self.assertTrue(store.transition(other_venue.intent_id, IntentState.RECONCILING, IntentState.FINALIZED, effect_id=self.LEGACY_EFFECT))
+        finally:
+            store.close()
+
+    def test_legacy_reservations_count_toward_velocity_after_upgrade(self):
+        path = temp_path(self)
+        self._make_legacy(path)
+        store = SQLiteIntentStore(path)
+        try:
+            g = grant(limits=replace(grant().limits, max_actions_per_window=2, max_daily_turnover_usd=Decimal("1500")))
+            i = intent(intent_id="post_upgrade_00000000004")
+            store.register(i, canonical_hash(i))
+            ok, reasons = store.reserve_usage(i, g, risk(actions_in_window=0), NOW)
+            self.assertFalse(ok, "two legacy actions inside the window must fill a limit of two")
+            self.assertIn("ATOMIC_ACTION_VELOCITY_EXCEEDED", reasons)
+            ok, _ = store.reserve_usage(i, g, risk(actions_in_window=0), NOW + timedelta(seconds=61))
+            self.assertTrue(ok, "legacy actions age out of the window normally")
+        finally:
+            store.close()
+
+    def test_legacy_in_flight_intent_gets_a_conservative_ambiguity_window(self):
+        path = temp_path(self)
+        self._make_legacy(path)
+        store = SQLiteIntentStore(path)
+        try:
+            row = store.get(self.LEGACY_INFLIGHT)
+            self.assertEqual(IntentState.UNKNOWN, row.state)
+            expected = datetime.fromisoformat(self.LEGACY_UPDATED_AT) + timedelta(seconds=60)
+            self.assertEqual(expected.isoformat(), row.ambiguity_until)
+            self.assertIsNone(store.get(self.LEGACY_FINAL).ambiguity_until, "terminal rows get no window")
+        finally:
+            store.close()
+
+    def test_unreadable_legacy_timestamp_fails_closed(self):
+        path = temp_path(self)
+        self._make_legacy(path, created_at="not-a-timestamp")
+        with self.assertRaises(MigrationError):
+            SQLiteIntentStore(path)
+
     def test_concurrent_open_of_legacy_database_migrates_cleanly(self):
-        path = _tmp_db()
+        path = temp_path(self)
         self._make_legacy(path)
         ctx = mp.get_context("spawn")
         barrier = ctx.Barrier(4)
@@ -213,7 +296,7 @@ class GuardAndFenceTests(unittest.TestCase):
         self.assertEqual({}, store._intent_locks)
 
     def test_execution_fence_is_shared_by_store_instances_on_the_same_file(self):
-        path = _tmp_db()
+        path = temp_path(self)
         a = SQLiteIntentStore(path)
         b = SQLiteIntentStore(path)
         g = grant()
@@ -319,6 +402,97 @@ class EvidenceIntegrityTests(unittest.TestCase):
         t.join(10)
         self.assertEqual([], failures)
         self.assertTrue(all(results), f"{results.count(False)} spurious tamper alarms under concurrent appends")
+
+
+class LegacyChainTests(unittest.TestCase):
+    """Keyed 0.4 store over chains written before signed heads existed."""
+
+    def _keyed(self):
+        path = temp_path(self)
+        store = SQLiteIntentStore(path, evidence_key=EVIDENCE_KEY)
+        store.provision_grant(grant(), canonical_hash(grant()))
+        return path, store
+
+    @staticmethod
+    def _drop_heads(path, *, empty_intent=None):
+        conn = sqlite3.connect(path)
+        conn.execute("DELETE FROM evidence_head")
+        if empty_intent is not None:
+            conn.execute("DELETE FROM evidence WHERE intent_id=?", (empty_intent,))
+        conn.commit()
+        conn.close()
+
+    def test_runtime_does_not_advance_state_on_a_chain_it_cannot_extend(self):
+        path, store = self._keyed()
+        t = trust()
+        i = intent(intent_id="legacy_chain_000000000001")
+        store.register(i, canonical_hash(i))
+        self.assertTrue(store.reserve_usage(i, grant(), risk(), NOW)[0])
+        self.assertTrue(store.transition(i.intent_id, IntentState.PROPOSED, IntentState.AUTHORIZED))
+        self.assertTrue(store.transition(i.intent_id, IntentState.AUTHORIZED, IntentState.RESERVED))
+        store.close()
+        self._drop_heads(path)
+
+        reopened = SQLiteIntentStore(path, evidence_key=EVIDENCE_KEY)
+        try:
+            self.assertEqual("head_missing", reopened.evidence_status(i.intent_id)["status"])
+            runtime, venue, *_ = build_mock_runtime(reopened, t)
+            aa, ra = attest_pair(t, i, AUTH, risk(), NOW)
+            events_before = len(reopened.evidence(i.intent_id))
+            result = runtime.process(i, AUTH, grant(), risk(), authority_attestation=aa, risk_attestation=ra, now=NOW)
+            self.assertEqual(("EVIDENCE_INTEGRITY_FAILURE",), result.reason_codes)
+            self.assertEqual(IntentState.RESERVED, result.state, "no transition without evidence")
+            self.assertEqual(IntentState.RESERVED, reopened.get(i.intent_id).state)
+            self.assertEqual(events_before, len(reopened.evidence(i.intent_id)))
+            self.assertEqual(0, venue.execute_call_count(i.intent_id))
+            self.assertEqual(("EVIDENCE_INTEGRITY_FAILURE",), runtime.reconcile(i, grant=grant()).reason_codes)
+            # The explicit operator migration restores service for the whole database.
+            self.assertEqual({i.intent_id: "committed"}, reopened.rebuild_evidence_heads())
+            self.assertEqual("ok", reopened.evidence_status(i.intent_id)["status"])
+            result = runtime.process(i, AUTH, grant(), risk(), authority_attestation=aa, risk_attestation=ra, now=NOW)
+            self.assertEqual(IntentState.FINALIZED, result.state)
+            self.assertTrue(reopened.verify_evidence_chain(i.intent_id))
+        finally:
+            reopened.close()
+
+    def test_empty_legacy_chain_is_adopted_only_on_request_and_records_the_adoption(self):
+        path, store = self._keyed()
+        i = intent(intent_id="legacy_chain_000000000002")
+        store.register(i, canonical_hash(i))
+        store.close()
+        self._drop_heads(path, empty_intent=i.intent_id)
+        reopened = SQLiteIntentStore(path, evidence_key=EVIDENCE_KEY)
+        try:
+            self.assertEqual("chain_empty", reopened.evidence_status(i.intent_id)["status"])
+            self.assertEqual({i.intent_id: "skipped_empty"}, reopened.rebuild_evidence_heads())
+            with self.assertRaises(EvidenceIntegrityError):
+                reopened.rebuild_evidence_head(i.intent_id)
+            self.assertEqual({i.intent_id: "adopted_empty"}, reopened.rebuild_evidence_heads(allow_empty=True))
+            self.assertEqual(["evidence_head_adopted"], [e["event_type"] for e in reopened.evidence(i.intent_id)])
+            self.assertTrue(reopened.verify_evidence_chain(i.intent_id))
+            self.assertEqual({}, reopened.rebuild_evidence_heads(allow_empty=True))
+        finally:
+            reopened.close()
+
+    def test_tampered_chain_is_not_adopted_by_the_bulk_rebuild(self):
+        path, store = self._keyed()
+        i = intent(intent_id="legacy_chain_000000000003")
+        store.register(i, canonical_hash(i))
+        store.add_evidence(i.intent_id, "note", {"n": 1})
+        store.close()
+        self._drop_heads(path)
+        conn = sqlite3.connect(path)
+        conn.execute("UPDATE evidence SET payload_json='{\"n\": 2}' WHERE intent_id=? AND event_type='note'", (i.intent_id,))
+        conn.commit()
+        conn.close()
+        reopened = SQLiteIntentStore(path, evidence_key=EVIDENCE_KEY)
+        try:
+            self.assertEqual("chain_invalid", reopened.evidence_status(i.intent_id)["status"])
+            outcomes = reopened.rebuild_evidence_heads(allow_empty=True)
+            self.assertTrue(outcomes[i.intent_id].startswith("refused:"), outcomes)
+            self.assertFalse(reopened.verify_evidence_chain(i.intent_id))
+        finally:
+            reopened.close()
 
 
 if __name__ == "__main__":

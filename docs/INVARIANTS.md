@@ -1,6 +1,6 @@
 # FAAR Invariants
 
-These are design targets for the reference runtime. A passing test is evidence for the tested implementation/model, not universal proof over every venue or deployment architecture. Each invariant names the tests that enforce it; `evals/run_redteam.py` maps attack classes to the same tests and fails if any mapping is missing.
+These are design targets for the reference runtime. A passing test is evidence for the tested implementation/model, not universal proof over every venue or deployment architecture. Where an invariant is enforced by a specific test it is named; the complete mapping from attack classes to tests lives in `evals/run_redteam.py`, which fails if any mapped test is missing.
 
 ## I-1 — Stable logical identity
 
@@ -58,7 +58,7 @@ CONFIRMED/FINALIZED settlement requires a bounded, non-empty `effect_id`. Once o
 
 ## I-11 — External effect identity is unique per venue
 
-The same effect ID on the same venue cannot be claimed as the successful effect of two different FAAR intents. Identifiers are a per-venue namespace; the same string on two venues is two effects.
+The same effect ID on the same venue cannot be claimed as the successful effect of two different FAAR intents. Identifiers are a per-venue namespace; the same string on two venues is two effects. Rows written before the namespace existed are backfilled from their canonical payload when the database is first opened, or the open fails (`test_store_hardening.SchemaMigrationTests`).
 
 ## I-12 — Retry remains authorized
 
@@ -138,7 +138,7 @@ An `intent_id`, its usage reservation, its permits and its evidence belong to on
 
 ## I-30 — In-flight attempts are bounded by their permit
 
-An attempt whose outcome the runtime did not observe can be acted on by the venue only until its permit expires. The runtime persists that instant and neither trusts absence nor retries before it has passed (`test_runtime_hardening`, `evals/model_check_permit_protocol.py`).
+Any attempt can be acted on by the venue until its permit expires, whatever the adapter reported (timeout, exception, deterministic rejection, receipt, or an uninterpretable value). The store persists that instant together with the permit, the runtime neither trusts absence nor retries before it has passed, the store refuses a second live permit for one intent, and a later permit supersedes an earlier one at consumption (`test_runtime_hardening`, `test_permits`, `evals/model_check_permit_protocol.py`).
 
 ## I-31 — Adapter calls are bounded
 
@@ -150,8 +150,8 @@ With `adapter_deadline_seconds` configured, a hung adapter call cannot hold the 
 
 ## I-33 — Consumed authority cannot be resurrected by restore
 
-With an authority anchor kept outside the backup set, a grant version whose `(runtime_epoch, fence_counter)` regressed behind the anchor is `REGRESSED`: no permit is issued or consumed under it and its lifecycle cannot be changed except by `revoke_after_restore`. Without an anchor this invariant does not hold; the test suite documents that ceiling.
+With an authority anchor kept outside the backup set, a grant version whose `(runtime_epoch, fence_counter)` regressed behind the anchor is `REGRESSED`: no permit is issued or consumed under it and its lifecycle cannot be changed except by `revoke_after_restore`. The fence counter advances at issuance and at consumption, so a snapshot between the two is detected. Once a database has been opened with an anchor, an instance without one cannot consume or change authority (`ANCHOR_REQUIRED`), and an unreadable anchor fails closed (`ANCHOR_UNAVAILABLE`). Without an anchor this invariant does not hold; the test suite documents that ceiling.
 
 ## I-34 — Key lifecycle is enforced at verification
 
-Attestation keys and permit signers carry optional validity windows and a revocation flag; artifacts issued outside a window or under a revoked key are rejected, unknown key ids are always rejected, and an artifact issued inside a window remains verifiable for its own lifetime after the window closes.
+Attestation keys and permit signers carry optional validity windows and a revocation flag; artifacts issued outside a window or under a revoked key are rejected, unknown key ids are always rejected, and an artifact issued inside a window remains verifiable for its own lifetime after the window closes. Because `issued_at` is signer-controlled, verifiers also bound each artifact's lifetime (`ATTESTATION_TTL_EXCEEDED`, `PERMIT_TTL_EXCEEDED`), capping a retired key's exposure to `not_after + lifetime`; revocation remains the hard control.

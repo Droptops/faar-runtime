@@ -18,6 +18,7 @@ from .models import (
     AuthorityDecision,
     CapabilityGrant,
     Decision,
+    ExecutionReceipt,
     ExecutionRequest,
     Intent,
     IntentState,
@@ -28,7 +29,16 @@ from .models import (
     Verdict,
     utcnow,
 )
-from .store import EffectConflict, GrantConflict, IntentBusy, SQLiteIntentStore, TERMINAL_STATES, UnknownGrant, UnknownIntent
+from .store import (
+    EffectConflict,
+    EvidenceIntegrityError,
+    GrantConflict,
+    IntentBusy,
+    SQLiteIntentStore,
+    TERMINAL_STATES,
+    UnknownGrant,
+    UnknownIntent,
+)
 
 
 # Adapter and verifier output is a trust boundary. An effect identity must be a
@@ -43,6 +53,11 @@ _RESUBMIT_BLOCKING_REASONS = frozenset({
     _DETERMINISTIC_FAILURE_BLOCK,
     "EXECUTION_DETERMINISTIC_FAILURE_UNVERIFIED",
 })
+
+# Terminal reason codes derived from a settlement observation. A never-submitted
+# intent stopped for one of these may still be backed by an external effect the
+# verifier attributed to it, so its HELD reservation is not an orphan (I-23).
+_SETTLEMENT_DERIVED_PREFIXES = ("SETTLED_", "SETTLEMENT_", "EFFECT_ID_", "PAYMENT_", "UNHANDLED_SETTLEMENT")
 
 
 def _valid_effect_id(value: object) -> bool:
@@ -193,6 +208,23 @@ class FAARRuntime:
                 reason_codes=("INTENT_BUSY",), replayed=True,
                 submission_count=current.submission_count,
             )
+        except EvidenceIntegrityError:
+            return self._integrity_failure(intent.intent_id)
+
+    def _integrity_failure(self, intent_id: str) -> RuntimeResult:
+        """The evidence chain refused an append: nothing advances, the caller gets a code.
+
+        Reached for a keyed chain without a head (pre-0.4 database, remedied by the
+        operator's `rebuild_evidence_head`) or a chain whose tail no longer matches
+        its signed head (tampering). Either way the intent is fail-stuck with a
+        machine-readable reason rather than a traceback.
+        """
+        current = self.store.get(intent_id)
+        return RuntimeResult(
+            intent_id=intent_id, state=current.state, effect_id=current.effect_id,
+            reason_codes=("EVIDENCE_INTEGRITY_FAILURE",), replayed=True,
+            submission_count=current.submission_count,
+        )
 
     def _release_orphaned_hold(self, stored) -> None:
         """Release a HELD reservation left behind by a terminal, never-submitted intent.
@@ -200,10 +232,16 @@ class FAARRuntime:
         `submission_count` is incremented atomically with the SUBMITTED transition, so
         a terminal intent with a zero count provably never reached an adapter and its
         reservation cannot back an external effect. Anything else keeps its budget
-        held; ambiguity is never resolved in favour of availability.
+        held; ambiguity is never resolved in favour of availability. A stop that
+        reconciliation derived from an authoritative settlement observation is not
+        an orphan either: the verifier attributed an effect to this intent that the
+        runtime could not accept, and that needs a human (OPERATIONS.md §4).
         """
-        if stored.state in TERMINAL_STATES and stored.state != IntentState.FINALIZED and stored.submission_count == 0:
-            self.store.release_usage(stored.intent_id)
+        if stored.state not in TERMINAL_STATES or stored.state == IntentState.FINALIZED or stored.submission_count != 0:
+            return
+        if any(reason.startswith(_SETTLEMENT_DERIVED_PREFIXES) for reason in stored.reason_codes):
+            return
+        self.store.release_usage(stored.intent_id)
 
     def _process_unlocked(
         self,
@@ -220,6 +258,10 @@ class FAARRuntime:
         decision_now = self._decision_time(now)
         intent_hash = canonical_hash(intent)
         existing = self.store.register(intent, intent_hash)
+        if existing.state not in TERMINAL_STATES:
+            # Every decision below records evidence. If the chain will refuse the
+            # append, fail here, before any state is advanced.
+            self.store.assert_evidence_appendable(intent.intent_id)
 
         # The complete grant envelope is provisioned by a separate principal.
         # Matching only grant_id/version is insufficient because a compromised
@@ -245,6 +287,9 @@ class FAARRuntime:
                     "runtime_status": runtime_grant_status, "from_state": existing.state.value,
                 })
                 return self._current_result(intent.intent_id, reason_codes=(reason,))
+            # A durable deterministic-failure block outranks the status block: it must
+            # survive a halt/resume cycle, and it terminalizes as FAILED_SAFE.
+            blocked = any(r in _RESUBMIT_BLOCKING_REASONS for r in existing.reason_codes)
             return self.reconcile(
                 intent,
                 grant=grant,
@@ -254,7 +299,7 @@ class FAARRuntime:
                 risk_attestation=risk_attestation,
                 now=now_override,
                 _allow_resubmit=False,
-                _block_reason=reason,
+                _block_reason=_DETERMINISTIC_FAILURE_BLOCK if blocked else reason,
             )
 
         # Interrupted authorization should not blindly resume on stale caller state.
@@ -508,6 +553,7 @@ class FAARRuntime:
                     decisions,
                     release_usage=True,
                 )
+            permit = None
             if not started:
                 outcome = "not_started"
             else:
@@ -525,9 +571,20 @@ class FAARRuntime:
                     )
                 except PermitIssuanceError as exc:
                     reasons = ("EXECUTION_PERMIT_REJECTED",) + exc.reasons
-                    self.store.transition(intent.intent_id, IntentState.SUBMITTED, IntentState.FAILED_SAFE, reason_codes=reasons, release_usage=True)
-                    self.store.add_evidence(intent.intent_id, "execution_permit_rejected", {"reason_codes": list(exc.reasons), "attempt": attempt})
-                    return self._current_result(intent.intent_id, decisions=decisions, reason_codes=reasons)
+                    if "PERMIT_PREVIOUS_ATTEMPT_LIVE" in exc.reasons:
+                        # The store refused a second live permit for this intent. No
+                        # authority was transported by this attempt, but the earlier
+                        # permit may still be consumed, so the budget stays held and
+                        # the recorded window governs reconciliation.
+                        outcome = "previous_live"
+                        self.store.transition(intent.intent_id, IntentState.SUBMITTED, IntentState.UNKNOWN, reason_codes=reasons)
+                        self.store.add_evidence(intent.intent_id, "execution_permit_rejected", {
+                            "reason_codes": list(exc.reasons), "attempt": attempt, "budget_released": False,
+                        })
+                    else:
+                        self.store.transition(intent.intent_id, IntentState.SUBMITTED, IntentState.FAILED_SAFE, reason_codes=reasons, release_usage=True)
+                        self.store.add_evidence(intent.intent_id, "execution_permit_rejected", {"reason_codes": list(exc.reasons), "attempt": attempt})
+                        return self._current_result(intent.intent_id, decisions=decisions, reason_codes=reasons)
                 except Exception as exc:
                     # Permit issuance happens before the adapter sees anything, so an
                     # unexpected signer/store failure is fail-safe rather than economically
@@ -539,6 +596,7 @@ class FAARRuntime:
                     })
                     return self._current_result(intent.intent_id, decisions=decisions, reason_codes=reasons)
 
+            if permit is not None:
                 self.store.add_evidence(intent.intent_id, "submission_started", {
                     "venue": intent.venue,
                     "attempt": attempt,
@@ -547,12 +605,21 @@ class FAARRuntime:
                     "grant_epoch": permit.permit.grant_epoch,
                     "fence_token": permit.permit.fence_token,
                 })
-                # While the signed permit is live the venue may still act on an
-                # attempt whose outcome the runtime never observed. Absence of an
-                # effect is therefore not authoritative until the permit has expired.
+                # While the signed permit is live the venue may act on this attempt
+                # whatever the adapter reports next (receipt, rejection, exception,
+                # or nothing). The store recorded `permit.expires_at` as the intent's
+                # ambiguity window atomically with the permit; every transition below
+                # carries the same instant so absence of an effect is not trusted
+                # before it (I-30).
                 ambiguity_until = permit.permit.expires_at
                 try:
                     receipt = self._execute_adapter(adapter, request, permit)
+                    if not isinstance(receipt, ExecutionReceipt):
+                        # Adapter output is a trust boundary: a value the runtime cannot
+                        # interpret is an unobserved outcome, never a crash.
+                        raise AmbiguousExecution(
+                            f"adapter returned {type(receipt).__name__}, not an ExecutionReceipt"
+                        )
                 except AmbiguousExecution as exc:
                     outcome = "ambiguous"
                     reason = "EXECUTION_DEADLINE_EXCEEDED" if isinstance(exc, AdapterDeadlineExceeded) else "EXECUTION_AMBIGUOUS"
@@ -567,16 +634,16 @@ class FAARRuntime:
                 except DeterministicFailure as exc:
                     # A submitter is not allowed to prove non-execution. Even a
                     # deterministic-looking rejection is independently reconciled before
-                    # held budget is released. The verifier may still find an effect.
-                    # The block on resubmission is persisted in the reason codes so it
-                    # survives across calls and worker restarts.
+                    # held budget is released, and not before the permit the venue may
+                    # still hold has expired. The block on resubmission is persisted in
+                    # the reason codes so it survives across calls and worker restarts.
                     outcome = "deterministic"
                     self.store.transition(
                         intent.intent_id, IntentState.SUBMITTED, IntentState.UNKNOWN,
-                        reason_codes=("EXECUTION_DETERMINISTIC_FAILURE_UNVERIFIED",),
+                        reason_codes=("EXECUTION_DETERMINISTIC_FAILURE_UNVERIFIED",), ambiguity_until=ambiguity_until,
                     )
                     self.store.add_evidence(intent.intent_id, "adapter_rejection_untrusted", {
-                        "message": str(exc), "attempt": attempt,
+                        "message": str(exc), "attempt": attempt, "ambiguity_until": ambiguity_until.isoformat(),
                     })
                 except Exception as exc:
                     # Adapter crashes are economically ambiguous. The independent
@@ -596,7 +663,8 @@ class FAARRuntime:
                     # configured independent settlement verifier may advance
                     # CONFIRMED/FINALIZED. Receipt fields are bounded/stringified here
                     # because adapter output is a trust boundary and must not be able to
-                    # crash evidence recording.
+                    # crash evidence recording. A receipt does not close the window: a
+                    # venue that acknowledged the request may not have processed it.
                     self.store.add_evidence(intent.intent_id, "adapter_receipt_untrusted", {
                         "reported_status": receipt.status.value,
                         "reported_effect_id": _untrusted_repr(receipt.effect_id),
@@ -606,7 +674,7 @@ class FAARRuntime:
                     })
                     self.store.transition(
                         intent.intent_id, IntentState.SUBMITTED, IntentState.UNKNOWN,
-                        reason_codes=("AWAITING_INDEPENDENT_SETTLEMENT",),
+                        reason_codes=("AWAITING_INDEPENDENT_SETTLEMENT",), ambiguity_until=ambiguity_until,
                     )
 
         if outcome == "deterministic":
@@ -648,6 +716,8 @@ class FAARRuntime:
                 effect_id=current.effect_id, reason_codes=("INTENT_BUSY",), replayed=True,
                 submission_count=current.submission_count,
             )
+        except EvidenceIntegrityError:
+            return self._integrity_failure(intent.intent_id)
 
     def _reconcile_unlocked(
         self,
@@ -671,6 +741,7 @@ class FAARRuntime:
         previous_effect_id = stored.effect_id
         if stored.state in TERMINAL_STATES:
             return self._stored_result(stored, decisions=decisions, replayed=True)
+        self.store.assert_evidence_appendable(intent.intent_id)
 
         # The presented grant must be the provisioned envelope before any state
         # mutation. A caller presenting the wrong grant is not evidence about the

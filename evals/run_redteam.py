@@ -102,6 +102,7 @@ ATTACK_CLASSES: dict[str, tuple[str, ...]] = {
     "symmetric/private permit key leakage into execution gateway": (
         "test_permits.PermitBoundaryTests.test_execution_gateway_rejects_symmetric_signing_material",
         "test_permits.PermitBoundaryTests.test_permit_verifier_rejects_private_key_material",
+        "test_permits.PermitBoundaryTests.test_permit_authority_rejects_symmetric_signer",
     ),
     "fresh retry risk-state reuse by another intent": ("test_permits.PermitBoundaryTests.test_fresh_retry_risk_state_cannot_be_reused_by_different_intent",),
     "submitter receipt self-finalization": ("test_runtime.FAARRuntimeTests.test_submitter_receipt_cannot_override_independent_settlement",),
@@ -142,7 +143,10 @@ ATTACK_CLASSES: dict[str, tuple[str, ...]] = {
     "malformed permit crashing the gateway": ("test_boundary_hardening.PermitVerifierBoundaryTests.test_malformed_permit_is_a_deterministic_rejection_not_an_exception",),
     "settlement of another intent satisfying the task contract": ("test_boundary_hardening.OutcomeBindingTests.test_settlement_of_another_intent_cannot_satisfy_the_contract",),
     "restored backup resurrecting a revoked grant": ("test_controls.AuthorityAnchorTests.test_restored_snapshot_cannot_resurrect_a_revoked_grant",),
-    "restored backup replaying a consumed permit": ("test_controls.AuthorityAnchorTests.test_restored_snapshot_cannot_replay_a_consumed_permit",),
+    "restored backup replaying a consumed permit": (
+        "test_controls.AuthorityAnchorTests.test_restored_snapshot_cannot_replay_a_consumed_permit",
+        "test_controls.AuthorityAnchorTests.test_restored_snapshot_from_before_issuance_is_regressed_too",
+    ),
     "outstanding permits surviving an emergency halt": ("test_controls.KillSwitchTests.test_global_halt_stops_new_intents_and_kills_outstanding_permits",),
     "revoked attestation key still trusted": ("test_key_lifecycle.AttestationKeyLifecycleTests.test_revoked_key_is_rejected_even_with_a_valid_signature",),
     "retired permit signer still trusted at the gateway": ("test_key_lifecycle.PermitSignerRotationTests.test_gateway_trusts_both_signers_during_overlap_then_revokes_the_old_one",),
@@ -158,6 +162,44 @@ ATTACK_CLASSES: dict[str, tuple[str, ...]] = {
     "expired or future permit consumed at the gateway": ("test_mutation_gaps.EpochFenceTests.test_expired_and_future_permits_are_rejected_at_the_gateway",),
     "older risk state re-authorizing after a newer one": ("test_mutation_gaps.RiskStateMonotonicityTests.test_older_risk_state_version_cannot_authorize_after_newer_one",),
     "PAY to an unapproved recipient": ("test_mutation_gaps.PayPrimitiveTests.test_pay_to_unapproved_recipient_is_denied",),
+    # --- added in the 0.4.0 review pass ------------------------------------------
+    "receipt or deterministic rejection closing the permit window early": (
+        "test_runtime_hardening.RuntimeHardeningTests.test_receipt_without_effect_does_not_close_the_permit_window",
+        "test_runtime_hardening.RuntimeHardeningTests.test_deterministic_failure_keeps_budget_until_the_permit_window_closes",
+        "test_paper.PaperVenueTests.test_insufficient_balance_fails_safe_and_releases_usage",
+    ),
+    "second live permit minted for one intent": (
+        "test_permits.PermitBoundaryTests.test_one_live_permit_per_intent_is_enforced_by_the_store",
+        "test_runtime_hardening.RuntimeHardeningTests.test_store_refuses_a_second_live_permit_and_the_runtime_keeps_the_budget",
+    ),
+    "adapter returning a non-receipt value crashing the state machine": ("test_runtime_hardening.RuntimeHardeningTests.test_non_receipt_adapter_return_is_ambiguous_not_a_crash",),
+    "deterministic-failure block overwritten by a halt": ("test_runtime_hardening.RuntimeHardeningTests.test_deterministic_failure_block_survives_a_halt_and_resume",),
+    "settlement-derived stop released as an orphaned hold on replay": ("test_runtime_hardening.RuntimeHardeningTests.test_replay_keeps_the_hold_of_a_never_submitted_intent_stopped_on_settlement_evidence",),
+    "single transient settlement source error terminally stopping an intent": (
+        "test_settlement.SettlementQuorumTests.test_single_transient_source_error_is_insufficient_evidence_not_contradiction",
+        "test_settlement.SettlementQuorumTests.test_non_authoritative_source_cannot_form_quorum",
+        "test_boundary_hardening.SettlementHardeningTests.test_one_raising_minority_source_does_not_wedge_the_quorum",
+    ),
+    "retired-but-not-revoked key with a back-dated long-lived artifact": (
+        "test_key_lifecycle.AttestationKeyLifecycleTests.test_artifact_lifetime_bound_caps_a_retired_keys_exposure",
+        "test_key_lifecycle.PermitSignerRotationTests.test_gateway_bounds_permit_lifetime",
+    ),
+    "concurrent anchor writers losing a high-water mark": ("test_controls.AuthorityAnchorTests.test_file_anchor_is_safe_across_processes",),
+    "authority consumed through an unanchored or unreadable anchor": (
+        "test_controls.AuthorityAnchorTests.test_store_bound_to_an_anchor_refuses_unanchored_authority_changes",
+        "test_controls.AuthorityAnchorTests.test_unreadable_anchor_fails_closed",
+        "test_cli.OperatorCliTests.test_unanchored_command_on_an_anchored_database_exits_with_a_typed_error",
+    ),
+    "legacy effect id claimable by a new intent after upgrade": ("test_store_hardening.SchemaMigrationTests.test_legacy_effect_ids_stay_bound_to_their_venue_after_upgrade",),
+    "legacy reservations dropped from the velocity window after upgrade": ("test_store_hardening.SchemaMigrationTests.test_legacy_reservations_count_toward_velocity_after_upgrade",),
+    "legacy in-flight attempt trusted as absent immediately after upgrade": ("test_store_hardening.SchemaMigrationTests.test_legacy_in_flight_intent_gets_a_conservative_ambiguity_window",),
+    "unreadable legacy row silently exempted from the invariants": ("test_store_hardening.SchemaMigrationTests.test_unreadable_legacy_timestamp_fails_closed",),
+    "keyed runtime advancing state on a chain it cannot extend": (
+        "test_store_hardening.LegacyChainTests.test_runtime_does_not_advance_state_on_a_chain_it_cannot_extend",
+        "test_store_hardening.LegacyChainTests.test_empty_legacy_chain_is_adopted_only_on_request_and_records_the_adoption",
+        "test_store_hardening.LegacyChainTests.test_tampered_chain_is_not_adopted_by_the_bulk_rebuild",
+        "test_cli.OperatorCliTests.test_rebuild_evidence_heads_for_a_legacy_database",
+    ),
 }
 
 

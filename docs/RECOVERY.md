@@ -31,7 +31,7 @@ Both reconcile first. Submitter output never decides which.
 | `NONE`, authoritative | window closed, resubmission blocked | `FAILED_SAFE` (deterministic adapter failure) or `STOPPED` (grant not active), usage RELEASED |
 | `NONE`, authoritative | window closed, retry predicates hold | new submission attempt |
 | `NONE`, authoritative | window closed, a retry predicate fails | `STOPPED` with the failing predicate, usage RELEASED |
-| `UNKNOWN` | | `UNKNOWN (SETTLEMENT_UNKNOWN)`, usage HELD |
+| `UNKNOWN` (including a quorum short of votes because sources were unreachable) | | `UNKNOWN (SETTLEMENT_UNKNOWN)`, usage HELD |
 | `CONTRADICTORY` | any authority | `STOPPED (SETTLEMENT_CONTRADICTORY)`, usage HELD |
 | verifier raised | | `UNKNOWN (RECONCILIATION_EXCEPTION)`, usage HELD |
 | authoritative record bound to a different request | | `STOPPED (SETTLEMENT_REQUEST_BINDING_MISMATCH)`, usage HELD |
@@ -45,6 +45,8 @@ Pre-settlement terminal paths:
 | Event | Result |
 |---|---|
 | permit issuance refused / raised | `FAILED_SAFE (EXECUTION_PERMIT_REJECTED / EXECUTION_PERMIT_EXCEPTION)`, usage RELEASED (no capability was transported) |
+| permit issuance refused because an earlier permit for this intent is still live | `UNKNOWN (EXECUTION_PERMIT_REJECTED, PERMIT_PREVIOUS_ATTEMPT_LIVE)`, usage HELD; reconcile after the recorded window |
+| evidence chain refuses an append | no transition; result `EVIDENCE_INTEGRITY_FAILURE` (operator: `rebuild-evidence-head`) |
 | grant not ACTIVE (paused, revoked, halted, regressed) before submission | `STOPPED (GRANT_RUNTIME_<STATUS>)`, usage RELEASED |
 | grant not ACTIVE while an attempt is in flight | reconcile with resubmission blocked; effect is still recorded if found |
 | adapter missing | `STOPPED (ADAPTER_NOT_CONFIGURED)`; usage RELEASED only from PROPOSED/AUTHORIZED/RESERVED |
@@ -54,11 +56,14 @@ made". `STOPPED` means "a human must look". Both are terminal.
 
 ## The permit window
 
-While the permit of an ambiguous attempt is unexpired, the venue may still act on
-it. The runtime stores `permit.expires_at` as `ambiguity_until` and refuses to
-treat absence as authoritative until that instant plus the grant's
-`max_clock_skew_seconds`. A new attempt therefore never overlaps an attempt the
-venue may still execute. `begin_submission` resets the window for the new attempt.
+While a permit is unexpired, the venue may still act on it, whatever the adapter
+reported: timeout, exception, deterministic rejection, receipt, or garbage. The
+store writes `permit.expires_at` as `ambiguity_until` in the same transaction as
+the permit and refuses to treat absence as authoritative until that instant plus
+the grant's `max_clock_skew_seconds`. A new attempt therefore never overlaps an
+attempt the venue may still execute: `begin_submission` resets the window, the
+new permit sets it again, and the store refuses to record a second live permit
+for one intent. A later permit supersedes the earlier one at consumption.
 
 ## Before resubmission
 

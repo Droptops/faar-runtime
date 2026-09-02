@@ -22,8 +22,14 @@ faar resume --scope global --db faar.sqlite
   including at venues that verify permits themselves, and they stay dead after
   `resume`.
 - `halt` does not wait for a hung adapter call. In-flight attempts are refused
-  at permit consumption; their intents reconcile as usual and stay UNKNOWN until
-  their permit window closes.
+  at permit consumption (`PERMIT_HALTED`). Their intents reconcile as usual with
+  resubmission blocked: an effect the verifier finds still finalizes; otherwise
+  they stay UNKNOWN until their permit window closes and then end `STOPPED`
+  (`GRANT_RUNTIME_HALTED`) with the reservation released once absence is
+  authoritative. A durable deterministic-failure block survives the halt and
+  ends the intent `FAILED_SAFE` instead.
+- `halt` and `resume` are authority changes: on a database bound to an anchor
+  they require `--anchor` (see §5).
 - While halted, `list-grants` shows `effective_status: HALTED`; new intents end
   `STOPPED` with `GRANT_RUNTIME_HALTED`.
 - Per-grant `set-grant-status ... --status PAUSED|REVOKED` remains the
@@ -60,7 +66,9 @@ Read `reason_codes` and `ambiguity_until`:
 | `SETTLEMENT_NONE_WITHIN_PERMIT_WINDOW` | the last attempt may still be in flight | wait until `ambiguity_until` + grant clock skew; the next `process()` call with fresh attestations reconciles |
 | `SETTLEMENT_NONE_NOT_AUTHORITATIVE` / `SETTLEMENT_POSITIVE_NOT_AUTHORITATIVE` | the verifier could not give an authoritative answer | fix the verifier's data source; re-run `process()` |
 | `SETTLEMENT_UNKNOWN`, `RECONCILIATION_EXCEPTION` | verifier unavailable | same |
-| `EXECUTION_DETERMINISTIC_FAILURE_UNVERIFIED` (with one of the above) | adapter rejected the request; block on resubmission is durable | once an authoritative NONE arrives the intent ends `FAILED_SAFE`; a new intent is required |
+| `EXECUTION_DETERMINISTIC_FAILURE` (with one of the above; `_UNVERIFIED` only before the first reconciliation) | adapter rejected the request; block on resubmission is durable | once an authoritative NONE arrives after the permit window the intent ends `FAILED_SAFE`; a new intent is required |
+| `EXECUTION_PERMIT_REJECTED`, `PERMIT_PREVIOUS_ATTEMPT_LIVE` | the store refused a second live permit for this intent | wait for the recorded window; budget stays held |
+| `EVIDENCE_INTEGRITY_FAILURE` | the evidence chain refused an append (legacy chain without a head, or a tail that no longer matches its signed head) | state was not advanced; see §6 and §9 |
 
 Budget held by an UNKNOWN intent is never released by hand through the CLI. It is
 released when the verifier proves absence after the permit window, or committed
@@ -87,6 +95,21 @@ it. Run the store with an authority anchor kept **outside** the backup set:
 faar provision-grant --grant grant.json --db faar.sqlite --anchor /mnt/anchor/faar.anchor.json
 # runtime: SQLiteIntentStore(path, evidence_key=..., authority_anchor=FileAuthorityAnchor(...))
 ```
+
+The first open with an anchor binds the database to it durably. From then on an
+instance opened **without** an anchor (a worker missing the option, an operator
+command without `--anchor`) cannot issue, consume, or change authority:
+`list-grants` shows `effective_status: ANCHOR_REQUIRED`, new intents stop with
+`GRANT_RUNTIME_ANCHOR_REQUIRED`, venues refuse `PERMIT_ANCHOR_REQUIRED`, and
+`halt`/`resume`/`set-grant-status`/`provision-grant`/`revoke-after-restore` exit 2
+with `AuthorityAnchorRequired`. Read-only commands work without it. An anchor
+file that cannot be read or parsed fails closed the same way
+(`ANCHOR_UNAVAILABLE`, `PERMIT_ANCHOR_UNAVAILABLE`).
+
+The per-grant fence counter advances on every permit issuance **and** every
+consumption, so a snapshot taken between the two is detected too. The file
+anchor holds an inter-process lock on `<anchor>.lock` around each update; every
+worker and the CLI may share one file.
 
 Taking a backup:
 
@@ -122,18 +145,25 @@ faar verify-evidence --intent-id <id> --db faar.sqlite --evidence-key-env FAAR_E
 ```
 
 Exit code 2 means the chain, a MAC, or the signed head commitment does not verify,
-or the intent does not exist. Verification without a key checks the public hash
-chain only and cannot detect tail truncation.
+or the intent does not exist. The `status` field says which: `chain_invalid`
+(hash or MAC), `head_mismatch` (tail truncated or head rewritten), `head_missing`
+(a chain written before signed heads existed; not tampering), `chain_empty`
+(an intent with no events at all), `unknown_intent`. Verification without a key
+checks the public hash chain only and cannot detect tail truncation.
 
-A keyed store created before signed heads existed refuses to append to a chain
-that has no head (`EvidenceIntegrityError`). After verifying the chain out of
-band, commit a head once:
+A keyed store refuses to append to a chain that has no head. The runtime then
+returns `EVIDENCE_INTEGRITY_FAILURE` without advancing the intent. After
+verifying the chains out of band, commit heads once:
 
 ```bash
+faar rebuild-evidence-head --all --db faar.sqlite --evidence-key-env FAAR_EVIDENCE_KEY
 faar rebuild-evidence-head --intent-id <id> --db faar.sqlite --evidence-key-env FAAR_EVIDENCE_KEY
 ```
 
-The command refuses if the chain itself does not verify.
+The command refuses any chain that does not verify (`refused:` in the per-intent
+outcome) and skips chains with zero events unless `--adopt-empty` is given, in
+which case the adoption is recorded as the chain's first keyed event. It is never
+run by the runtime.
 
 ## 7. Key rotation
 
@@ -147,14 +177,40 @@ Attestation keys and permit signers are rotated with overlapping validity window
 
 Validity is judged on each artifact's `issued_at`: revocation is immediate; a
 window closing never invalidates an artifact issued inside it. Unknown key ids are
-always rejected.
+always rejected. Because `issued_at` is signer-controlled, a retired key could
+back-date a long-lived artifact; the verifiers therefore bound every artifact's
+own lifetime (`ATTESTATION_TTL_EXCEEDED` above 24 h by default,
+`PERMIT_TTL_EXCEEDED` above 60 s), which caps the exposure of a retired key to
+`not_after + lifetime`. **Revocation is the hard control; `not_after` is a
+rotation convenience.**
 
-## 8. What the CLI deliberately cannot do
+## 8. Upgrading a 0.3.x database
+
+1. Stop every 0.3.x worker and wait at least the permit TTL plus the grant clock
+   skew (default 5 s + 2 s). Mixed-version fleets are unsupported: the permit
+   signature payload changed, and a 0.3.x worker keeps writing rows without a
+   venue namespace.
+2. Take a backup (`checkpoint`, then copy).
+3. Open the database once with 0.4 (any command). The migration runs in one
+   transaction and backfills what the new invariants rely on: each intent's
+   venue from its canonical payload (per-venue effect identity), each legacy
+   reservation's window timestamp (velocity), and a 60 s ambiguity window for
+   in-flight legacy attempts. A row that cannot be brought into the model makes
+   the open fail with `MigrationError`; fix the row, do not skip it.
+4. If the runtime uses an evidence key, run
+   `rebuild-evidence-head --all --evidence-key-env ...` and re-run
+   `verify-evidence` for the intents you care about.
+5. If you run with an authority anchor, open the store with it before any
+   worker starts; that first open binds the database.
+
+## 9. What the CLI deliberately cannot do
 
 - release a HELD reservation;
 - resurrect a REVOKED grant version;
 - take over a lease without the exact owner token;
 - change an intent's state directly;
-- verify keyed evidence without the key.
+- verify keyed evidence without the key;
+- commit a head over a chain that does not verify;
+- change authority on an anchored database without the anchor.
 
 Each of these would let an operator path bypass an invariant the runtime enforces.

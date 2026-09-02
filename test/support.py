@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import os
+import tempfile
 from dataclasses import replace
+from types import SimpleNamespace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
@@ -35,6 +38,22 @@ TRUST_KEY_KINDS = {
     "risk-test": {AttestationKind.RISK},
     "task-test": {AttestationKind.TASK},
 }
+
+
+def temp_path(case, suffix: str = ".sqlite") -> str:
+    """A unique path inside a per-test temporary directory that is removed at cleanup.
+
+    Nothing is created at the path itself, so it serves for SQLite files (and their
+    -wal/-shm companions), anchor files and snapshots alike.
+    """
+    tmpdir = tempfile.TemporaryDirectory(prefix="faar-test-")
+    case.addCleanup(tmpdir.cleanup)
+    return os.path.join(tmpdir.name, "store" + suffix)
+
+
+def temp_file(case, suffix: str = ".sqlite"):
+    """`temp_path` wrapped so `.name` reads like a NamedTemporaryFile."""
+    return SimpleNamespace(name=temp_path(case, suffix))
 
 
 def trust() -> Ed25519TrustStore:

@@ -92,13 +92,36 @@ A third adversarial pass ran eight independent reviewers over the store, runtime
 
 Residual, by design: RT-42's window is only as accurate as the venue's permit expiry check; a venue that ignores permits is outside the model. RT-62's anchor detects nothing if restored together with the database. RT-45's deadline cannot cancel a Python call; the orphaned call is bounded by RT-42.
 
+## Findings fixed in the v0.4.0 review pass
+
+Before release, five independent reviewers (fail-closed regressions, new-code correctness, documentation versus code, test quality, upgrade compatibility) read the v0.4.0 change set; a skeptic re-ran every reproduction it could before a finding was accepted. Each code finding below has a regression test named in `evals/run_redteam.py`.
+
+| ID | Finding | Severity in reference model | Response |
+|---|---|---:|---|
+| RT-66 | The per-venue effect index (RT-58) left every pre-0.4 row in venue namespace `''`; on an upgraded database a new intent at the same venue could be FINALIZED with a legacy effect id and commit its budget against an effect that already settled another intent | High | Migration backfills `venue` from the canonical payload inside the migration transaction and fails closed if any row cannot be namespaced |
+| RT-67 | The ambiguity window (RT-42) was recorded only on the timeout/exception paths. A receipt for a merely accepted request let an authoritative NONE authorize a retry while permit #1 was live; a deterministic rejection released the budget while the venue could still execute the queued request, orphaning the effect | High | The store writes `ambiguity_until` in the same transaction as the permit record, so every adapter outcome is covered; it refuses a second live permit per intent (`PERMIT_PREVIOUS_ATTEMPT_LIVE`, budget held); a later permit supersedes the earlier one at consumption (`PERMIT_SUPERSEDED`) |
+| RT-68 | `FileAuthorityAnchor` held only a per-instance thread lock and a fixed temp name: concurrent workers or the CLI lost high-water marks (a later restore then went undetected) and could corrupt the file; read failures escaped as raw exceptions into permit issuance and `process()` | High | Inter-process `flock` across every read-modify-write, unique temp names, typed `AnchorUnavailable` mapped to `ANCHOR_UNAVAILABLE` / `PERMIT_ANCHOR_UNAVAILABLE` |
+| RT-69 | The anchor recorded issuance but not consumption: a snapshot taken between the two restored as ACTIVE and the consumed permit consumed again; the shipped test snapshotted before issuance and passed for an unrelated reason | Medium | The grant fence counter advances at consumption and is anchored; the test now snapshots between issuance and consumption and asserts `PERMIT_AUTHORITY_REGRESSED` |
+| RT-70 | Any instance opened without an anchor (a worker missing the option, `halt` without `--anchor`) advanced authority unrecorded, so a later restore silently resurrected the permits a halt had killed | Medium | The first anchored open binds the database durably; unanchored instances report `ANCHOR_REQUIRED`, refuse issuance and consumption (`PERMIT_ANCHOR_REQUIRED`) and raise `AuthorityAnchorRequired` on lifecycle changes; the CLI exits 2 with the typed error |
+| RT-71 | `QuorumSettlementVerifier` turned one uncontested vote short of quorum into an authoritative CONTRADICTORY, so a single transient source error terminally STOPPED an intent whose effect exists and held its budget forever | Medium | Short-of-quorum without a contest is a non-authoritative UNKNOWN (`quorum-not-reached`) the runtime retries; a contest or a binding mismatch stays CONTRADICTORY |
+| RT-72 | On a 0.3.0 database (no signed heads) the keyed runtime committed `UNKNOWN -> RECONCILING`, then raised `EvidenceIntegrityError` out of `process()` on every call; keyed `verify-evidence` reported every legacy chain as tampered; zero-event chains had no remedy | Medium | Appendability is checked before any transition; refusal is the machine-readable `EVIDENCE_INTEGRITY_FAILURE`; `evidence_status` distinguishes `head_missing` from tampering; `rebuild-evidence-head --all [--adopt-empty]` is the documented upgrade step and still refuses chains that do not verify |
+| RT-73 | An adapter returning a non-`ExecutionReceipt` value crashed `_submit` outside its exception handlers, leaving the intent SUBMITTED with a transported permit | Medium | Treated as `AmbiguousExecution` inside the window |
+| RT-74 | A halt (or any non-ACTIVE status) while an intent carried the durable deterministic-failure block overwrote the block; after `resume` the adapter was called again | Low | The durable block outranks the status block through every non-terminal transition |
+| RT-75 | Replaying a never-submitted intent that reconciliation had STOPPED on settlement evidence (`SETTLED_AMOUNT_EXCEEDS_AUTHORIZED` from a RESERVED intent) released the hold that reconciliation deliberately kept | Low | Settlement-derived stops are never treated as orphaned holds |
+| RT-76 | `KeyValidity.not_after` was judged on the signer-controlled `issued_at` with no bound on artifact lifetime: a retired (not revoked) key could mint a back-dated ten-year attestation that verified forever | Low | Verifiers bound artifact lifetime (`ATTESTATION_TTL_EXCEEDED` above 24 h, `PERMIT_TTL_EXCEEDED` above 60 s); revocation documented as the hard control |
+| RT-77 | After upgrade, legacy reservations (`velocity_ts` NULL) vanished from the sliding velocity window and legacy in-flight attempts (`ambiguity_until` NULL) were resubmitted immediately | Low | Migration backfills `velocity_ts` from `created_at` and a 60 s window for in-flight legacy rows; unreadable timestamps fail the open |
+| RT-78 | The gateway never emitted `PERMIT_HALTED` / `PERMIT_AUTHORITY_REGRESSED` (documented codes); `ConstrainedPermitAuthority` accepted the symmetric `HMACPermitSignature` although the trust model said otherwise | Info | Status-specific codes at `verify`; symmetric signers refused without the test override |
+| RT-79 | Test-quality defects: the restore test snapshotted before issuance; the canonical-encoding test exercised its check in ~25 % of runs; the signer-relabel test could not distinguish a payload binding from a different key; a deadline test synchronised on `sleep`; the suite leaked 157 temp files per run; a CLI test destroyed a caller's environment variable | Assurance | All rewritten (deterministic aliases, same key under two ids, events, per-test temp directories, `patch.dict`) |
+
+Documentation corrections from the same pass: halt semantics for in-flight intents, the persisted deterministic-failure code, the residual-risk table (partial fills OPEN, orphan threads under R-09), adapter-contract references, HMAC statements, the lifecycle diagram (`RECONCILING -> FAILED_SAFE`, retry edge), and the invariants header.
+
 ## Executable regression matrix
 
 Current `make check` result for v0.4.0:
 
 ```text
-237 unit/invariant tests -> PASS
-86 targeted red-team attack classes, each mapped to named tests (104 tests) -> PASS, 0 unmapped
+261 unit/invariant tests -> PASS
+100 targeted red-team attack classes, each mapped to named tests (131 tests) -> PASS, 0 unmapped
 160 deterministic denial mutations -> 0 unauthorized economic effects, 0 adapter calls
 100 retries of one logical intent -> 1 successful effect, 1 adapter call, 1 permit issued and consumed
 ambiguous timeout-after-effect recovery -> 1 successful effect, 1 adapter call

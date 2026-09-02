@@ -8,7 +8,6 @@ the adapter was never invoked (or invoked exactly once).
 from __future__ import annotations
 
 import inspect
-import tempfile
 import unittest
 from dataclasses import replace
 from datetime import timedelta
@@ -39,14 +38,12 @@ from faar.permits import PermitIssuanceError
 from faar.runtime import FAARRuntime
 from faar.settlement import MockSettlementVerifier, QuorumSettlementVerifier, REFERENCE_SETTLEMENT_PROFILE, SettlementSecurityProfile
 from faar.store import IntentConflict, InvalidTransition, SQLiteIntentStore, UnknownGrant
-from support import AUTH, NOW, PRINCIPAL, TRUST_KEY_KINDS, attest_pair, build_mock_runtime, grant, intent, permit_stack, risk, trust, verification_trust
+from support import AUTH, NOW, PRINCIPAL, TRUST_KEY_KINDS, attest_pair, build_mock_runtime, grant, intent, permit_stack, risk, temp_path, trust, verification_trust
 
 
 class _Base(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False)
-        self.tmp.close()
-        self.store = SQLiteIntentStore(self.tmp.name, evidence_key=b"evidence-test-key-32-bytes-long!!!!")
+        self.store = SQLiteIntentStore(temp_path(self), evidence_key=b"evidence-test-key-32-bytes-long!!!!")
         self.trust = trust()
         self.store.provision_grant(grant(), canonical_hash(grant()))
         self.runtime, self.venue, self.settlement, self.permit_authority, self.permit_verifier = build_mock_runtime(self.store, self.trust)

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import tempfile
 import unittest
 from datetime import timedelta
 from decimal import Decimal
@@ -13,13 +12,12 @@ from faar.settlement import MockSettlementVerifier
 from faar.permits import ConstrainedPermitAuthority, ExecutionPermitVerifier
 from faar.store import SQLiteIntentStore
 
-from support import AUTH, NOW, PRINCIPAL, attest_pair, trust, verification_trust, permit_stack
+from support import AUTH, NOW, PRINCIPAL, attest_pair, temp_path, trust, verification_trust, permit_stack
 
 
 class PaperVenueTests(unittest.TestCase):
     def setUp(self):
-        f = tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False); f.close()
-        self.store = SQLiteIntentStore(f.name)
+        self.store = SQLiteIntentStore(temp_path(self))
         self.grant = CapabilityGrant(
             principal_id=PRINCIPAL,
             grant_id="g-paper", version=1, actor_id="agent:q", status=GrantStatus.ACTIVE,
@@ -89,7 +87,18 @@ class PaperVenueTests(unittest.TestCase):
             payload={"from_asset": "USDC", "to_asset": "MEME", "amount_usd": "50", "target": "paper-router"},
         )
         result = self.execute_case(i)
-        self.assertEqual(IntentState.FAILED_SAFE, result.state)
+        # The venue's rejection is not proof of non-execution while the permit it
+        # was handed can still be consumed: budget stays held for the window.
+        self.assertEqual(IntentState.UNKNOWN, result.state)
+        self.assertIn("SETTLEMENT_NONE_WITHIN_PERMIT_WINDOW", result.reason_codes)
+        self.assertEqual("HELD", self.store.usage("g-paper", 1)[0]["status"])
+        aa, ra = attest_pair(self.trust, i, AUTH, self.risk)
+        later = self.runtime.process(
+            i, AUTH, self.grant, self.risk, authority_attestation=aa, risk_attestation=ra,
+            now=NOW + timedelta(seconds=15),
+        )
+        self.assertEqual(IntentState.FAILED_SAFE, later.state)
+        self.assertEqual(("EXECUTION_DETERMINISTIC_FAILURE",), later.reason_codes)
         usage = self.store.usage("g-paper", 1)
         self.assertEqual("RELEASED", usage[0]["status"])
         self.assertEqual(0, self.venue.successful_effect_count(i.intent_id))

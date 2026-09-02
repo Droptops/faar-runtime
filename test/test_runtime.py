@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import tempfile
 import threading
 import time
 import unittest
@@ -26,7 +25,7 @@ from faar.settlement import MockSettlementVerifier, SettlementRecord, Settlement
 from faar.models import ExecutionRequest
 from faar.store import GrantConflict, IntentConflict, SQLiteIntentStore
 
-from support import AUTH, NOW, PRINCIPAL, Clock, attest_pair, grant, intent, risk, trust, verification_trust, build_mock_runtime, permit_stack
+from support import AUTH, NOW, PRINCIPAL, Clock, attest_pair, grant, intent, risk, temp_path, trust, verification_trust, build_mock_runtime, permit_stack
 
 
 class AdapterBackedVerifier:
@@ -48,9 +47,7 @@ class AdapterBackedVerifier:
 
 class FAARRuntimeTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False)
-        self.tmp.close()
-        self.store = SQLiteIntentStore(self.tmp.name, evidence_key=b"evidence-test-key-32-bytes-long!!!!")
+        self.store = SQLiteIntentStore(temp_path(self), evidence_key=b"evidence-test-key-32-bytes-long!!!!")
         self.trust = trust()
         self.runtime, self.venue, self.settlement, self.permit_authority, self.permit_verifier = build_mock_runtime(
             self.store, self.trust

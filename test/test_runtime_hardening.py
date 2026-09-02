@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import tempfile
 import threading
 import time
 import unittest
@@ -13,8 +12,8 @@ from faar.canonical import canonical_hash
 from faar.models import ExecutionReceipt, ExecutionRequest, IntentState, SettlementRecord, SettlementStatus
 from faar.runtime import FAARRuntime
 from faar.settlement import MockSettlementVerifier, REFERENCE_SETTLEMENT_PROFILE
-from faar.store import SQLiteIntentStore, UnknownIntent
-from support import AUTH, NOW, Clock, attest_pair, build_mock_runtime, grant, intent, permit_stack, risk, trust, verification_trust
+from faar.store import PermitConflict, SQLiteIntentStore, UnknownIntent
+from support import AUTH, NOW, Clock, attest_pair, build_mock_runtime, grant, intent, permit_stack, risk, temp_path, trust, verification_trust
 
 
 def _auth(status, effect_id=None, amount="50"):
@@ -75,9 +74,7 @@ class ScriptedVerifier:
 
 class RuntimeHardeningTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False)
-        self.tmp.close()
-        self.store = SQLiteIntentStore(self.tmp.name, evidence_key=b"evidence-test-key-32-bytes-long!!!!")
+        self.store = SQLiteIntentStore(temp_path(self), evidence_key=b"evidence-test-key-32-bytes-long!!!!")
         self.trust = trust()
         self.store.provision_grant(grant(), canonical_hash(grant()))
 
@@ -91,11 +88,14 @@ class RuntimeHardeningTests(unittest.TestCase):
             {"mock-dex": ScriptedVerifier(adapter)}, clock=lambda: NOW, allow_test_time_override=True,
         )
 
-    def run_case(self, runtime, i, g=None, rs=None):
+    def run_case(self, runtime, i, g=None, rs=None, now=NOW):
         g = g or grant()
-        rs = rs or risk()
-        aa, ra = attest_pair(self.trust, i, AUTH, rs, NOW)
-        return runtime.process(i, AUTH, g, rs, authority_attestation=aa, risk_attestation=ra, now=NOW)
+        rs = rs or risk(observed_at=now)
+        aa, ra = attest_pair(self.trust, i, AUTH, rs, now)
+        return runtime.process(i, AUTH, g, rs, authority_attestation=aa, risk_attestation=ra, now=now)
+
+    # Past the default 5 s permit TTL plus the grant's 2 s clock-skew allowance.
+    AFTER_WINDOW = NOW + timedelta(seconds=10)
 
     def usage_status(self, iid):
         return next(r["status"] for r in self.store.usage("grant:test", 1) if r["intent_id"] == iid)
@@ -153,12 +153,141 @@ class RuntimeHardeningTests(unittest.TestCase):
         first = self.run_case(runtime, i)
         self.assertEqual(IntentState.UNKNOWN, first.state)
         self.assertIn("EXECUTION_DETERMINISTIC_FAILURE", self.store.get(i.intent_id).reason_codes)
-        second = self.run_case(runtime, i)
+        second = self.run_case(runtime, i, now=self.AFTER_WINDOW)
         self.assertEqual(IntentState.FAILED_SAFE, second.state)
         self.assertEqual(("EXECUTION_DETERMINISTIC_FAILURE",), second.reason_codes)
         self.assertEqual(1, adapter.calls, "a persisted block must not be forgotten by the next worker")
         self.assertEqual(1, self.store.get(i.intent_id).submission_count)
         self.assertEqual("RELEASED", self.usage_status(i.intent_id))
+
+    def test_deterministic_failure_block_survives_a_halt_and_resume(self):
+        adapter = ScriptedAdapter(
+            [DeterministicFailure("permit rejected"), ExecutionReceipt("effect-Y", SettlementStatus.FINALIZED, {}, Decimal("50"))],
+            [_auth(SettlementStatus.NONE)],
+        )
+        runtime = self.runtime_for(adapter)
+        i = intent(intent_id="intent_hard_000000000021")
+        self.assertEqual(IntentState.UNKNOWN, self.run_case(runtime, i).state)
+        # An emergency halt while the intent is parked must not overwrite the
+        # durable block with the status block; otherwise the adapter is called
+        # again as soon as the halt is lifted.
+        self.store.halt("global", reason="drill")
+        halted = self.run_case(runtime, i)
+        self.assertEqual(IntentState.UNKNOWN, halted.state)
+        self.assertIn("EXECUTION_DETERMINISTIC_FAILURE", self.store.get(i.intent_id).reason_codes)
+        self.store.resume("global")
+        after = self.run_case(runtime, i, now=self.AFTER_WINDOW)
+        self.assertEqual(IntentState.FAILED_SAFE, after.state)
+        self.assertEqual(("EXECUTION_DETERMINISTIC_FAILURE",), after.reason_codes)
+        self.assertEqual(1, adapter.calls)
+        self.assertEqual("RELEASED", self.usage_status(i.intent_id))
+
+    # --- the permit window covers every adapter outcome ------------------------------
+
+    def test_receipt_without_effect_does_not_close_the_permit_window(self):
+        # The adapter reports a receipt but the venue has not processed the request
+        # (accepted-and-queued). An authoritative NONE inside the permit window must
+        # not authorize a retry: the queued request can still consume permit #1.
+        adapter = ScriptedAdapter(
+            [
+                ExecutionReceipt("fx_pending", SettlementStatus.CONFIRMED, {"note": "accepted-not-processed"}, Decimal("50")),
+                ExecutionReceipt("fx_final", SettlementStatus.FINALIZED, {}, Decimal("50")),
+            ],
+            [_auth(SettlementStatus.NONE), _auth(SettlementStatus.NONE), _auth(SettlementStatus.FINALIZED, "fx_final")],
+        )
+        runtime = self.runtime_for(adapter)
+        i = intent(intent_id="intent_hard_000000000030")
+        first = self.run_case(runtime, i)
+        self.assertEqual(IntentState.UNKNOWN, first.state)
+        self.assertIn("SETTLEMENT_NONE_WITHIN_PERMIT_WINDOW", first.reason_codes)
+        self.assertEqual(1, adapter.calls)
+        self.assertEqual((1, 0), self.store.permit_counts(i.intent_id))
+        self.assertEqual("HELD", self.usage_status(i.intent_id))
+        self.assertIsNotNone(self.store.get(i.intent_id).ambiguity_until)
+        # Once the permit can no longer be honoured, the retry budget applies.
+        second = self.run_case(runtime, i, now=self.AFTER_WINDOW)
+        self.assertEqual(IntentState.FINALIZED, second.state)
+        self.assertEqual(2, adapter.calls)
+        self.assertEqual(2, self.store.get(i.intent_id).submission_count)
+
+    def test_deterministic_failure_keeps_budget_until_the_permit_window_closes(self):
+        # The adapter raises DeterministicFailure without the venue having consumed
+        # the permit (e.g. a transport error after the request was queued). The
+        # venue then executes inside the permit lifetime. Releasing budget on the
+        # rejection would have orphaned that effect.
+        permit_authority, permit_verifier = permit_stack(self.store, self.trust)
+        inner = MockVenue(permit_verifier=permit_verifier, name="mock-dex", clock=lambda: NOW)
+        calls: list = []
+
+        class FailsWithoutConsuming:
+            name = "mock-dex"
+            security_profile = REFERENCE_SAFE_PROFILE
+
+            def execute(self, request, permit):
+                calls.append((request, permit))
+                raise DeterministicFailure("venue returned 502 (request was actually queued)")
+
+        runtime = FAARRuntime(
+            self.store, {"mock-dex": FailsWithoutConsuming()}, verification_trust(self.trust), permit_authority,
+            {"mock-dex": MockSettlementVerifier(inner)}, clock=lambda: NOW, allow_test_time_override=True,
+        )
+        i = intent(intent_id="intent_hard_000000000031")
+        first = self.run_case(runtime, i)
+        self.assertEqual(IntentState.UNKNOWN, first.state)
+        self.assertIn("SETTLEMENT_NONE_WITHIN_PERMIT_WINDOW", first.reason_codes)
+        self.assertIn("EXECUTION_DETERMINISTIC_FAILURE", first.reason_codes)
+        self.assertEqual("HELD", self.usage_status(i.intent_id))
+        request, permit = calls[0]
+        self.assertEqual(permit.permit.expires_at.isoformat(), self.store.get(i.intent_id).ambiguity_until)
+        # The queued request lands at the venue while the permit is live.
+        receipt = inner.execute(request, permit)
+        self.assertEqual(1, inner.successful_effect_count(i.intent_id))
+        later = self.run_case(runtime, i, now=self.AFTER_WINDOW)
+        self.assertEqual(IntentState.FINALIZED, later.state)
+        self.assertEqual(receipt.effect_id, later.effect_id)
+        self.assertEqual("COMMITTED", self.usage_status(i.intent_id))
+        self.assertEqual(1, len(calls))
+
+    def test_non_receipt_adapter_return_is_ambiguous_not_a_crash(self):
+        adapter = ScriptedAdapter([{"status": "ok"}], [_auth(SettlementStatus.NONE)])
+        runtime = self.runtime_for(adapter)
+        i = intent(intent_id="intent_hard_000000000032")
+        result = self.run_case(runtime, i)
+        self.assertEqual(IntentState.UNKNOWN, result.state)
+        self.assertIn("SETTLEMENT_NONE_WITHIN_PERMIT_WINDOW", result.reason_codes)
+        self.assertIn("execution_ambiguous", self.event_types(i.intent_id))
+        self.assertEqual("HELD", self.usage_status(i.intent_id))
+
+    def test_store_refuses_a_second_live_permit_and_the_runtime_keeps_the_budget(self):
+        # Store-level backstop for I-30, exercised directly.
+        i = intent(intent_id="intent_hard_000000000033")
+        self.store.register(i, canonical_hash(i))
+        g = grant()
+        self.store.record_execution_permit("permit_a", i, g, 1, 1, "h1", expires_at=NOW + timedelta(seconds=5), now=NOW)
+        with self.assertRaises(PermitConflict):
+            self.store.record_execution_permit("permit_b", i, g, 1, 2, "h2", expires_at=NOW + timedelta(seconds=5), now=NOW + timedelta(seconds=6))
+        self.store.record_execution_permit("permit_c", i, g, 1, 3, "h3", expires_at=NOW + timedelta(seconds=20), now=NOW + timedelta(seconds=8))
+        self.assertEqual((NOW + timedelta(seconds=20)).isoformat(), self.store.get(i.intent_id).ambiguity_until)
+
+    # --- a settlement-derived stop is not an orphaned hold ------------------------
+
+    def test_replay_keeps_the_hold_of_a_never_submitted_intent_stopped_on_settlement_evidence(self):
+        over = ScriptedAdapter([], [_auth(SettlementStatus.FINALIZED, "fx_external", amount="60")])
+        runtime = self.runtime_for(over)
+        i = intent(intent_id="intent_hard_000000000034")
+        self.store.register(i, canonical_hash(i))
+        self.assertTrue(self.store.reserve_usage(i, grant(), risk(), NOW)[0])
+        self.assertTrue(self.store.transition(i.intent_id, IntentState.PROPOSED, IntentState.AUTHORIZED))
+        self.assertTrue(self.store.transition(i.intent_id, IntentState.AUTHORIZED, IntentState.RESERVED))
+        first = self.run_case(runtime, i)
+        self.assertEqual(IntentState.STOPPED, first.state)
+        self.assertEqual(("SETTLED_AMOUNT_EXCEEDS_AUTHORIZED",), first.reason_codes)
+        self.assertEqual("HELD", self.usage_status(i.intent_id))
+        replay = self.run_case(runtime, i)
+        self.assertEqual(IntentState.STOPPED, replay.state)
+        self.assertTrue(replay.replayed)
+        self.assertEqual("HELD", self.usage_status(i.intent_id), "an effect the verifier attributed to this intent needs a human")
+        self.assertEqual(0, over.calls)
 
     # --- revocation fence covers submission only ------------------------------------
 
@@ -334,6 +463,7 @@ class RuntimeHardeningTests(unittest.TestCase):
         permit_authority, permit_verifier = permit_stack(self.store, self.trust, max_permit_ttl_seconds=1)
         inner = MockVenue(permit_verifier=permit_verifier, name="mock-dex", clock=clock)
         proceed = threading.Event()
+        arrived = threading.Event()
 
         class SlowVenue:
             """Hangs past the runtime deadline, then completes the venue call."""
@@ -341,8 +471,12 @@ class RuntimeHardeningTests(unittest.TestCase):
             security_profile = REFERENCE_SAFE_PROFILE
 
             def execute(self, request, permit):
-                proceed.wait(5)
-                return inner.execute(request, permit)
+                if not proceed.wait(5):
+                    raise AssertionError("test never released the slow venue")
+                try:
+                    return inner.execute(request, permit)
+                finally:
+                    arrived.set()
 
         runtime = FAARRuntime(
             self.store, {"mock-dex": SlowVenue()}, verification_trust(self.trust), permit_authority,
@@ -359,7 +493,7 @@ class RuntimeHardeningTests(unittest.TestCase):
         self.assertIn("execution_ambiguous", self.event_types(i.intent_id))
         # The orphaned call lands late, while the permit is still live: exactly one effect.
         proceed.set()
-        time.sleep(0.2)
+        self.assertTrue(arrived.wait(5), "late venue call must complete")
         self.assertEqual(1, inner.successful_effect_count(i.intent_id))
         clock.advance(4)
         later = runtime.process(i, AUTH, grant(), risk(), authority_attestation=aa, risk_attestation=ra, now=clock())

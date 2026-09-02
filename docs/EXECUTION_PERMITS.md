@@ -66,12 +66,19 @@ calls `store.consume_execution_permit`, one `BEGIN IMMEDIATE` transaction that:
 
 1. finds the permit row written at issuance and checks the ledger binding
    (`permit_hash`, fence token, epoch);
-2. rejects an already consumed permit (`PERMIT_ALREADY_CONSUMED`);
+2. rejects an already consumed permit (`PERMIT_ALREADY_CONSUMED`) and a permit
+   that a later permit for the same intent has superseded (`PERMIT_SUPERSEDED`);
 3. re-reads the grant row and rejects unless it is ACTIVE with the same epoch
    (`PERMIT_GRANT_NOT_ACTIVE`, `PERMIT_GRANT_EPOCH_STALE`), the scope is not
-   halted (`PERMIT_HALTED`), and authority did not regress
-   (`PERMIT_AUTHORITY_REGRESSED`);
-4. marks the permit consumed.
+   halted (`PERMIT_HALTED`), the store can consult its authority anchor
+   (`PERMIT_ANCHOR_REQUIRED`, `PERMIT_ANCHOR_UNAVAILABLE`) and authority did not
+   regress (`PERMIT_AUTHORITY_REGRESSED`);
+4. marks the permit consumed and advances the grant's fence counter, which is
+   pushed to the authority anchor.
+
+The gateway's pre-check (`verify`) reports the same status-specific codes, so a
+venue operator can tell a halt or a restore apart from an ordinary pause. It also
+bounds the permit's own lifetime (`PERMIT_TTL_EXCEEDED`, 60 s by default).
 
 Because `set_grant_status`, `halt`, and consumption all run as IMMEDIATE
 transactions on the same store, a permit either consumes before a lifecycle change
@@ -84,10 +91,14 @@ transport input rather than raising; the venue turns any rejection into a
 
 ## Ambiguity window
 
-If the adapter call does not return a definite result (timeout, exception, or the
-runtime's `adapter_deadline_seconds` elapsed), the request may still be in flight.
-The venue can act on it exactly until the permit expires. The runtime therefore
-records `permit.expires_at` as the intent's `ambiguity_until` and, until that
+From the moment a permit exists the venue may act on it, whatever the adapter
+reports afterwards: a timeout, an exception, a deterministic-looking rejection
+(the request may have been queued before the transport failed), a receipt for a
+request the venue has merely accepted, or a value the runtime cannot interpret.
+The store therefore records `permit.expires_at` as the intent's `ambiguity_until`
+**in the same transaction as the permit itself**, and refuses to record a second
+permit for an intent while an earlier one can still be honoured
+(`PERMIT_PREVIOUS_ATTEMPT_LIVE`; the runtime keeps the budget held). Until that
 instant plus the grant's `max_clock_skew_seconds` has passed:
 
 - an authoritative `NONE` from the settlement verifier is **not** trusted
@@ -115,7 +126,8 @@ without this rule and unreachable with it.
   invalidates authority already granted.
 
 `HMACPermitSignature` remains only as a symmetric compatibility fixture for tests;
-the runtime rejects it at every boundary.
+the permit authority and the gateway both refuse it unless the explicit test-only
+override is passed.
 
 ## Claim boundary
 

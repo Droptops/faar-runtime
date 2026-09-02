@@ -63,7 +63,7 @@ Residual risk: the head commitment is only meaningful when an evidence key is co
 
 ### Backup restore
 
-Restoring an older database resurrects revoked grants, consumed permits and spent risk states. With an authority anchor outside the backup set, affected grant versions become `REGRESSED` and can only be closed. Residual risk: an anchor restored together with the database, or an operator who reconciles without checking the venue, defeats the control.
+Restoring an older database resurrects revoked grants, consumed permits and spent risk states. With an authority anchor outside the backup set, affected grant versions become `REGRESSED` and can only be closed; the anchored fence counter advances at permit issuance and at consumption, a database once bound to an anchor refuses authority changes from instances opened without it, and the file anchor is locked across processes. Residual risk: an anchor restored together with the database, or an operator who reconciles without checking the venue, defeats the control.
 
 ### Malicious/buggy execution adapter
 

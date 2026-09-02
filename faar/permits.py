@@ -12,6 +12,7 @@ from typing import Mapping
 from .attestation import AttestationVerifier, decode_ed25519_signature, encode_ed25519_signature, has_signing_api
 from .canonical import canonical_hash, canonical_json, parse_bounded_decimal
 from .gates import evaluate_authority, evaluate_capability, evaluate_risk
+from .store import PermitConflict
 from .models import (
     Attestation,
     AttestationKind,
@@ -80,6 +81,12 @@ def signed_permit_payload(permit: ExecutionPermit, signer_id: str, algorithm: Pe
 
 @dataclass(frozen=True)
 class HMACPermitSignature:
+    """Symmetric test fixture. Anyone who can verify can also mint, so neither the
+    permit authority nor the execution gateway accepts it without the explicit
+    test-only override."""
+
+    symmetric = True
+
     """Symmetric compatibility backend. Not suitable for an isolated verifier.
 
     Any holder that can verify also has enough key material to mint permits. v0.4
@@ -169,6 +176,9 @@ class PermitControlStore(Protocol):
         grant_epoch: int,
         fence_token: int,
         permit_hash: str,
+        *,
+        expires_at: datetime | None = None,
+        now: datetime | None = None,
     ) -> None: ...
     def consume_execution_permit(
         self, *, permit_id: str, principal_id: str, grant_id: str, grant_version: int,
@@ -206,11 +216,17 @@ class ConstrainedPermitAuthority:
         signature: PermitSigner,
         *,
         max_permit_ttl_seconds: int = 5,
+        allow_symmetric_backend_for_tests: bool = False,
     ) -> None:
         if max_permit_ttl_seconds <= 0:
             raise ValueError("max_permit_ttl_seconds must be positive")
         if not has_signing_api(signature):
             raise ValueError("permit authority requires a signing-capable private backend")
+        if getattr(signature, "symmetric", False) and not allow_symmetric_backend_for_tests:
+            raise ValueError(
+                "permit authority requires an asymmetric signer; a symmetric backend lets every "
+                "verifier mint permits"
+            )
         if has_signing_api(trust):
             raise ValueError("permit authority must receive a verify-only upstream attestation trust store")
         self.store = store
@@ -353,15 +369,33 @@ class ConstrainedPermitAuthority:
             algorithm=self.signature.algorithm,
             signature=self.signature.sign(payload),
         )
-        self.store.record_execution_permit(
-            permit_id,
-            intent,
-            grant,
-            epoch,
-            fence,
-            canonical_hash(signed),
-        )
+        try:
+            self.store.record_execution_permit(
+                permit_id,
+                intent,
+                grant,
+                epoch,
+                fence,
+                canonical_hash(signed),
+                expires_at=expires_at,
+                now=now,
+            )
+        except PermitConflict:
+            # An earlier permit for this intent is still consumable at the venue.
+            # The signed object above never leaves this function, so no authority
+            # was transported; the caller must wait for that permit's window.
+            raise PermitIssuanceError(("PERMIT_PREVIOUS_ATTEMPT_LIVE",))
         return signed
+
+
+# Effective grant statuses that carry their own permit rejection code so a venue
+# operator can tell an emergency halt or a restore apart from an ordinary pause.
+_STATUS_REASONS = {
+    "HALTED": "PERMIT_HALTED",
+    "REGRESSED": "PERMIT_AUTHORITY_REGRESSED",
+    "ANCHOR_REQUIRED": "PERMIT_ANCHOR_REQUIRED",
+    "ANCHOR_UNAVAILABLE": "PERMIT_ANCHOR_UNAVAILABLE",
+}
 
 
 class ExecutionPermitVerifier:
@@ -381,10 +415,13 @@ class ExecutionPermitVerifier:
         max_clock_skew_seconds: int = 2,
         allow_signing_backend_for_tests: bool = False,
         key_validity: Mapping[str, KeyValidity] | None = None,
+        max_permit_lifetime_seconds: int = 60,
     ) -> None:
         verifiers = dict(signature) if isinstance(signature, Mapping) else {signature.signer_id: signature}
         if not verifiers:
             raise ValueError("at least one permit verifier is required")
+        if max_permit_lifetime_seconds <= 0:
+            raise ValueError("max_permit_lifetime_seconds must be positive")
         for signer_id, verifier in verifiers.items():
             if verifier.signer_id != signer_id:
                 raise ValueError(f"permit verifier registered under {signer_id!r} reports signer_id {verifier.signer_id!r}")
@@ -402,11 +439,16 @@ class ExecutionPermitVerifier:
         self.signature = next(iter(verifiers.values()))
         self.control_store = control_store
         self.max_clock_skew_seconds = max_clock_skew_seconds
+        # Bounds how long any single permit can be valid, whatever its signer chose.
+        # Together with `KeyValidity.not_after` (judged on issued_at) this caps the
+        # exposure of a retired-but-not-revoked signer to `not_after + lifetime`.
+        self.max_permit_lifetime_seconds = max_permit_lifetime_seconds
 
     def with_key_validity(self, key_validity: Mapping[str, KeyValidity]) -> "ExecutionPermitVerifier":
         return ExecutionPermitVerifier(
             self.verifiers, self.control_store, max_clock_skew_seconds=self.max_clock_skew_seconds,
             allow_signing_backend_for_tests=True, key_validity=key_validity,
+            max_permit_lifetime_seconds=self.max_permit_lifetime_seconds,
         )
 
     def verify(
@@ -456,13 +498,15 @@ class ExecutionPermitVerifier:
             reasons.append("PERMIT_FROM_FUTURE")
         if now > permit.expires_at:
             reasons.append("PERMIT_EXPIRED")
+        if permit.expires_at - permit.issued_at > timedelta(seconds=self.max_permit_lifetime_seconds):
+            reasons.append("PERMIT_TTL_EXCEEDED")
 
         try:
             status, epoch, _ = self.control_store.get_grant_control(
                 permit.principal_id, permit.grant_id, permit.grant_version
             )
             if status != "ACTIVE":
-                reasons.append("PERMIT_GRANT_NOT_ACTIVE")
+                reasons.append(_STATUS_REASONS.get(status, "PERMIT_GRANT_NOT_ACTIVE"))
             if epoch != permit.grant_epoch:
                 reasons.append("PERMIT_GRANT_EPOCH_STALE")
         except Exception:

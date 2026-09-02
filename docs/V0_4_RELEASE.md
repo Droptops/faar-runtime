@@ -25,14 +25,15 @@ Out of scope:
 
 ## What changed since v0.3.1
 
-See [`RED_TEAM_REPORT.md`](RED_TEAM_REPORT.md) RT-42..RT-65 and the CHANGELOG. Breaking changes for integrators:
+See [`RED_TEAM_REPORT.md`](RED_TEAM_REPORT.md) RT-42..RT-79 and the CHANGELOG. Breaking changes for integrators:
 
 - `schema_version` must be `"0.3"`; unknown document/limit keys are rejected; `intent_id` is 16..128 characters; payloads must be JSON objects; amount strings must be plain ASCII decimals with at most 8 fraction digits; BUY/SELL/PLACE_ORDER payloads carry exactly one amount field.
 - Proven risk-limit breaches are `DENIED` (were `DEFERRED`); missing or stale data still defers.
 - Permit signatures cover signer id and algorithm (permits are 5 s artifacts; no stored permit survives an upgrade).
-- Non-authoritative settlement records never STOP an intent.
-- `FAARRuntime(..., adapter_deadline_seconds=...)`, `SQLiteIntentStore(..., authority_anchor=...)`, `ExecutionPermitVerifier({signer_id: verifier, ...}, key_validity=...)`.
-- Effect ids are unique per `(venue, effect_id)`; daily turnover is a trailing 24 h window.
+- Non-authoritative positive or `NONE` settlement records never STOP an intent; `CONTRADICTORY` stops regardless of authority. A quorum short of votes without a contest is a retriable non-authoritative UNKNOWN (was CONTRADICTORY).
+- `FAARRuntime(..., adapter_deadline_seconds=...)`, `SQLiteIntentStore(..., authority_anchor=...)`, `ExecutionPermitVerifier({signer_id: verifier, ...}, key_validity=..., max_permit_lifetime_seconds=60)`, `Ed25519AttestationVerifier(..., max_attestation_lifetime_seconds=86400)`.
+- A database opened with an authority anchor once is bound to it: instances opened without one cannot issue, consume, or change authority. A store implementing `PermitControlStore.record_execution_permit` must accept `expires_at` and `now` and refuse a second live permit per intent.
+- Effect ids are unique per `(venue, effect_id)`; daily turnover is a trailing 24 h window. Opening a 0.3.x database migrates and backfills it once; follow `OPERATIONS.md` §8 (stop 0.3.x workers first, then `rebuild-evidence-head --all` for keyed stores).
 
 ## Validation evidence
 
@@ -40,8 +41,8 @@ Current `make check` headline results:
 
 | Gate | Result |
 |---|---|
-| Unit/invariant tests | 237/237 pass |
-| Targeted red-team | 86 attack classes mapped to 104 named tests, 0 unmapped |
+| Unit/invariant tests | 261/261 pass |
+| Targeted red-team | 100 attack classes mapped to 131 named tests, 0 unmapped |
 | Adversarial denial cases | 160; 0 unauthorized economic effects; 0 adapter calls |
 | Same-intent replay attempts | 100; 1 effect, 1 adapter call, 1 permit issued and consumed |
 | Seeded fuzz scenarios | 96; 0 duplicate-effect violations; 0 aggregate-budget violations |

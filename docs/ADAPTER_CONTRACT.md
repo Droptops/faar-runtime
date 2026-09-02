@@ -150,10 +150,15 @@ intent `UNKNOWN`, never confirm, and never invalidate a previously recorded effe
 
 `QuorumSettlementVerifier` votes on `(status, effect_id, numeric amount)`; two
 sources reporting `50` and `50.00` agree. A source that raises contributes a
-non-authoritative UNKNOWN and is listed under `evidence["errors"]`; two distinct
-facts each reaching quorum are `CONTRADICTORY`. Agreeing sources' evidence is
-merged into the record when identical and always available under
-`evidence["source_evidence"]`, so definition-of-done criteria remain evaluable.
+non-authoritative UNKNOWN and is listed under `evidence["errors"]`. Two distinct
+authoritative facts, whether or not either reaches quorum, or any authoritative
+record bound to another request, are `CONTRADICTORY` (authoritative; the runtime
+stops). One uncontested fact short of quorum is insufficient evidence, reported
+as a non-authoritative UNKNOWN (`quorum-not-reached`) that the runtime retries;
+a single transient source error therefore never terminally stops an intent.
+Agreeing sources' evidence is merged into the record when identical and always
+available under `evidence["source_evidence"]`, so definition-of-done criteria
+remain evaluable.
 
 ## Part C — Partial fills and cancellation
 

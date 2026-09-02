@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import tempfile
 import unittest
+from datetime import timedelta
 from dataclasses import replace
 from decimal import Decimal
 
@@ -19,13 +19,12 @@ from faar.permits import (
 from faar.attestation import has_signing_api
 from faar.store import SQLiteIntentStore
 
-from support import AUTH, NOW, PRINCIPAL, attest_pair, grant, intent, risk, trust, verification_trust
+from support import AUTH, NOW, PRINCIPAL, attest_pair, grant, intent, risk, temp_path, trust, verification_trust
 
 
 class PermitBoundaryTests(unittest.TestCase):
     def setUp(self):
-        f = tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False); f.close()
-        self.store = SQLiteIntentStore(f.name)
+        self.store = SQLiteIntentStore(temp_path(self))
         self.trust = trust()
         self.grant = grant()
         self.store.provision_grant(self.grant, canonical_hash(self.grant))
@@ -131,9 +130,11 @@ class PermitBoundaryTests(unittest.TestCase):
         self.assertEqual(0, self.venue.successful_effect_count(i.intent_id, principal_id=PRINCIPAL))
 
     def test_fresh_retry_risk_state_cannot_be_reused_by_different_intent(self):
-        i1, req1, _ = self.issue(
+        i1, req1, permit1 = self.issue(
             i=intent(intent_id="permit_risk_owner_000000001"), rs=risk(state_version=20)
         )
+        # A retry permit is only minted once the previous one is dead (I-30).
+        self.assertTrue(self.verifier.consume(permit1, req1, now=NOW)[0])
         fresh = risk(state_version=21)
         aa1, ra1 = attest_pair(self.trust, i1, AUTH, fresh, NOW)
         self.authority.issue(
@@ -154,6 +155,36 @@ class PermitBoundaryTests(unittest.TestCase):
                 authority_attestation=aa2, risk_attestation=ra2, now=NOW,
             )
         self.assertIn("PERMIT_RISK_STATE_VERSION_ALREADY_CLAIMED", ctx.exception.reasons)
+
+    def test_one_live_permit_per_intent_is_enforced_by_the_store(self):
+        # Structural form of I-30: while a permit for an intent can still be
+        # consumed, the authority refuses to mint another one for it, whatever the
+        # caller believes about the previous attempt.
+        i, req, first = self.issue(i=intent(intent_id="permit_live_0000000000001"), rs=risk(state_version=30))
+        fresh = risk(state_version=31)
+        aa, ra = attest_pair(self.trust, i, AUTH, fresh, NOW)
+        with self.assertRaises(PermitIssuanceError) as ctx:
+            self.authority.issue(req, intent=i, authority=AUTH, grant=self.grant, risk=fresh, authority_attestation=aa, risk_attestation=ra, now=NOW)
+        self.assertEqual(("PERMIT_PREVIOUS_ATTEMPT_LIVE",), ctx.exception.reasons)
+        self.assertEqual((1, 0), self.store.permit_counts(i.intent_id))
+        self.assertEqual(first.permit.expires_at.isoformat(), self.store.get(i.intent_id).ambiguity_until)
+        # Once the first permit has expired (plus the grant's clock-skew allowance)
+        # a retry permit is minted, and it supersedes the earlier one at the venue
+        # even for a venue whose clock still considers the old permit live.
+        later = first.permit.expires_at + timedelta(seconds=self.grant.limits.max_clock_skew_seconds + 1)
+        fresh = risk(state_version=32, observed_at=later)
+        aa, ra = attest_pair(self.trust, i, AUTH, fresh, later)
+        second = self.authority.issue(req, intent=i, authority=AUTH, grant=self.grant, risk=fresh, authority_attestation=aa, risk_attestation=ra, now=later)
+        self.assertNotEqual(first.permit.permit_id, second.permit.permit_id)
+        ok, reasons = self.verifier.consume(first, req, now=NOW)
+        self.assertFalse(ok)
+        self.assertEqual(("PERMIT_SUPERSEDED",), reasons)
+        self.assertTrue(self.verifier.consume(second, req, now=later)[0])
+
+    def test_permit_authority_rejects_symmetric_signer(self):
+        symmetric = HMACPermitSignature("unsafe-hmac", b"symmetric-key-material-32-bytes!!!")
+        with self.assertRaisesRegex(ValueError, "asymmetric"):
+            ConstrainedPermitAuthority(self.store, verification_trust(self.trust), symmetric)
 
     def test_execution_gateway_rejects_symmetric_signing_material(self):
         symmetric = HMACPermitSignature("unsafe-hmac", b"symmetric-key-material-32-bytes!!!")

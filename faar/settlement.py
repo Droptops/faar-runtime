@@ -139,45 +139,40 @@ class QuorumSettlementVerifier:
                 continue
             fact = self._fact(record)
             counts[fact] = counts.get(fact, 0) + 1
+        facts = [self._fact(r) for r in records]
+        if binding_mismatches or len(counts) > 1:
+            # Two distinct authoritative facts (a 2-2 split is the canonical case), or
+            # an authoritative record bound to another request, is a contested
+            # settlement: fail closed whether or not any fact reached quorum.
+            return SettlementRecord(
+                SettlementStatus.CONTRADICTORY,
+                evidence={
+                    "quorum": "request-binding-mismatch" if binding_mismatches and len(counts) <= 1 else "contested",
+                    "required": self.quorum,
+                    "facts": facts,
+                    "binding_mismatches": binding_mismatches,
+                    "errors": errors,
+                },
+                authoritative=True,
+                verified_request_hash=expected_hash,
+            )
         if not counts:
-            if binding_mismatches:
-                return SettlementRecord(
-                    SettlementStatus.CONTRADICTORY,
-                    evidence={"quorum": "request-binding-mismatch", "mismatches": binding_mismatches, "errors": errors},
-                    authoritative=True,
-                    verified_request_hash=expected_hash,
-                )
             return SettlementRecord(
                 SettlementStatus.UNKNOWN, evidence={"quorum": "no-authoritative-facts", "errors": errors}, authoritative=False,
             )
-        # Reaching quorum is necessary but not sufficient. If two DISTINCT
-        # authoritative facts each reach quorum (e.g. a 2-2 split with quorum=2),
-        # settlement is genuinely contested and must fail closed, not be resolved
-        # by whichever fact `max` happens to visit first.
-        quorum_facts = [fact for fact, count in counts.items() if count >= self.quorum]
-        if len(quorum_facts) > 1:
-            return SettlementRecord(
-                SettlementStatus.CONTRADICTORY,
-                evidence={
-                    "quorum": "multiple-facts-reached-quorum",
-                    "required": self.quorum,
-                    "facts": [self._fact(r) for r in records],
-                    "binding_mismatches": binding_mismatches,
-                },
-                authoritative=True,
-                verified_request_hash=expected_hash,
-            )
-        fact, count = max(counts.items(), key=lambda kv: kv[1])
+        ((fact, count),) = counts.items()
         if count < self.quorum:
+            # One uncontested fact short of quorum (the other sources were unreachable
+            # or non-authoritative) is insufficient evidence, not a contradiction. A
+            # weak UNKNOWN keeps the intent retriable; CONTRADICTORY would terminally
+            # STOP an intent whose effect exists on a single transient source error.
             return SettlementRecord(
-                SettlementStatus.CONTRADICTORY,
+                SettlementStatus.UNKNOWN,
                 evidence={
-                    "quorum": count, "required": self.quorum,
-                    "facts": [self._fact(r) for r in records],
-                    "binding_mismatches": binding_mismatches,
+                    "quorum": "quorum-not-reached", "votes": count, "required": self.quorum,
+                    "fact": list(fact), "facts": facts, "errors": errors,
                 },
-                authoritative=True,
-                verified_request_hash=expected_hash,
+                authoritative=False,
             )
         status = SettlementStatus(fact[0])
         amount = Decimal(fact[2]) if fact[2] is not None else None

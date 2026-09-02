@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import multiprocessing as mp
-import tempfile
 import unittest
 from dataclasses import replace
 from decimal import Decimal
@@ -9,7 +8,7 @@ from decimal import Decimal
 from faar.canonical import canonical_hash
 from faar.models import IntentState
 from faar.store import IntentBusy, SQLiteIntentStore
-from support import NOW, grant, intent, risk
+from support import NOW, grant, intent, risk, temp_file
 
 
 def _reserve_worker(path, grant_id, intent_id, risk_version, daily_cap, barrier, queue):
@@ -108,7 +107,7 @@ def _revoke_worker(path, entered, go, queue):
 
 class MultiProcessStoreTests(unittest.TestCase):
     def test_distinct_processes_cannot_oversubscribe_daily_budget(self):
-        f = tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False); f.close()
+        f = temp_file(self)
         parent = SQLiteIntentStore(f.name)
         tight = grant(
             grant_id="grant:mp-budget",
@@ -133,7 +132,7 @@ class MultiProcessStoreTests(unittest.TestCase):
         self.assertIn("ATOMIC_DAILY_TURNOVER_EXCEEDED", denied[0])
 
     def test_distinct_processes_cannot_both_begin_same_submission(self):
-        f = tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False); f.close()
+        f = temp_file(self)
         parent = SQLiteIntentStore(f.name)
         i = intent(intent_id="mp_submit_0000000000001")
         parent.register(i, canonical_hash(i))
@@ -157,7 +156,7 @@ class MultiProcessStoreTests(unittest.TestCase):
         finally:
             store.close()
     def test_durable_intent_lease_blocks_second_process(self):
-        f = tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False); f.close()
+        f = temp_file(self)
         parent = SQLiteIntentStore(f.name)
         i = intent(intent_id="mp_lease_00000000000001")
         parent.register(i, canonical_hash(i))
@@ -188,7 +187,7 @@ class MultiProcessStoreTests(unittest.TestCase):
         # Release gate 6 / I-17 across processes: the in-process fence cannot stop
         # a revoke issued elsewhere, so the durable epoch checked at permit
         # consumption must refuse the in-flight attempt.
-        f = tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False); f.close()
+        f = temp_file(self)
         parent = SQLiteIntentStore(f.name)
         parent.provision_grant(grant(), canonical_hash(grant()))
         parent.close()

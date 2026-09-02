@@ -17,6 +17,12 @@ ED25519_SIGNATURE_CHARS = 86  # unpadded base64url of 64 bytes
 _B64URL_TO_STD = str.maketrans("-_", "+/")
 
 
+# Upper bound on a single attestation's `expires_at - issued_at` accepted by the
+# Ed25519 verifiers. Signers normally mint 20-30 s artifacts; the bound exists so
+# that `KeyValidity.not_after` (judged on issued_at) caps a retired key's exposure.
+DEFAULT_MAX_ATTESTATION_LIFETIME_SECONDS = 86_400
+
+
 def has_signing_api(obj: object) -> bool:
     """True if `obj` exposes a callable `sign` minting path.
 
@@ -248,6 +254,7 @@ def _verify_ed25519_attestation(
     now: datetime,
     max_clock_skew_seconds: int,
     key_validity: Mapping[str, KeyValidity] | None = None,
+    max_lifetime_seconds: int | None = None,
 ) -> tuple[bool, tuple[str, ...]]:
     reasons: list[str] = []
     if attestation.algorithm != AttestationAlgorithm.ED25519:
@@ -275,6 +282,11 @@ def _verify_ed25519_attestation(
         reasons.append("ATTESTATION_FROM_FUTURE")
     if now > attestation.expires_at:
         reasons.append("ATTESTATION_EXPIRED")
+    # Bound the artifact's own lifetime. `KeyValidity.not_after` is judged on the
+    # signer-controlled `issued_at`; without this bound a back-dated, long-lived
+    # artifact from a retired (not revoked) key would verify indefinitely.
+    if max_lifetime_seconds is not None and attestation.expires_at - attestation.issued_at > timedelta(seconds=max_lifetime_seconds):
+        reasons.append("ATTESTATION_TTL_EXCEEDED")
     try:
         payload = _payload(
             algorithm=attestation.algorithm, kind=attestation.kind, key_id=attestation.key_id,
@@ -312,6 +324,7 @@ class Ed25519TrustStore:
         key_kinds: Mapping[str, Iterable[AttestationKind]],
         max_clock_skew_seconds: int = 5,
         key_validity: Mapping[str, KeyValidity] | None = None,
+        max_attestation_lifetime_seconds: int = DEFAULT_MAX_ATTESTATION_LIFETIME_SECONDS,
     ) -> None:
         if not keys:
             raise ValueError("at least one attestation key is required")
@@ -324,7 +337,10 @@ class Ed25519TrustStore:
         self.can_sign = capabilities.pop()
         if max_clock_skew_seconds < 0:
             raise ValueError("max_clock_skew_seconds must be non-negative")
+        if max_attestation_lifetime_seconds <= 0:
+            raise ValueError("max_attestation_lifetime_seconds must be positive")
         self.max_clock_skew_seconds = max_clock_skew_seconds
+        self.max_attestation_lifetime_seconds = max_attestation_lifetime_seconds
 
     @classmethod
     def generate(
@@ -333,6 +349,7 @@ class Ed25519TrustStore:
         *,
         max_clock_skew_seconds: int = 5,
         key_validity: Mapping[str, KeyValidity] | None = None,
+        max_attestation_lifetime_seconds: int = DEFAULT_MAX_ATTESTATION_LIFETIME_SECONDS,
     ) -> "Ed25519TrustStore":
         from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
         return cls(
@@ -340,9 +357,15 @@ class Ed25519TrustStore:
             key_kinds=key_kinds,
             max_clock_skew_seconds=max_clock_skew_seconds,
             key_validity=key_validity,
+            max_attestation_lifetime_seconds=max_attestation_lifetime_seconds,
         )
 
-    def public_verifier(self, *, key_validity: Mapping[str, KeyValidity] | None = None) -> "Ed25519AttestationVerifier":
+    def public_verifier(
+        self,
+        *,
+        key_validity: Mapping[str, KeyValidity] | None = None,
+        max_attestation_lifetime_seconds: int | None = None,
+    ) -> "Ed25519AttestationVerifier":
         """Verify-only projection. `key_validity` overrides the store's lifecycle map,
         so a verifier can revoke or window a key without touching signing material."""
         public = {}
@@ -354,6 +377,10 @@ class Ed25519TrustStore:
             public, key_kinds=self._key_kinds,
             max_clock_skew_seconds=self.max_clock_skew_seconds,
             key_validity=self._key_validity if key_validity is None else key_validity,
+            max_attestation_lifetime_seconds=(
+                self.max_attestation_lifetime_seconds
+                if max_attestation_lifetime_seconds is None else max_attestation_lifetime_seconds
+            ),
         )
 
     def _kind_allowed(self, key_id: str, kind: AttestationKind) -> bool:
@@ -408,6 +435,7 @@ class Ed25519TrustStore:
             kind=kind, subject=subject, intent=intent, now=now,
             max_clock_skew_seconds=self.max_clock_skew_seconds,
             key_validity=self._key_validity,
+            max_lifetime_seconds=self.max_attestation_lifetime_seconds,
         )
 
 
@@ -428,6 +456,7 @@ class Ed25519AttestationVerifier:
         key_kinds: Mapping[str, Iterable[AttestationKind]],
         max_clock_skew_seconds: int = 5,
         key_validity: Mapping[str, KeyValidity] | None = None,
+        max_attestation_lifetime_seconds: int = DEFAULT_MAX_ATTESTATION_LIFETIME_SECONDS,
     ) -> None:
         if not keys:
             raise ValueError("at least one attestation key is required")
@@ -438,13 +467,17 @@ class Ed25519AttestationVerifier:
         self._key_validity = _normalize_validity(set(self._keys), key_validity)
         if max_clock_skew_seconds < 0:
             raise ValueError("max_clock_skew_seconds must be non-negative")
+        if max_attestation_lifetime_seconds <= 0:
+            raise ValueError("max_attestation_lifetime_seconds must be positive")
         self.max_clock_skew_seconds = max_clock_skew_seconds
+        self.max_attestation_lifetime_seconds = max_attestation_lifetime_seconds
 
     def with_key_validity(self, key_validity: Mapping[str, KeyValidity]) -> "Ed25519AttestationVerifier":
         """A copy with an updated lifecycle map (e.g. after revoking a key)."""
         return Ed25519AttestationVerifier(
             self._keys, key_kinds=self._key_kinds,
             max_clock_skew_seconds=self.max_clock_skew_seconds, key_validity=key_validity,
+            max_attestation_lifetime_seconds=self.max_attestation_lifetime_seconds,
         )
 
     def verify(
@@ -461,4 +494,5 @@ class Ed25519AttestationVerifier:
             kind=kind, subject=subject, intent=intent, now=now,
             max_clock_skew_seconds=self.max_clock_skew_seconds,
             key_validity=self._key_validity,
+            max_lifetime_seconds=self.max_attestation_lifetime_seconds,
         )

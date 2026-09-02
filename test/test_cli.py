@@ -4,15 +4,16 @@ from __future__ import annotations
 import io
 import json
 import os
-import tempfile
+import sqlite3
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from unittest import mock
 
 from faar import cli
 from faar.canonical import canonical_hash
 from faar.store import SQLiteIntentStore
-from support import PRINCIPAL, grant, intent
+from support import PRINCIPAL, grant, intent, temp_path
 
 ROOT = Path(__file__).resolve().parents[1]
 EX = ROOT / "examples"
@@ -20,9 +21,8 @@ EX = ROOT / "examples"
 
 class OperatorCliTests(unittest.TestCase):
     def setUp(self):
-        self.db = tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False).name
-        self.anchor = tempfile.NamedTemporaryFile(suffix=".anchor.json", delete=False).name
-        os.unlink(self.anchor)
+        self.db = temp_path(self)
+        self.anchor = temp_path(self, ".anchor.json")
 
     def run_cli(self, *argv, expect_exit=None):
         out = io.StringIO()
@@ -54,8 +54,9 @@ class OperatorCliTests(unittest.TestCase):
         self.assertEqual([], self.run_cli("list-leases", "--db", self.db))
 
         keyed = self.run_cli("verify-evidence", "--intent-id", "intent_demo_000000000001", "--db", self.db, "--demo-evidence-key", expect_exit=0)
-        self.assertEqual({"evidence_chain_valid": True, "keyed": True}, {k: keyed[k] for k in ("evidence_chain_valid", "keyed")})
-        self.run_cli("verify-evidence", "--intent-id", "intent_that_never_existed", "--db", self.db, expect_exit=2)
+        self.assertEqual({"evidence_chain_valid": True, "keyed": True, "status": "ok"}, {k: keyed[k] for k in ("evidence_chain_valid", "keyed", "status")})
+        missing = self.run_cli("verify-evidence", "--intent-id", "intent_that_never_existed", "--db", self.db, expect_exit=2)
+        self.assertEqual("unknown_intent", missing["status"])
 
         halted = self.run_cli("halt", "--scope", "global", "--reason", "drill", "--db", self.db, "--anchor", self.anchor)
         self.assertEqual(1, halted["grant_versions_fenced"])
@@ -83,19 +84,52 @@ class OperatorCliTests(unittest.TestCase):
         self.assertEqual("REVOKED", self.run_cli("list-grants", "--db", self.db, "--anchor", self.anchor)[0]["effective_status"])
 
     def test_evidence_key_comes_from_the_environment(self):
-        os.environ["FAAR_TEST_EVIDENCE_KEY"] = "test-evidence-key-32-bytes-long!!!!"
-        try:
-            store = SQLiteIntentStore(self.db, evidence_key=b"test-evidence-key-32-bytes-long!!!!")
-            i = intent(intent_id="intent_cli_key_00000000001")
-            store.register(i, canonical_hash(i))
-            store.close()
+        store = SQLiteIntentStore(self.db, evidence_key=b"test-evidence-key-32-bytes-long!!!!")
+        i = intent(intent_id="intent_cli_key_00000000001")
+        store.register(i, canonical_hash(i))
+        store.close()
+        with mock.patch.dict(os.environ, {"FAAR_TEST_EVIDENCE_KEY": "test-evidence-key-32-bytes-long!!!!"}):
             ok = self.run_cli("verify-evidence", "--intent-id", i.intent_id, "--db", self.db, "--evidence-key-env", "FAAR_TEST_EVIDENCE_KEY", expect_exit=0)
             self.assertTrue(ok["keyed"])
-            # The wrong key must not verify.
-            os.environ["FAAR_TEST_EVIDENCE_KEY"] = "another-key-that-is-also-32-bytes!!"
-            self.run_cli("verify-evidence", "--intent-id", i.intent_id, "--db", self.db, "--evidence-key-env", "FAAR_TEST_EVIDENCE_KEY", expect_exit=2)
-        finally:
-            os.environ.pop("FAAR_TEST_EVIDENCE_KEY", None)
+        # The wrong key must not verify.
+        with mock.patch.dict(os.environ, {"FAAR_TEST_EVIDENCE_KEY": "another-key-that-is-also-32-bytes!!"}):
+            wrong = self.run_cli("verify-evidence", "--intent-id", i.intent_id, "--db", self.db, "--evidence-key-env", "FAAR_TEST_EVIDENCE_KEY", expect_exit=2)
+        self.assertEqual("chain_invalid", wrong["status"])
+
+    def test_unanchored_command_on_an_anchored_database_exits_with_a_typed_error(self):
+        self.run_cli("provision-grant", "--grant", str(EX / "grant.json"), "--db", self.db, "--anchor", self.anchor)
+        refused = self.run_cli("halt", "--scope", "global", "--reason", "forgot the anchor", "--db", self.db, expect_exit=2)
+        self.assertEqual("AuthorityAnchorRequired", refused["error"])
+        self.assertEqual([], self.run_cli("controls", "--db", self.db))
+        self.assertEqual("ANCHOR_REQUIRED", self.run_cli("list-grants", "--db", self.db)[0]["effective_status"])
+        halted = self.run_cli("halt", "--scope", "global", "--reason", "drill", "--db", self.db, "--anchor", self.anchor)
+        self.assertEqual(1, halted["grant_versions_fenced"])
+
+    def test_rebuild_evidence_heads_for_a_legacy_database(self):
+        key = "test-evidence-key-32-bytes-long!!!!"
+        store = SQLiteIntentStore(self.db, evidence_key=key.encode())
+        legacy = intent(intent_id="intent_cli_legacy_000000001")
+        empty = intent(intent_id="intent_cli_empty_0000000001")
+        for i in (legacy, empty):
+            store.register(i, canonical_hash(i))
+        store.close()
+        conn = sqlite3.connect(self.db)
+        conn.execute("DELETE FROM evidence_head")
+        conn.execute("DELETE FROM evidence WHERE intent_id=?", (empty.intent_id,))
+        conn.commit()
+        conn.close()
+        with mock.patch.dict(os.environ, {"FAAR_TEST_EVIDENCE_KEY": key}):
+            before = self.run_cli("verify-evidence", "--intent-id", legacy.intent_id, "--db", self.db, "--evidence-key-env", "FAAR_TEST_EVIDENCE_KEY", expect_exit=2)
+            self.assertEqual("head_missing", before["status"])
+            outcomes = self.run_cli("rebuild-evidence-head", "--all", "--db", self.db, "--evidence-key-env", "FAAR_TEST_EVIDENCE_KEY")["outcomes"]
+            self.assertEqual({legacy.intent_id: "committed", empty.intent_id: "skipped_empty"}, outcomes)
+            adopted = self.run_cli("rebuild-evidence-head", "--all", "--adopt-empty", "--db", self.db, "--evidence-key-env", "FAAR_TEST_EVIDENCE_KEY")["outcomes"]
+            self.assertEqual({empty.intent_id: "adopted_empty"}, adopted)
+            for i in (legacy, empty):
+                after = self.run_cli("verify-evidence", "--intent-id", i.intent_id, "--db", self.db, "--evidence-key-env", "FAAR_TEST_EVIDENCE_KEY", expect_exit=0)
+                self.assertEqual("ok", after["status"])
+            with self.assertRaises(SystemExit):
+                self.run_cli("rebuild-evidence-head", "--db", self.db, "--evidence-key-env", "FAAR_TEST_EVIDENCE_KEY")
 
 
 if __name__ == "__main__":

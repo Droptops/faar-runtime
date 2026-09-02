@@ -1,7 +1,6 @@
 """Key rotation and revocation for attestation and permit signers (release gate 1)."""
 from __future__ import annotations
 
-import tempfile
 import unittest
 from datetime import timedelta
 
@@ -10,7 +9,7 @@ from faar.canonical import canonical_hash
 from faar.models import AttestationKind, ExecutionRequest, KeyValidity
 from faar.permits import ConstrainedPermitAuthority, Ed25519PermitSigner, ExecutionPermitVerifier
 from faar.store import SQLiteIntentStore
-from support import AUTH, NOW, TRUST_KEY_KINDS, attest_pair, grant, intent, risk, trust
+from support import AUTH, NOW, TRUST_KEY_KINDS, attest_pair, grant, intent, risk, temp_path, trust
 
 
 class AttestationKeyLifecycleTests(unittest.TestCase):
@@ -44,6 +43,29 @@ class AttestationKeyLifecycleTests(unittest.TestCase):
         overlap = {"authority-test": KeyValidity(not_before=NOW - timedelta(minutes=1), not_after=NOW + timedelta(seconds=1))}
         self.assertTrue(self.verify_with(overlap, aa, now=NOW + timedelta(seconds=10))[0])
 
+    def test_artifact_lifetime_bound_caps_a_retired_keys_exposure(self):
+        # `not_after` is judged on the signer-controlled issued_at. A holder of a
+        # retired (not revoked) key could back-date issuance and choose a ten-year
+        # TTL; the verifier's lifetime bound is what makes that artifact fail.
+        retired_at = NOW - timedelta(days=30)
+        validity = {"authority-test": KeyValidity(not_after=retired_at)}
+        backdated = self.trust.sign(
+            "authority-test", AttestationKind.AUTHORITY, AUTH, self.intent,
+            issued_at=retired_at - timedelta(seconds=1), ttl_seconds=10 * 365 * 86_400,
+        )
+        ok, reasons = self.verify_with(validity, backdated)
+        self.assertFalse(ok)
+        self.assertIn("ATTESTATION_TTL_EXCEEDED", reasons)
+        self.assertNotIn("ATTESTATION_KEY_EXPIRED", reasons)
+        # Without the bound the same artifact would verify: the bound is the control.
+        unbounded = self.trust.public_verifier(key_validity=validity, max_attestation_lifetime_seconds=20 * 365 * 86_400)
+        self.assertTrue(unbounded.verify(backdated, kind=AttestationKind.AUTHORITY, subject=AUTH, intent=self.intent, now=NOW)[0])
+        # Ordinary short-lived artifacts are unaffected.
+        aa, _ = attest_pair(self.trust, self.intent, AUTH, risk(), NOW)
+        self.assertTrue(self.verify_with({}, aa)[0])
+        with self.assertRaises(ValueError):
+            self.trust.public_verifier(max_attestation_lifetime_seconds=0)
+
     def test_validity_map_must_reference_known_keys_and_be_well_formed(self):
         with self.assertRaises(ValueError):
             self.trust.public_verifier(key_validity={"ghost": KeyValidity(revoked=True)})
@@ -63,9 +85,7 @@ class AttestationKeyLifecycleTests(unittest.TestCase):
 
 class PermitSignerRotationTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False)
-        self.tmp.close()
-        self.store = SQLiteIntentStore(self.tmp.name)
+        self.store = SQLiteIntentStore(temp_path(self))
         self.store.provision_grant(grant(), canonical_hash(grant()))
         self.trust = trust()
         self.old = Ed25519PermitSigner("permit-2026-q3")
@@ -106,6 +126,17 @@ class PermitSignerRotationTests(unittest.TestCase):
             ExecutionPermitVerifier({"someone-else": self.new.public_verifier()}, self.store)
         with self.assertRaises(ValueError):
             ExecutionPermitVerifier(self.new.public_verifier(), self.store, key_validity={"ghost": KeyValidity(revoked=True)})
+
+    def test_gateway_bounds_permit_lifetime(self):
+        gateway = ExecutionPermitVerifier(self.new.public_verifier(), self.store, max_permit_lifetime_seconds=1)
+        req, permit = self.issue(self.new, "intent_rotate_00000000005", 5)
+        self.assertGreater(permit.permit.expires_at - permit.permit.issued_at, timedelta(seconds=1))
+        ok, reasons = gateway.verify(permit, req, now=NOW)
+        self.assertFalse(ok)
+        self.assertEqual(("PERMIT_TTL_EXCEEDED",), reasons)
+        self.assertTrue(ExecutionPermitVerifier(self.new.public_verifier(), self.store).verify(permit, req, now=NOW)[0])
+        with self.assertRaises(ValueError):
+            ExecutionPermitVerifier(self.new.public_verifier(), self.store, max_permit_lifetime_seconds=0)
 
     def test_signer_window_applies_to_permit_issuance_time(self):
         gateway = ExecutionPermitVerifier(

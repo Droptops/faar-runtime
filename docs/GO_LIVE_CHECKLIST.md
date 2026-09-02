@@ -22,18 +22,18 @@ DEPLOYMENT and OPEN row is closed and the result has been independently reviewed
 | 2.1 | serializable semantics across processes | DONE-IN-REPO (SQLite) / DEPLOYMENT (production DB) | `test_multiprocess`, `test_store_hardening.SchemaMigrationTests` |
 | 2.2 | distributed grant revocation / submission fence | DONE-IN-REPO (epoch at permit consumption) | `test_multiprocess.test_revocation_in_other_process_during_submission_prevents_effect`, `test_mutation_gaps.EpochFenceTests` |
 | 2.3 | unique intent / effect / risk-state constraints | DONE-IN-REPO | `test_store_hardening.EffectIdentityScopeTests`, `test_mutation_gaps.RiskStateMonotonicityTests` |
-| 2.4 | backup/restore does not resurrect consumed authority | DONE-IN-REPO (with anchor) / DEPLOYMENT (anchor placement) | `faar/anchor.py`; `test_controls.AuthorityAnchorTests`; `OPERATIONS.md` §5 |
+| 2.4 | backup/restore does not resurrect consumed authority | DONE-IN-REPO (with anchor; issuance and consumption both anchored; unanchored instances refused) / DEPLOYMENT (anchor placement) | `faar/anchor.py`; `test_controls.AuthorityAnchorTests`; `OPERATIONS.md` §5 |
 | 3.1 | monotonic risk-state versions | DONE-IN-REPO | `test_mutation_gaps.RiskStateMonotonicityTests`, `test_permits` |
 | 3.2 | authoritative portfolio / market semantics | DEPLOYMENT | `RISK_ENGINE_CONTRACT.md` (external risk signer) |
 | 3.3 | no aggregate oversubscription under concurrency | DONE-IN-REPO | `test_runtime`, `test_multiprocess`, `evals/run_state_fuzz.py`, `test_store_hardening.TurnoverWindowTests` |
 | 4.1 | bounded adapter deadlines | DONE-IN-REPO | `adapter_deadline_seconds`; `test_runtime_hardening` deadline tests |
-| 4.2 | stable external intent identity | DONE-IN-REPO (contract) / DEPLOYMENT (per venue) | `ADAPTER_CONTRACT.md` §1 |
+| 4.2 | stable external intent identity | DEPLOYMENT (per venue; the contract is documented, no in-repo test can prove it for a real venue) | `ADAPTER_CONTRACT.md` A2; `test_runtime.test_adapter_without_exactly_once_contract_is_rejected` checks the declared profile only |
 | 4.3 | authoritative reconciliation by identity | DONE-IN-REPO (contract) / DEPLOYMENT | `test_runtime` settlement tests, `test_settlement` |
-| 4.4 | partial-fill / cancel semantics | OPEN (documented, unmodelled) | `ADAPTER_CONTRACT.md` §7; `test_mutation_gaps.SettlementPathTests.test_partial_fill_below_authorized_finalizes_and_commits_authorized_amount` pins current behaviour |
+| 4.4 | partial-fill / cancel semantics | OPEN (documented, unmodelled) | `ADAPTER_CONTRACT.md` Part C; `test_mutation_gaps.SettlementPathTests.test_partial_fill_below_authorized_finalizes_and_commits_authorized_amount` pins current behaviour |
 | 4.5 | effect ID definition | DONE-IN-REPO (contract, per venue) | `INVARIANTS.md` I-10/I-11 |
 | 4.6 | authoritative positive and negative reconciliation | DONE-IN-REPO | `test_runtime_hardening` weak-observation tests |
 | 4.7 | independent settled amount / asset / target verification | DONE-IN-REPO (amount) / DEPLOYMENT (venue evidence) | I-24 tests, `test_mutation_gaps.PayPrimitiveTests` |
-| 4.8 | retry behaviour and maximum ambiguity window | DONE-IN-REPO | permit-bounded ambiguity window; `test_runtime_hardening`, model check |
+| 4.8 | retry behaviour and maximum ambiguity window | DONE-IN-REPO | permit-bounded ambiguity window recorded at permit issuance for every adapter outcome; one live permit per intent; `test_runtime_hardening`, `test_permits`, model check |
 | 4.9 | finality definition | DEPLOYMENT (per venue) | `ADAPTER_CONTRACT.md` |
 | 5.1 | model cannot access signing secrets | DONE-IN-REPO (structure) / DEPLOYMENT (process isolation) | `UNPLUG_TEST.md` |
 | 5.2 | credential scope narrower than root authority | DEPLOYMENT | venue configuration |
@@ -44,7 +44,7 @@ DEPLOYMENT and OPEN row is closed and the result has been independently reviewed
 | 6.2 | process / network partition | DONE-IN-REPO (deadline + window) / DEPLOYMENT | `test_runtime_hardening` |
 | 6.3 | duplicate workers | DONE-IN-REPO | `test_runtime.test_concurrent_workers_create_at_most_one_effect`, `test_multiprocess` |
 | 6.4 | datastore failover | OPEN (not testable against SQLite) | `V0_4_RELEASE.md` not-tested list |
-| 6.5 | stale / malicious RPC or provider | DONE-IN-REPO (fail closed) | non-authoritative settlement tests, quorum tests |
+| 6.5 | stale / malicious RPC or provider | DONE-IN-REPO (fail closed; a transient single-source error is retriable, a contest stops) | non-authoritative settlement tests, quorum tests |
 | 6.6 | revocation during submission | DONE-IN-REPO | fence and cross-process tests |
 | 6.7 | partial fill + cancellation race | OPEN | see 4.4 |
 | 6.8 | venue returns changing identifiers / states | DONE-IN-REPO | effect continuity tests |
@@ -69,12 +69,12 @@ DEPLOYMENT and OPEN row is closed and the result has been independently reviewed
 | R-06 credential authority | DEPLOYMENT | |
 | R-07 evidence host / key compromise | DEPLOYMENT | append refusal + head commitment in repo; remote anchoring operational |
 | R-08 venue semantics | DEPLOYMENT | |
-| R-09 hung adapter delays revocation | DONE-IN-REPO | deadline + kill switch |
+| R-09 hung adapter delays revocation; orphaned adapter threads | DONE-IN-REPO | deadline + kill switch; a cancelled Python call cannot be killed, the venue refuses its expired or superseded permit |
 | R-10 intent namespace squatting | DEPLOYMENT | ingress authentication |
 | R-11 trusted clock | DEPLOYMENT | |
 | R-12 mock verifier shares ground truth with mock venue | DEPLOYMENT | independent read path or quorum per venue |
 | R-13 anchor placement | DEPLOYMENT | anchor restored with the DB detects nothing |
-| R-14 orphaned adapter threads | DONE-IN-REPO (bounded by permit window) | a cancelled Python call cannot be killed; the venue refuses its expired permit |
+| R-14 partial fills and cancellation | OPEN | see gates 4.4 and 6.7; `ADAPTER_CONTRACT.md` Part C |
 
 ## Before the first funded deployment
 
