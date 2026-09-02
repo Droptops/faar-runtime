@@ -166,6 +166,22 @@ Before release, five independent reviewers (fail-closed regressions, new-code co
 | RT-126 | The slippage control was opt-in: a grant allowing SWAP/BUY/SELL/PLACE_ORDER without `max_slippage_bps` admitted swaps with no bound at all (a missing financial limit read as infinity) | Medium | Trade grants require `max_slippage_bps` at construction and in the schema |
 | RT-127 | Every store open ran four write transactions, so during a write-lock incident every operator command, including read-only diagnostics, blocked 30 s and died with a raw driver traceback | Low | An up-to-date database opens read-only (schema revision stamp, index probe, settings probe); a busy datastore is `StoreUnavailable` (JSON, exit 2) for the CLI |
 
+## Findings closed in the Hyperliquid testnet candidate
+
+These findings cover only the narrow, fixed-origin testnet adapter in
+`faar/hyperliquid.py`. They do not close a deployment row or constitute a live
+venue review; see [`HYPERLIQUID_TESTNET_ADAPTER_REVIEW.md`](HYPERLIQUID_TESTNET_ADAPTER_REVIEW.md).
+
+| ID | Finding | Severity in candidate | Response |
+|---|---|---:|---|
+| RT-128 | A nominally testnet adapter could accept a mainnet transport or follow an HTTP redirect carrying a signed order to another origin | High | Adapter and verifier require the exact testnet origin; the default HTTP stack refuses redirects; no execution-origin parameter exists |
+| RT-129 | Venue translation could silently broaden a request through market/GTC orders, SELL valuation, unpinned assets, relative slippage without a trusted reference, price/size rounding, or venue-minimum upsizing | High | Only operator-pinned USDC spot BUY, absolute limit and IOC are admitted; price precision is validated, size rounds down, and a below-minimum result is refused before permit consumption |
+| RT-130 | A replay or hidden HTTP retry could submit a second venue action after the permit was consumed or the first response was lost | High | Durable single-use permit consumption precedes one POST; no application retry; nonce and `expiresAfter` are signed; lost responses reconcile by `cloid` |
+| RT-131 | A `cloid` lookup could be rebound to another market, side, price, size, order type, or fill leg and finalize the wrong economic effect | High | Verifier reconstructs and compares every order term, selects fills by `oid`, checks trade ids/coin/side/price, and binds the result to the canonical request hash |
+| RT-132 | `unknownOid`, an API outage, or truncated/incomplete recent fill history could be treated as proof that no effect occurred | High | Each is non-authoritative `UNKNOWN`; a single public API miss never produces authoritative `NONE` |
+| RT-133 | An IOC could be reported as resting, or a rejected order could carry a fill, without tripping the venue contract | High | `open`/`triggered` IOC and rejection-with-fill records are `CONTRADICTORY`; resting/error submit responses require independent reconciliation |
+| RT-134 | The adapter could hand arbitrary economic material to the signer, let a signer mutate the transported action, or accept malformed signature/nonce/expiry data | High | The transport constructs one exact order action with no builder/transfer fields, signs a private copy and refuses mutation; bounded order objects, nonce/expiry and canonical `r/s/v` are checked before the network call |
+
 Three further reports from the same personas were confirmed already closed on the
 current head by RT-88 (quorum aggregates that exceed the evidence bound), RT-89
 (zero-notional actions under a tightened exposure cap) and RT-93 (an anchor lock
@@ -178,8 +194,9 @@ Documentation corrections from the same pass: halt semantics for in-flight inten
 Current `make check` result for v0.4.0:
 
 ```text
-353 unit/invariant tests -> PASS
-158 targeted red-team attack classes, each mapped to named tests (221 tests) -> PASS, 0 unmapped
+382 unit/invariant tests -> PASS
+165 targeted red-team attack classes, each mapped to named tests (242 tests) -> PASS, 0 unmapped
+29 Hyperliquid testnet contract tests with deterministic fakes -> PASS; no live venue or credential claim
 160 deterministic denial mutations -> 0 unauthorized economic effects, 0 adapter calls
 100 retries of one logical intent -> 1 successful effect, 1 adapter call, 1 permit issued and consumed
 ambiguous timeout-after-effect recovery -> 1 successful effect, 1 adapter call

@@ -376,6 +376,42 @@ ATTACK_CLASSES: dict[str, tuple[str, ...]] = {
         "test_selfreview_redteam.ReadOnlyOpenTests.test_operator_reads_do_not_need_the_write_lock",
         "test_selfreview_redteam.ReadOnlyOpenTests.test_a_busy_datastore_is_a_typed_refusal_for_the_cli",
     ),
+    # --- first external testnet adapter candidate ------------------------------------
+    "testnet adapter redirected or configured to a live venue": (
+        "test_hyperliquid.HyperliquidAdapterContractTests.test_mainnet_or_other_origin_transport_is_refused",
+        "test_hyperliquid.HyperliquidHTTPBoundaryTests.test_default_http_stack_refuses_redirects",
+        "test_hyperliquid.HyperliquidSettlementContractTests.test_verifier_refuses_non_testnet_read_origin",
+    ),
+    "testnet adapter broadening a bounded request during translation": (
+        "test_hyperliquid.HyperliquidAdapterContractTests.test_unsupported_or_unbounded_order_shapes_fail_before_permit_consumption",
+        "test_hyperliquid.HyperliquidAdapterContractTests.test_submission_is_exact_limit_ioc_and_consumes_one_permit",
+        "test_hyperliquid.HyperliquidHTTPBoundaryTests.test_ioc_order_object_cannot_exceed_its_authorization",
+    ),
+    "testnet adapter replay or hidden retry after permit consumption": (
+        "test_hyperliquid.HyperliquidAdapterContractTests.test_consumed_permit_replay_never_reaches_transport_twice",
+        "test_hyperliquid.HyperliquidAdapterContractTests.test_post_consumption_transport_failure_is_ambiguous_and_never_retried",
+        "test_hyperliquid.HyperliquidRuntimeIntegrationTests.test_lost_submit_response_finalizes_only_from_independent_verifier",
+    ),
+    "testnet settlement rebound to a different order leg or price": (
+        "test_hyperliquid.HyperliquidSettlementContractTests.test_every_order_term_is_bound_back_to_the_request",
+        "test_hyperliquid.HyperliquidSettlementContractTests.test_malformed_or_wrong_leg_fill_is_contradictory",
+        "test_hyperliquid.HyperliquidSettlementContractTests.test_price_above_limit_or_fill_above_notional_is_contradictory",
+    ),
+    "testnet verifier trusting a missing or incomplete venue history": (
+        "test_hyperliquid.HyperliquidSettlementContractTests.test_missing_order_is_not_authoritative_absence",
+        "test_hyperliquid.HyperliquidSettlementContractTests.test_incomplete_or_truncated_fill_history_has_no_weight",
+        "test_hyperliquid.HyperliquidSettlementContractTests.test_info_transport_error_remains_non_authoritative_unknown",
+    ),
+    "testnet IOC reported non-terminal or rejected with a fill": (
+        "test_hyperliquid.HyperliquidAdapterContractTests.test_ioc_resting_or_error_response_requires_reconciliation",
+        "test_hyperliquid.HyperliquidSettlementContractTests.test_ioc_open_state_is_a_terminal_contradiction",
+        "test_hyperliquid.HyperliquidSettlementContractTests.test_rejected_order_cannot_carry_a_fill",
+    ),
+    "testnet signer accepting a broadened action or malformed signature": (
+        "test_hyperliquid.HyperliquidHTTPBoundaryTests.test_http_transport_builds_only_the_pinned_testnet_ioc_action",
+        "test_hyperliquid.HyperliquidHTTPBoundaryTests.test_malformed_or_mutating_signer_never_reaches_the_network",
+        "test_hyperliquid.HyperliquidHTTPBoundaryTests.test_invalid_nonce_or_expiry_never_reaches_the_signer",
+    ),
 }
 
 

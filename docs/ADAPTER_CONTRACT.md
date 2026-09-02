@@ -266,3 +266,8 @@ retry budget
 revocation/fencing
 known venue failure modes
 ```
+
+The first external testnet candidate's completed repository-side review is
+[`HYPERLIQUID_TESTNET_ADAPTER_REVIEW.md`](HYPERLIQUID_TESTNET_ADAPTER_REVIEW.md).
+Its unresolved deployment evidence is explicit; the document is not an approval
+for mainnet or live funds.
