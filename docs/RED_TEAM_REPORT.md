@@ -48,6 +48,21 @@ Method: source review, state-machine analysis, concurrency fault reasoning, dete
 | RT-34 | Future-dated signed task contract could be evaluated early | Medium / stale/future control | Task-contract issuance window enforced |
 | RT-35 | PAY effect could settle for a different amount while remaining under general trade cap | High | PAY requires exact settled amount equality |
 
+## Findings fixed in v0.3.1
+
+A second adversarial review pass (source review plus a fan-out of independent per-dimension reviewers, each finding adversarially re-verified) surfaced the following code-level gaps over v0.3.0. Each was reproduced against the real modules before fixing and now has regression coverage.
+
+| ID | Finding | Severity in reference model | v0.3.1 response |
+|---|---|---:|---|
+| RT-36 | `QuorumSettlementVerifier` resolved a genuine source disagreement by iteration order: when two distinct authoritative facts each reached quorum (e.g. a 2-2 split at quorum=2) it returned the first, not a contradiction | High | Multiple facts reaching quorum now return `CONTRADICTORY` (fail closed) |
+| RT-37 | `allowed_assets` allowlist was skipped for a falsy-but-present asset value (integer `0`, `false`) because asset extraction used truthiness, not presence | Low | Asset extraction uses presence (`not in (None, "")`), so falsy values are validated |
+| RT-38 | `denied_targets` / `TARGET_REQUIRED` were skipped for a falsy-but-present target because target resolution used `a or b or c` | Low | Target resolution coalesces on presence (`is None`), not truthiness |
+| RT-39 | Action-velocity reservation used a fixed tumbling bucket (`timestamp // window`), allowing up to 2x the limit to fire across a bucket boundary | Low / Medium | Sliding window over the trailing `action_window_seconds` |
+| RT-40 | The evidence hash chain could not detect tail-truncation or whole-chain deletion (a deleted suffix leaves an internally consistent prefix), despite the store claiming to detect database-only rewriting | Medium | Signed per-intent head commitment (seq + head hash under the evidence MAC) detects truncation/deletion in keyed mode |
+| RT-41 | CI actions pinned to mutable `@v4`/`@v5` tags; `cryptography` pinned to an over-tight `>=46,<47` that blocked installs and security updates | Low | Actions pinned to commit SHAs; dependency range loosened |
+
+Residual, by design: RT-40's head commitment is only meaningful when an evidence key is configured — without a key a database-level attacker can rewrite the head row too, so the chain-only guarantees remain the ceiling (see R-07). RT-36 still accepts a quorum-reaching fact when the dissent is below quorum; that is the intended tolerance of a quorum configuration, not unanimity.
+
 ## Executable regression matrix
 
 The findings table above records the v0.2 hardening work. The matrix below is the current `make check` result for v0.3.0:

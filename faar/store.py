@@ -90,7 +90,8 @@ class SQLiteIntentStore:
     - per-grant execution guards make revocation linearizable inside one runtime
       process: once set_grant_status(..., REVOKED) returns, no later submission may
       begin under that grant version.
-    - optional evidence HMACs detect database-only rewriting of the hash chain.
+    - optional evidence HMACs plus a signed per-intent head commitment detect
+      database-only rewriting and tail-truncation of the hash chain.
 
     A production distributed store must reproduce these semantics; SQLite itself is
     not the claimed production architecture.
@@ -136,6 +137,7 @@ class SQLiteIntentStore:
                 grant_version INTEGER NOT NULL,
                 day_key TEXT NOT NULL,
                 velocity_bucket INTEGER,
+                velocity_ts INTEGER,
                 amount_usd TEXT NOT NULL,
                 status TEXT NOT NULL CHECK(status IN ('HELD','COMMITTED','RELEASED')),
                 created_at TEXT NOT NULL,
@@ -145,6 +147,8 @@ class SQLiteIntentStore:
               ON usage_reservations(grant_id, grant_version, day_key, status);
             CREATE INDEX IF NOT EXISTS ix_usage_grant_bucket
               ON usage_reservations(grant_id, grant_version, velocity_bucket, status);
+            CREATE INDEX IF NOT EXISTS ix_usage_grant_velocity_ts
+              ON usage_reservations(grant_id, grant_version, velocity_ts, status);
             CREATE TABLE IF NOT EXISTS risk_claims (
                 principal_id TEXT NOT NULL,
                 grant_id TEXT NOT NULL,
@@ -200,6 +204,13 @@ class SQLiteIntentStore:
                 event_mac TEXT,
                 FOREIGN KEY(intent_id) REFERENCES intents(intent_id)
             );
+            CREATE TABLE IF NOT EXISTS evidence_head (
+                intent_id TEXT PRIMARY KEY,
+                seq INTEGER NOT NULL,
+                head_hash TEXT NOT NULL,
+                head_mac TEXT,
+                updated_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS execution_permits (
                 permit_id TEXT PRIMARY KEY,
                 intent_id TEXT NOT NULL,
@@ -235,6 +246,8 @@ class SQLiteIntentStore:
             usage_cols = {row["name"] for row in self._conn.execute("PRAGMA table_info(usage_reservations)").fetchall()}
             if "principal_id" not in usage_cols:
                 self._conn.execute("ALTER TABLE usage_reservations ADD COLUMN principal_id TEXT NOT NULL DEFAULT 'legacy:unknown'")
+            if "velocity_ts" not in usage_cols:
+                self._conn.execute("ALTER TABLE usage_reservations ADD COLUMN velocity_ts INTEGER")
             risk_cols = {row["name"] for row in self._conn.execute("PRAGMA table_info(risk_claims)").fetchall()}
             if "principal_id" not in risk_cols:
                 self._conn.execute("ALTER TABLE risk_claims ADD COLUMN principal_id TEXT NOT NULL DEFAULT 'legacy:unknown'")
@@ -628,9 +641,9 @@ class SQLiteIntentStore:
             amount = Decimal("0")
 
         day_key = now.astimezone(timezone.utc).date().isoformat()
-        bucket = None
-        if grant.limits.action_window_seconds:
-            bucket = int(now.timestamp()) // grant.limits.action_window_seconds
+        window = grant.limits.action_window_seconds
+        bucket = int(now.timestamp()) // window if window else None
+        velocity_ts = int(now.timestamp())
 
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
@@ -668,10 +681,13 @@ class SQLiteIntentStore:
                     if current + amount > grant.limits.max_daily_turnover_usd:
                         reasons.append("ATOMIC_DAILY_TURNOVER_EXCEEDED")
 
-                if grant.limits.max_actions_per_window is not None and bucket is not None:
+                if grant.limits.max_actions_per_window is not None and window:
+                    # Sliding window over the trailing `window` seconds. A fixed
+                    # tumbling bucket (timestamp // window) would let up to 2x the
+                    # limit fire across a bucket boundary.
                     count = self._conn.execute(
-                        "SELECT COUNT(*) AS n FROM usage_reservations WHERE grant_id=? AND grant_version=? AND velocity_bucket=? AND status IN ('HELD','COMMITTED')",
-                        (grant.grant_id, grant.version, bucket),
+                        "SELECT COUNT(*) AS n FROM usage_reservations WHERE grant_id=? AND grant_version=? AND velocity_ts > ? AND status IN ('HELD','COMMITTED')",
+                        (grant.grant_id, grant.version, velocity_ts - window),
                     ).fetchone()["n"]
                     if count + 1 > grant.limits.max_actions_per_window:
                         reasons.append("ATOMIC_ACTION_VELOCITY_EXCEEDED")
@@ -686,8 +702,8 @@ class SQLiteIntentStore:
                     (intent.principal_id, grant.grant_id, grant.version, risk.scope, risk.state_version, intent.intent_id, ts),
                 )
                 self._conn.execute(
-                    "INSERT INTO usage_reservations(intent_id,principal_id,grant_id,grant_version,day_key,velocity_bucket,amount_usd,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                    (intent.intent_id, intent.principal_id, grant.grant_id, grant.version, day_key, bucket, format(amount, "f"), "HELD", ts, ts),
+                    "INSERT INTO usage_reservations(intent_id,principal_id,grant_id,grant_version,day_key,velocity_bucket,velocity_ts,amount_usd,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    (intent.intent_id, intent.principal_id, grant.grant_id, grant.version, day_key, bucket, velocity_ts, format(amount, "f"), "HELD", ts, ts),
                 )
                 self._conn.execute("COMMIT")
                 return True, ()
@@ -873,6 +889,23 @@ class SQLiteIntentStore:
                     "INSERT INTO evidence(intent_id,principal_id,event_type,payload_json,created_at,prev_hash,event_hash,event_mac) VALUES(?,?,?,?,?,?,?,?)",
                     (intent_id, principal["principal_id"], event_type, payload_json, created_at, prev_hash, event_hash, event_mac),
                 )
+                # Signed head commitment. A prev_hash chain alone cannot detect
+                # tail truncation (a deleted suffix leaves an internally consistent
+                # prefix). Binding the (seq, head_hash) under the evidence MAC lets a
+                # keyed verifier detect that the most recent events were dropped.
+                seq = self._conn.execute("SELECT COUNT(*) AS n FROM evidence WHERE intent_id=?", (intent_id,)).fetchone()["n"] - 1
+                head_mac = None
+                if self._evidence_key is not None:
+                    head_mac = hmac.new(
+                        self._evidence_key,
+                        f"{intent_id}\x1f{seq}\x1f{event_hash}".encode("utf-8"),
+                        hashlib.sha256,
+                    ).hexdigest()
+                self._conn.execute(
+                    "INSERT INTO evidence_head(intent_id,seq,head_hash,head_mac,updated_at) VALUES(?,?,?,?,?) "
+                    "ON CONFLICT(intent_id) DO UPDATE SET seq=excluded.seq, head_hash=excluded.head_hash, head_mac=excluded.head_mac, updated_at=excluded.updated_at",
+                    (intent_id, seq, event_hash, head_mac, created_at),
+                )
                 self._conn.execute("COMMIT")
                 return event_hash
             except Exception:
@@ -899,6 +932,8 @@ class SQLiteIntentStore:
 
     def verify_evidence_chain(self, intent_id: str) -> bool:
         prev_hash = None
+        count = 0
+        last_hash = None
         for event in self.evidence(intent_id):
             if event["prev_hash"] != prev_hash:
                 return False
@@ -919,4 +954,31 @@ class SQLiteIntentStore:
                 if not hmac.compare_digest(expected_mac, str(event["event_mac"])):
                     return False
             prev_hash = event["event_hash"]
+            last_hash = event["event_hash"]
+            count += 1
+
+        # Verify the signed head commitment to catch tail truncation / whole-chain
+        # deletion. Only enforced when an evidence key is configured; without a key a
+        # DB-level attacker can rewrite the head row too, so the chain-only guarantees
+        # above are the ceiling. A keyed store created before this column existed will
+        # have no head row until its next appended event.
+        if self._evidence_key is not None:
+            with self._lock:
+                head = self._conn.execute(
+                    "SELECT seq,head_hash,head_mac FROM evidence_head WHERE intent_id=?",
+                    (intent_id,),
+                ).fetchone()
+            if count == 0:
+                return head is None
+            if head is None or not head["head_mac"]:
+                return False
+            if int(head["seq"]) != count - 1 or str(head["head_hash"]) != last_hash:
+                return False
+            expected_head_mac = hmac.new(
+                self._evidence_key,
+                f"{intent_id}\x1f{count - 1}\x1f{last_hash}".encode("utf-8"),
+                hashlib.sha256,
+            ).hexdigest()
+            if not hmac.compare_digest(expected_head_mac, str(head["head_mac"])):
+                return False
         return True

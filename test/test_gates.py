@@ -4,7 +4,7 @@ import unittest
 from datetime import timedelta
 from decimal import Decimal
 
-from faar.gates import evaluate_risk
+from faar.gates import evaluate_capability, evaluate_risk
 from faar.models import CapabilityGrant, CapabilityLimits, EconomicPrimitive, GrantStatus, Intent, RiskSnapshot, Verdict
 from support import NOW
 
@@ -112,6 +112,55 @@ class GateTests(unittest.TestCase):
                     max_order_usd=Decimal("100"), max_daily_turnover_usd=Decimal("1000"),
                 ),
             )
+
+
+    def test_falsy_asset_value_is_validated_against_allowlist(self):
+        # A falsy-but-present asset value (integer 0) must not slip past the
+        # allowed_assets scope by being treated as absent.
+        grant = CapabilityGrant(
+            principal_id="principal:test",
+            grant_id="g", version=1, actor_id="a", status=GrantStatus.ACTIVE,
+            allowed_primitives=frozenset({EconomicPrimitive.BUY}), allowed_venues=frozenset({"v"}),
+            allowed_assets=frozenset({"BTC", "USD"}),
+            limits=CapabilityLimits(
+                max_order_usd=Decimal("100"), max_daily_turnover_usd=Decimal("1000"),
+                max_actions_per_window=10, action_window_seconds=60,
+            ),
+        )
+        intent = Intent(
+            principal_id="principal:test",
+            intent_id="intent_falsy_asset_00001", actor_id="a", grant_id="g", grant_version=1,
+            primitive=EconomicPrimitive.BUY, venue="v", created_at=NOW,
+            expires_at=NOW + timedelta(seconds=10),
+            payload={"base_asset": 0, "quote_asset": "USD", "amount_usd": "10"},
+        )
+        decision = evaluate_capability(intent, grant, NOW)
+        self.assertEqual(Verdict.DENY, decision.verdict)
+        self.assertTrue(any(r.startswith("ASSET_NOT_ALLOWED") for r in decision.reason_codes))
+
+    def test_falsy_target_value_hits_denied_targets(self):
+        # A falsy-but-present target (integer 0) must still be checked against
+        # denied_targets rather than coalescing to None and skipping the check.
+        grant = CapabilityGrant(
+            principal_id="principal:test",
+            grant_id="g", version=1, actor_id="a", status=GrantStatus.ACTIVE,
+            allowed_primitives=frozenset({EconomicPrimitive.BUY}), allowed_venues=frozenset({"v"}),
+            allowed_assets=frozenset({"BTC", "USD"}), denied_targets=frozenset({"0"}),
+            limits=CapabilityLimits(
+                max_order_usd=Decimal("100"), max_daily_turnover_usd=Decimal("1000"),
+                max_actions_per_window=10, action_window_seconds=60,
+            ),
+        )
+        intent = Intent(
+            principal_id="principal:test",
+            intent_id="intent_falsy_target_0001", actor_id="a", grant_id="g", grant_version=1,
+            primitive=EconomicPrimitive.BUY, venue="v", created_at=NOW,
+            expires_at=NOW + timedelta(seconds=10),
+            payload={"base_asset": "BTC", "quote_asset": "USD", "amount_usd": "10", "target": 0},
+        )
+        decision = evaluate_capability(intent, grant, NOW)
+        self.assertEqual(Verdict.DENY, decision.verdict)
+        self.assertIn("TARGET_DENIED", decision.reason_codes)
 
 
 if __name__ == "__main__":
