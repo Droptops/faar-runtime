@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from decimal import Decimal
+
 import hashlib
 from dataclasses import dataclass
 from enum import StrEnum
@@ -66,6 +68,15 @@ class MockMode(StrEnum):
     TIMEOUT_BEFORE_EFFECT = "TIMEOUT_BEFORE_EFFECT"
     TIMEOUT_AFTER_EFFECT = "TIMEOUT_AFTER_EFFECT"
     AMBIGUOUS = "AMBIGUOUS"
+    # The venue admitted the request (consumed the permit) and then timed out
+    # before producing any effect or record.
+    TIMEOUT_AFTER_ADMISSION = "TIMEOUT_AFTER_ADMISSION"
+    # The order rests on the book half filled; `complete_fill` / `cancel_order`
+    # move it to its terminal state.
+    PARTIAL_FILL = "PARTIAL_FILL"
+    # The order is admitted and rests with nothing filled (PARTIALLY_FILLED with a
+    # zero cumulative amount); `complete_fill` / `cancel_order` terminate it.
+    OPEN_ORDER = "OPEN_ORDER"
 
 
 class ExecutionAdapter(Protocol):
@@ -100,13 +111,20 @@ class MockVenue:
     def _key(request: ExecutionRequest) -> str:
         return f"{request.principal_id}\x1f{request.intent_id}"
 
-    def _receipt(self, request: ExecutionRequest) -> ExecutionReceipt:
+    def _receipt(
+        self,
+        request: ExecutionRequest,
+        *,
+        status: SettlementStatus = SettlementStatus.FINALIZED,
+        amount: Decimal | None = None,
+    ) -> ExecutionReceipt:
         seed = request.principal_id + "\x1f" + request.intent_id + canonical_json(request.payload)
         effect_id = "fx_" + hashlib.sha256(seed.encode()).hexdigest()[:24]
-        amount = parse_bounded_decimal(request.payload.get("amount_usd", request.payload.get("notional_usd")))
+        if amount is None:
+            amount = parse_bounded_decimal(request.payload.get("amount_usd", request.payload.get("notional_usd")))
         return ExecutionReceipt(
             effect_id=effect_id,
-            status=SettlementStatus.FINALIZED,
+            status=status,
             evidence={
                 "venue": self.name,
                 "principal_id": request.principal_id,
@@ -117,6 +135,10 @@ class MockVenue:
             amount_usd=amount,
         )
 
+    @staticmethod
+    def _authorized_amount(request: ExecutionRequest) -> Decimal | None:
+        return parse_bounded_decimal(request.payload.get("amount_usd", request.payload.get("notional_usd")))
+
     def execute(self, request: ExecutionRequest, permit: SignedExecutionPermit) -> ExecutionReceipt:
         with self._lock:
             key = self._key(request)
@@ -124,18 +146,66 @@ class MockVenue:
             if key in self._effects:
                 return self._effects[key]
 
-            ok, reasons = self.permit_verifier.consume(permit, request, now=self.clock())
+            if self.mode == MockMode.TIMEOUT_BEFORE_EFFECT:
+                # Transport timeout before the venue admitted the request: the
+                # permit is never consumed, so a retry after the window is legal.
+                raise AmbiguousExecution("timeout before venue admission; caller must reconcile before retry")
+
+            # The gateway binds the permit to this venue: a permit minted for another
+            # venue's request is refused before anything is consumed.
+            ok, reasons = self.permit_verifier.consume(permit, request, now=self.clock(), venue=self.name)
             if not ok:
                 raise DeterministicFailure("permit rejected:" + ",".join(reasons))
 
-            if self.mode == MockMode.TIMEOUT_BEFORE_EFFECT:
-                raise AmbiguousExecution("timeout before venue effect; caller must reconcile before retry")
+            if self.mode == MockMode.TIMEOUT_AFTER_ADMISSION:
+                raise AmbiguousExecution("timeout after venue admission; no effect and no record")
             if self.mode == MockMode.AMBIGUOUS:
                 raise AmbiguousExecution("venue remains ambiguous")
-            receipt = self._receipt(request)
+            if self.mode == MockMode.PARTIAL_FILL:
+                full = self._authorized_amount(request)
+                half = (full / 2).quantize(Decimal("0.00000001")) if full is not None else None
+                receipt = self._receipt(request, status=SettlementStatus.PARTIALLY_FILLED, amount=half)
+            elif self.mode == MockMode.OPEN_ORDER:
+                receipt = self._receipt(request, status=SettlementStatus.PARTIALLY_FILLED, amount=Decimal("0"))
+            else:
+                receipt = self._receipt(request)
             self._effects[key] = receipt
             if self.mode == MockMode.TIMEOUT_AFTER_EFFECT:
                 raise AmbiguousExecution("timeout after venue effect; caller must reconcile")
+            return receipt
+
+    def complete_fill(self, request: ExecutionRequest) -> ExecutionReceipt | None:
+        """Venue-side: the resting remainder of a partially filled order fills."""
+        with self._lock:
+            key = self._key(request)
+            current = self._effects.get(key)
+            if current is None:
+                return None
+            if current.status == SettlementStatus.CANCELLED:
+                # Terminal by contract (ADAPTER_CONTRACT Part C): a venue never
+                # fills an order after it acknowledged the cancel.
+                return current
+            receipt = self._receipt(request, status=SettlementStatus.FINALIZED)
+            self._effects[key] = receipt
+            return receipt
+
+    def cancel_order(self, request: ExecutionRequest) -> ExecutionReceipt | None:
+        """Venue-side: cancel a resting order; the filled amount so far stays settled.
+
+        Terminal by contract: after this the venue never fills the remainder.
+        """
+        with self._lock:
+            key = self._key(request)
+            current = self._effects.get(key)
+            if current is None:
+                return None
+            filled = current.amount_usd if current.status == SettlementStatus.PARTIALLY_FILLED else (
+                current.amount_usd if current.status == SettlementStatus.CANCELLED else None
+            )
+            if current.status == SettlementStatus.FINALIZED:
+                return current  # nothing left to cancel
+            receipt = self._receipt(request, status=SettlementStatus.CANCELLED, amount=filled)
+            self._effects[key] = receipt
             return receipt
 
     def lookup_effect(self, request: ExecutionRequest) -> ExecutionReceipt | None:
@@ -143,7 +213,12 @@ class MockVenue:
             return self._effects.get(self._key(request))
 
     def successful_effect_count(self, intent_id: str, *, principal_id: str = "principal:test") -> int:
-        return 1 if f"{principal_id}\x1f{intent_id}" in self._effects else 0
+        receipt = self._effects.get(f"{principal_id}\x1f{intent_id}")
+        if receipt is None:
+            return 0
+        if receipt.status in {SettlementStatus.CANCELLED, SettlementStatus.PARTIALLY_FILLED} and not (receipt.amount_usd or 0) > 0:
+            return 0
+        return 1
 
     def execute_call_count(self, intent_id: str, *, principal_id: str = "principal:test") -> int:
         return self._execute_calls.get(f"{principal_id}\x1f{intent_id}", 0)

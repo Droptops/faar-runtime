@@ -17,7 +17,7 @@
 
 The model may intentionally request unauthorized targets/assets/venues, oversized orders, withdrawals or arbitrary transfers, raw calldata or signed transaction blobs, unlimited approvals, reuse of stale decisions, or rewriting success criteria after seeing the result. It may also craft payloads meant to break the runtime rather than move money: non-JSON payloads, dual amount fields, Unicode or exponent amount strings, amounts whose fixed-point form would allocate gigabytes, multi-megabyte identifiers.
 
-FAAR treats these as untrusted proposals: typed allowlists, a strict amount grammar with canonical bounds, identifier bounds, and construction-time validation reject them before any state is written.
+FAAR treats these as untrusted proposals: typed allowlists, a strict amount grammar with canonical bounds (applied to JSON numbers as well as strings), identifier bounds, a byte budget on every untrusted document, and construction-time validation reject them before any state is written; gate reason codes never copy payload content verbatim, and a slippage cap in the grant requires an executor-side bound in the request.
 
 ### Compromised coordinator/API
 

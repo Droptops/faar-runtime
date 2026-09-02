@@ -30,6 +30,20 @@ faar resume --scope global --db faar.sqlite
   ends the intent `FAILED_SAFE` instead.
 - `halt` and `resume` are authority changes: on a database bound to an anchor
   they require `--anchor` (see §5).
+- Scopes are `global` or `principal:<principal_id>` (ids are themselves of the
+  form `principal:<name>`, so the scope is doubled); a principal with no
+  provisioned grant is refused (`UnknownPrincipal`) unless
+  `--allow-unprovisioned-principal` is given, so a typo cannot report a halt or
+  a cap that protects nothing.
+- A first funded deployment also sets a fleet-wide ceiling that no grant can
+  exceed. `EXPOSURE_CAP_EXCEEDED` defers the intent at reservation time:
+
+```bash
+faar set-exposure-cap --scope global --max-usd 500 --db faar.sqlite --anchor faar.anchor.json
+faar set-exposure-cap --scope principal:principal:demo --max-usd 100 --db faar.sqlite --anchor faar.anchor.json
+faar exposure-caps --db faar.sqlite
+faar set-exposure-cap --scope global --clear --db faar.sqlite --anchor faar.anchor.json
+```
 - While halted, `list-grants` shows `effective_status: HALTED`; new intents end
   `STOPPED` with `GRANT_RUNTIME_HALTED`.
 - Per-grant `set-grant-status ... --status PAUSED|REVOKED` remains the
@@ -39,18 +53,31 @@ faar resume --scope global --db faar.sqlite
 
 A worker that dies inside `process()`/`reconcile()` leaves its durable lease in
 place. By design nothing takes the lease over automatically; every later call
-returns `INTENT_BUSY` after `wait_seconds`.
+returns `INTENT_BUSY` after `wait_seconds`. The lease is owned by the store
+instance (not a thread), so a live worker whose release failed on a busy
+datastore re-acquires its own lease on its next call from any thread; a release
+waits about five seconds at most before it reports `StoreUnavailable`.
 
 ```bash
-faar list-leases --db faar.sqlite
-# confirm the owning process is dead (owner_token = <store instance id>:<thread id>)
+faar list-leases --db faar.sqlite          # shows owner_token, host, pid, acquired_at
+# confirm the owning process is dead: on the lease's host, check the pid
 faar inspect --intent-id <id> --db faar.sqlite
 # reconcile external settlement by hand if the intent is SUBMITTED/UNKNOWN/RECONCILING
 faar clear-lease --intent-id <id> --owner-token <token> --db faar.sqlite
 ```
 
+`clear-lease` refuses (`LeaseOwnerAlive`, exit 2) when the owner is a live process
+on the host you run it from; `--force` overrides that only when you have confirmed
+the worker is gone by other means. A worker that hit a busy datastore keeps the
+right to re-acquire its own lease, so a lease row with a live pid is not
+necessarily stuck: wait for the worker's next call first.
+
 Never clear a lease whose owner may still be running: two workers inside one
 intent's state machine is exactly the duplicate-execution race the lease prevents.
+
+This procedure is exercised by `make crash` (`evals/run_crash_injection.py`),
+which kills a worker before every store call and recovers with exactly these
+steps.
 
 ## 3. Intents parked in UNKNOWN with budget HELD
 
@@ -68,7 +95,9 @@ Read `reason_codes` and `ambiguity_until`:
 | `SETTLEMENT_UNKNOWN`, `RECONCILIATION_EXCEPTION` | verifier unavailable | same |
 | `EXECUTION_DETERMINISTIC_FAILURE` (with one of the above; `_UNVERIFIED` only before the first reconciliation) | adapter rejected the request; block on resubmission is durable | once an authoritative NONE arrives after the permit window the intent ends `FAILED_SAFE`; a new intent is required |
 | `EXECUTION_PERMIT_REJECTED`, `PERMIT_PREVIOUS_ATTEMPT_LIVE` | the store refused a second live permit for this intent | wait for the recorded window; budget stays held |
-| `EVIDENCE_INTEGRITY_FAILURE` | the evidence chain refused an append (legacy chain without a head, or a tail that no longer matches its signed head) | state was not advanced; see §6 and §9 |
+| `EVIDENCE_INTEGRITY_FAILURE` | the evidence chain refused an append (legacy chain without a head, or a tail that no longer matches its signed head) | state was not advanced; see §6 and §8 |
+| `SETTLEMENT_PARTIAL_FILL_OPEN` (state `CONFIRMED`) | the order rests partially filled at the venue | reconcile again later; cancel at the venue to finish; the remainder is never a second order |
+| `ADAPTER_ORPHAN_LIMIT_REACHED` (state `STOPPED`, budget released) | this worker has too many abandoned adapter calls | let them drain or restart the worker; investigate the venue latency |
 
 Budget held by an UNKNOWN intent is never released by hand through the CLI. It is
 released when the verifier proves absence after the permit window, or committed
@@ -77,10 +106,17 @@ when settlement is finalized.
 ## 4. Intents STOPPED with budget HELD
 
 `SETTLEMENT_CONTRADICTORY`, `SETTLEMENT_EFFECT_ID_MISMATCH`,
-`SETTLEMENT_LOST_PREVIOUS_EFFECT`, `SETTLED_AMOUNT_*`, `PAYMENT_AMOUNT_MISMATCH`,
-`EFFECT_ID_ALREADY_CLAIMED`, `SETTLED_EFFECT_ID_INVALID` and
+`SETTLEMENT_LOST_PREVIOUS_EFFECT`, `SETTLEMENT_CANCEL_CONTRADICTS_RECORDED_EFFECT`,
+`SETTLEMENT_NONE_AFTER_PERMIT_CONSUMED` (the venue admitted the request but has
+no record of it), `SETTLEMENT_RECORD_MALFORMED`,
+`SETTLED_AMOUNT_*`, `PAYMENT_AMOUNT_MISMATCH`, `PAYMENT_PARTIAL_NOT_ALLOWED`,
+`EFFECT_ID_ALREADY_CLAIMED`, `SETTLED_EFFECT_ID_INVALID`, `SETTLEMENT_FILL_REGRESSED`
+(the venue reported a cumulative fill below one it reported earlier) and
 `SETTLEMENT_REQUEST_BINDING_MISMATCH` are terminal and keep the reservation HELD
-because an effect may exist that FAAR cannot attribute safely. These need a human:
+because an effect may exist that FAAR cannot attribute safely. Every such stop
+first voids the attempt's unconsumed permits (`permits_voided` in the evidence),
+so a venue request that lands later is refused with `PERMIT_VOIDED`; the ledger
+shows whether a permit was consumed before the stop. These need a human:
 reconcile at the venue, then decide whether to revoke the grant version. The
 trailing 24 h turnover window means the held amount stops counting on its own
 after a day; the velocity window ages it out after `action_window_seconds`.
@@ -91,13 +127,37 @@ All consumed authority lives in the store file: grant epochs, fence tokens,
 consumed permits, claimed risk states. Restoring an older copy resurrects all of
 it. Run the store with an authority anchor kept **outside** the backup set:
 
+Retention: nothing is purged automatically, and every per-intent lookup is
+indexed, so a large history is a disk-space matter rather than a latency one.
+When archiving, keep every intent whose usage row is inside the trailing
+turnover window (24 h) or whose grant's `action_window_seconds` has not passed,
+every non-terminal intent, and every row the evidence chain of a retained intent
+references; archive terminal intents older than that together with their
+evidence and permits, never by deleting rows from a live database.
+
+Anchor behind the datastore: a stop (`set-grant-status PAUSED|REVOKED`, `halt`,
+`set-exposure-cap` tightening, `revoke-after-restore`) that could not raise the
+anchor mark still commits and exits 2 with `"error": "AnchorUnavailableAfterCommit",
+"committed": true`. Treat it as an alert: re-run the same command once the anchor
+is reachable (a re-run is never a no-op: it raises the mark), or simply open the
+store with `--anchor` (every anchored open raises marks that are behind their
+rows); `list-grants` shows `anchor_behind` per grant version. `"committed":
+false` means nothing changed. Do not take a backup while any grant shows
+`anchor_behind: true`. The opposite case, an anchor ahead of the datastore after a
+transient failure between the anchor write and the commit at issuance or
+consumption, reports `REGRESSED` for that grant version; the only continuation is
+`revoke-after-restore` and a new grant version (fail closed by design).
+
 ```bash
 faar provision-grant --grant grant.json --db faar.sqlite --anchor /mnt/anchor/faar.anchor.json
 # runtime: SQLiteIntentStore(path, evidence_key=..., authority_anchor=FileAuthorityAnchor(...))
 ```
 
-The first open with an anchor binds the database to it durably. From then on an
-instance opened **without** an anchor (a worker missing the option, an operator
+The first open with an anchor binds the database to it durably and writes a
+shared identity into both; opening later with a different anchor, or with a
+fresh file at the same path (an unmounted volume, a new host), fails with
+`AnchorMismatch` instead of silently un-regressing a restored database. From
+then on an instance opened **without** an anchor (a worker missing the option, an operator
 command without `--anchor`) cannot issue, consume, or change authority:
 `list-grants` shows `effective_status: ANCHOR_REQUIRED`, new intents stop with
 `GRANT_RUNTIME_ANCHOR_REQUIRED`, venues refuse `PERMIT_ANCHOR_REQUIRED`, and
@@ -107,14 +167,21 @@ file that cannot be read or parsed fails closed the same way
 (`ANCHOR_UNAVAILABLE`, `PERMIT_ANCHOR_UNAVAILABLE`).
 
 The per-grant fence counter advances on every permit issuance **and** every
-consumption, so a snapshot taken between the two is detected too. The file
-anchor holds an inter-process lock on `<anchor>.lock` around each update; every
-worker and the CLI may share one file.
+consumption, so a snapshot taken between the two is detected too. The mark is
+raised inside the datastore transaction, before commit: provisioning,
+re-activation, permit issuance and consumption roll back when the anchor cannot
+be written, so no authority ever exists without its mark. Pause, revoke, `halt`
+and `revoke-after-restore` commit regardless (stopping is always the safe
+direction) and then exit 2 with `AnchorUnavailable ... committed; anchor not
+updated`; treat that as an alert, not a failed stop. The file anchor holds an
+inter-process lock on `<anchor>.lock` around each update, waits at most
+`ANCHOR_LOCK_TIMEOUT_SECONDS` (5 s) for it and otherwise reports
+`ANCHOR_UNAVAILABLE`; every worker and the CLI may share one file.
 
 Taking a backup:
 
 ```bash
-faar checkpoint --db faar.sqlite      # fold the WAL into the main file first
+faar checkpoint --db faar.sqlite      # fold the WAL into the main file first; exit 2 = not folded, do not copy
 cp faar.sqlite backups/faar-$(date -u +%Y%m%dT%H%M%SZ).sqlite
 ```
 
@@ -131,7 +198,10 @@ faar revoke-after-restore --grant-id grant:demo --grant-version 1 --db faar.sqli
 ```
 
 Intents that were in flight in the lost history must be reconciled at the venue by
-hand; the restored store does not know about them.
+hand; the restored store does not know about them. Exposure caps are anchored
+too: after a restore every monetary reservation is refused with
+`EXPOSURE_CAPS_REGRESSED` until an operator re-applies the caps with
+`set-exposure-cap` (re-check every scope; the snapshot may carry a looser cap).
 
 Without an anchor a restore is undetectable (see
 `test_controls.test_without_an_anchor_a_restore_is_undetectable`). An anchor file
@@ -146,7 +216,9 @@ faar verify-evidence --intent-id <id> --db faar.sqlite --evidence-key-env FAAR_E
 
 Exit code 2 means the chain, a MAC, or the signed head commitment does not verify,
 or the intent does not exist. The `status` field says which: `chain_invalid`
-(hash or MAC), `head_mismatch` (tail truncated or head rewritten), `head_missing`
+(hash or MAC), `head_mismatch` (tail truncated or head rewritten), `head_deleted`
+(a chain that started with a signed head has lost it: tampering, and the rebuild
+refuses it), `head_missing`
 (a chain written before signed heads existed; not tampering), `chain_empty`
 (an intent with no events at all), `unknown_intent`. Verification without a key
 checks the public hash chain only and cannot detect tail truncation.

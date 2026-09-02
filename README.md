@@ -71,7 +71,7 @@ FAAR is built around five non-negotiable properties:
 5. **Settlement is evidence-driven**
    - API success is not settlement. Submitter receipts are telemetry; only an independent verifier's authoritative, request-bound record advances an intent.
 
-See [`docs/INVARIANTS.md`](docs/INVARIANTS.md) (I-1..I-34).
+See [`docs/INVARIANTS.md`](docs/INVARIANTS.md) (I-1..I-38).
 
 ## First vertical: autonomous trading
 
@@ -158,6 +158,7 @@ faar/
 
 docs/
   ARCHITECTURE.md         EXECUTION_PERMITS.md     OPERATIONS.md
+  STORE_CONTRACT.md
   INVARIANTS.md           THREAT_MODEL.md          TRUST_MODEL.md
   RISK_ENGINE_CONTRACT.md ADAPTER_CONTRACT.md      RECOVERY.md
   GRANT_PROVISIONING.md   DEFINITION_OF_DONE.md    UNPLUG_TEST.md
@@ -175,10 +176,10 @@ examples/             # non-production fixtures
 ```bash
 python -m venv .venv && . .venv/bin/activate
 python -m pip install -e ".[dev]"
-make check      # unit tests, adversarial, red-team matrix, fuzz, demo, bounded model
+make check      # unit tests, adversarial, red-team matrix, fuzz, demo, bounded model, crash injection
 ```
 
-Operator commands (`python -m faar.cli --help`): `provision-grant`, `set-grant-status`, `halt`, `resume`, `controls`, `list-grants`, `list-intents`, `held-usage`, `list-leases`, `clear-lease`, `inspect`, `verify-evidence`, `rebuild-evidence-head`, `revoke-after-restore`, `checkpoint`, `evaluate`, `mock-run`. Procedures: [`docs/OPERATIONS.md`](docs/OPERATIONS.md).
+Operator commands (`python -m faar.cli --help`): `provision-grant`, `set-grant-status`, `halt`, `resume`, `controls`, `set-exposure-cap`, `exposure-caps`, `list-grants`, `list-intents`, `held-usage`, `list-leases`, `clear-lease`, `inspect`, `verify-evidence`, `rebuild-evidence-head`, `revoke-after-restore`, `checkpoint`, `evaluate`, `mock-run`. Procedures: [`docs/OPERATIONS.md`](docs/OPERATIONS.md).
 
 ## Status
 
@@ -186,13 +187,14 @@ Operator commands (`python -m faar.cli --help`): `provision-grant`, `set-grant-s
 
 See [`docs/V0_4_RELEASE.md`](docs/V0_4_RELEASE.md). The deterministic release gate (`make check`) includes unit tests, adversarial denial/replay checks with adapter-call and permit-consumption metrics, a red-team matrix in which every attack class is mapped to named tests, seeded state-machine fuzz with an advancing clock, the demo CLI path with keyed evidence verification, and the bounded permit protocol model checker. Headline results:
 
-- 261/261 unit/invariant tests
-- 100 targeted red-team attack classes mapped to 131 named tests, 0 unmapped
+- 353/353 unit/invariant tests
+- 158 targeted red-team attack classes mapped to 221 named tests, 0 unmapped
 - 160 adversarial denial cases with 0 unauthorized economic effects and 0 adapter calls
 - 100 same-intent replay attempts with 1 economic effect, 1 adapter call, 1 permit issued and consumed
 - 96 seeded fuzz scenarios with 0 duplicate-effect and 0 aggregate-budget violations
-- bounded permit model: 1766 states, 4304 transitions, 0 invariant violations; stale permits unconsumable after revoke and after halt/resume; 187 violations when the permit-window rule is removed
+- bounded permit model: 3940 states, 10047 transitions, 0 invariant violations; stale permits unconsumable after revoke and after halt/resume; 223 violations without the permit-window rule and 399 without the ledger check that stops on a consumed permit
+- crash injection: a worker killed before every one of 224 store-call boundaries across 7 scenarios, recovered by the runbook with 0 duplicate effects, 0 lost effects and 0 stranded budget
 
 These are deterministic regression, adversarial, fuzz, mutation-derived, and bounded-model results. They are not formal verification, an independent security audit, or a production-safety claim.
 
-Before any live-money adapter, the repository still requires the gates in [`docs/V0_2_RELEASE_GATES.md`](docs/V0_2_RELEASE_GATES.md); [`docs/GO_LIVE_CHECKLIST.md`](docs/GO_LIVE_CHECKLIST.md) records which are closed in-repo (key rotation, cross-process fencing, restore safety, kill switch, bounded deadlines, ambiguity window), which belong to a deployment (key custody, venue-side permit verification, credential scoping, authenticated ingress, anchor placement, capped exposure), and which remain open (partial-fill/cancel semantics, datastore failover, independent security review). Do not add a real-money adapter until every row is closed and independently reviewed.
+Before any live-money adapter, the repository still requires the gates in [`docs/V0_2_RELEASE_GATES.md`](docs/V0_2_RELEASE_GATES.md); [`docs/GO_LIVE_CHECKLIST.md`](docs/GO_LIVE_CHECKLIST.md) records which are closed in-repo (key rotation, cross-process fencing, restore safety, kill switch, exposure caps, velocity that counts venue actions, executor-side slippage bounds, bounded deadlines and abandoned-call cap, ambiguity window, partial fills, open orders and cancellation, crash recovery), which belong to a deployment (key custody, venue-side permit verification, credential scoping, authenticated ingress, anchor placement, capped exposure), and which remain open (datastore failover beyond SQLite, independent security review). Do not add a real-money adapter until every row is closed and independently reviewed.

@@ -9,7 +9,7 @@ from collections.abc import Iterable
 from typing import Mapping, Protocol
 
 from .canonical import canonical_hash, canonical_json
-from .models import Attestation, AttestationAlgorithm, AttestationKind, Intent, KeyValidity
+from .models import MAX_CLOCK_SKEW_SECONDS, Attestation, AttestationAlgorithm, AttestationKind, Intent, KeyValidity
 
 
 ED25519_SIGNATURE_BYTES = 64
@@ -142,8 +142,8 @@ class HMACTrustStore:
         if any(len(v) < 16 for v in self._keys.values()):
             raise ValueError("attestation keys must be at least 16 bytes")
         self._key_kinds = _normalize_kinds(set(self._keys), key_kinds)
-        if max_clock_skew_seconds < 0:
-            raise ValueError("max_clock_skew_seconds must be non-negative")
+        if not isinstance(max_clock_skew_seconds, int) or isinstance(max_clock_skew_seconds, bool) or not 0 <= max_clock_skew_seconds <= MAX_CLOCK_SKEW_SECONDS:
+            raise ValueError("max_clock_skew_seconds must be an integer between 0 and MAX_CLOCK_SKEW_SECONDS")
         self.max_clock_skew_seconds = max_clock_skew_seconds
 
     def _kind_allowed(self, key_id: str, kind: AttestationKind) -> bool:
@@ -335,8 +335,8 @@ class Ed25519TrustStore:
         if len(capabilities) != 1:
             raise ValueError("attestation trust store cannot mix private and public keys")
         self.can_sign = capabilities.pop()
-        if max_clock_skew_seconds < 0:
-            raise ValueError("max_clock_skew_seconds must be non-negative")
+        if not isinstance(max_clock_skew_seconds, int) or isinstance(max_clock_skew_seconds, bool) or not 0 <= max_clock_skew_seconds <= MAX_CLOCK_SKEW_SECONDS:
+            raise ValueError("max_clock_skew_seconds must be an integer between 0 and MAX_CLOCK_SKEW_SECONDS")
         if max_attestation_lifetime_seconds <= 0:
             raise ValueError("max_attestation_lifetime_seconds must be positive")
         self.max_clock_skew_seconds = max_clock_skew_seconds
@@ -465,8 +465,8 @@ class Ed25519AttestationVerifier:
         self._keys = {str(k): v for k, v in keys.items()}
         self._key_kinds = _normalize_kinds(set(self._keys), key_kinds)
         self._key_validity = _normalize_validity(set(self._keys), key_validity)
-        if max_clock_skew_seconds < 0:
-            raise ValueError("max_clock_skew_seconds must be non-negative")
+        if not isinstance(max_clock_skew_seconds, int) or isinstance(max_clock_skew_seconds, bool) or not 0 <= max_clock_skew_seconds <= MAX_CLOCK_SKEW_SECONDS:
+            raise ValueError("max_clock_skew_seconds must be an integer between 0 and MAX_CLOCK_SKEW_SECONDS")
         if max_attestation_lifetime_seconds <= 0:
             raise ValueError("max_attestation_lifetime_seconds must be positive")
         self.max_clock_skew_seconds = max_clock_skew_seconds

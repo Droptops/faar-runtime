@@ -269,6 +269,35 @@ class RuntimeHardeningTests(unittest.TestCase):
         self.store.record_execution_permit("permit_c", i, g, 1, 3, "h3", expires_at=NOW + timedelta(seconds=20), now=NOW + timedelta(seconds=8))
         self.assertEqual((NOW + timedelta(seconds=20)).isoformat(), self.store.get(i.intent_id).ambiguity_until)
 
+    # --- finalize and commit are one transaction --------------------------------------
+
+    def test_finalize_and_commit_are_one_transaction_and_replay_repairs_older_rows(self):
+        i = intent(intent_id="intent_hard_000000000040")
+        self.store.register(i, canonical_hash(i))
+        self.assertTrue(self.store.reserve_usage(i, grant(), risk(), NOW)[0])
+        for a, b in ((IntentState.PROPOSED, IntentState.AUTHORIZED), (IntentState.AUTHORIZED, IntentState.RESERVED),
+                     (IntentState.RESERVED, IntentState.RECONCILING)):
+            self.assertTrue(self.store.transition(i.intent_id, a, b))
+        with self.assertRaises(ValueError):
+            self.store.transition(i.intent_id, IntentState.RECONCILING, IntentState.FINALIZED, effect_id="fx-a", release_usage=True, commit_usage=True)
+        self.assertTrue(self.store.transition(i.intent_id, IntentState.RECONCILING, IntentState.FINALIZED, effect_id="fx-a", commit_usage=True))
+        self.assertEqual("COMMITTED", self.usage_status(i.intent_id))
+        # A FINALIZED row whose commit never happened (older version, crash between
+        # the two statements) is repaired by the first replay.
+        j = intent(intent_id="intent_hard_000000000041")
+        self.store.register(j, canonical_hash(j))
+        self.assertTrue(self.store.reserve_usage(j, grant(), risk(state_version=2), NOW)[0])
+        for a, b in ((IntentState.PROPOSED, IntentState.AUTHORIZED), (IntentState.AUTHORIZED, IntentState.RESERVED),
+                     (IntentState.RESERVED, IntentState.RECONCILING)):
+            self.assertTrue(self.store.transition(j.intent_id, a, b))
+        self.assertTrue(self.store.transition(j.intent_id, IntentState.RECONCILING, IntentState.FINALIZED, effect_id="fx-b"))
+        self.assertEqual("HELD", self.usage_status(j.intent_id))
+        runtime = self.runtime_for(ScriptedAdapter([], [_auth(SettlementStatus.NONE)]))
+        replay = self.run_case(runtime, j)
+        self.assertEqual(IntentState.FINALIZED, replay.state)
+        self.assertTrue(replay.replayed)
+        self.assertEqual("COMMITTED", self.usage_status(j.intent_id))
+
     # --- a settlement-derived stop is not an orphaned hold ------------------------
 
     def test_replay_keeps_the_hold_of_a_never_submitted_intent_stopped_on_settlement_evidence(self):
@@ -406,9 +435,11 @@ class RuntimeHardeningTests(unittest.TestCase):
         self.assertFalse(receipt_events[0]["payload"]["reported_effect_id_well_formed"])
 
     def test_malformed_verifier_effect_id_stops_with_held_budget(self):
+        # A string effect id outside the accepted grammar is an authoritative record
+        # the runtime refuses: terminal STOP, budget held.
         adapter = ScriptedAdapter(
             [ExecutionReceipt("effect-A", SettlementStatus.FINALIZED, {}, Decimal("50"))],
-            [_auth(SettlementStatus.FINALIZED, b"binary-effect-id")],  # type: ignore[arg-type]
+            [_auth(SettlementStatus.FINALIZED, "x" * 600)],
         )
         runtime = self.runtime_for(adapter)
         i = intent(intent_id="intent_hard_000000000061")
@@ -417,6 +448,19 @@ class RuntimeHardeningTests(unittest.TestCase):
         self.assertIn("SETTLED_EFFECT_ID_INVALID", result.reason_codes)
         self.assertIsNone(self.store.get(i.intent_id).effect_id)
         self.assertEqual("HELD", self.usage_status(i.intent_id))
+        # A non-string effect id never forms a record at all: the verifier fails
+        # (where a quorum can outvote it) and the intent stays retriable, budget held.
+        with self.assertRaises(ValueError):
+            _auth(SettlementStatus.FINALIZED, b"binary-effect-id")(ExecutionRequest.from_intent(i))  # type: ignore[arg-type]
+        adapter = ScriptedAdapter(
+            [ExecutionReceipt("effect-B", SettlementStatus.FINALIZED, {}, Decimal("50"))],
+            [_auth(SettlementStatus.FINALIZED, b"binary-effect-id")],  # type: ignore[arg-type]
+        )
+        j = intent(intent_id="intent_hard_000000000062")
+        result = self.run_case(self.runtime_for(adapter), j, rs=risk(state_version=2))
+        self.assertEqual(IntentState.UNKNOWN, result.state)
+        self.assertIn("RECONCILIATION_EXCEPTION", result.reason_codes)
+        self.assertEqual("HELD", self.usage_status(j.intent_id))
 
     # --- in-flight ambiguity is bounded by the permit window -------------------------
 

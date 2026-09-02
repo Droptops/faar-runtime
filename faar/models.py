@@ -8,7 +8,7 @@ from math import isfinite
 from types import MappingProxyType
 from typing import Any, Mapping
 
-from .canonical import parse_bounded_decimal
+from .canonical import canonical_json, parse_bounded_decimal
 
 
 def _aware(value: datetime) -> bool:
@@ -27,6 +27,9 @@ MAX_CANONICAL_INT_BITS = 256
 MAX_IDENTIFIER_CHARS = 128
 MIN_INTENT_ID_CHARS = 16
 MAX_SAFE_INT = 2**63 - 1
+# Reason codes carried by a signed authority decision.
+MAX_REASON_CODES = 64
+MAX_REASON_CODE_CHARS = 256
 SUPPORTED_INTENT_SCHEMA_VERSIONS = frozenset({"0.3"})
 
 
@@ -42,13 +45,33 @@ def _require_mapping(name: str, value: object) -> None:
         raise ValueError(f"{name} must be a JSON object")
 
 
-def _deep_freeze(value: Any, _depth: int = 0) -> Any:
+# Total nodes one untrusted document may expand to. Per-container and depth
+# bounds alone still let a DAG (one child referenced from every key) materialise
+# millions of nodes when copied; the shared budget makes the copy linear in what
+# the caller may legitimately send.
+MAX_CANONICAL_TOTAL_NODES = 10_000
+# Total UTF-8 bytes of string content (keys and values) one frozen structure may
+# carry. Node and string-length bounds alone admitted ~160 MB documents that were
+# canonicalised a dozen times and stored verbatim before any gate ran.
+MAX_CANONICAL_TOTAL_BYTES = 65_536
+# Upper bound on the canonical JSON size of an evidence payload accepted from a
+# settlement source or adapter and copied into the evidence chain.
+MAX_EVIDENCE_BYTES = 65_536
+
+
+def _deep_freeze(value: Any, _depth: int = 0, _budget: list[int] | None = None) -> Any:
     """Copy untrusted nested data into a bounded immutable JSON-like structure.
 
     Frozen dataclasses are only shallowly immutable. The explicit depth/container/
-    scalar bounds also stop model, adapter, or verifier data from turning evidence
-    handling and canonical hashing into a trivial memory/recursion denial of service.
+    scalar bounds and the total node budget also stop model, adapter, or verifier
+    data from turning evidence handling and canonical hashing into a trivial
+    memory/recursion denial of service.
     """
+    if _budget is None:
+        _budget = [MAX_CANONICAL_TOTAL_NODES, MAX_CANONICAL_TOTAL_BYTES]
+    _budget[0] -= 1
+    if _budget[0] < 0:
+        raise ValueError("canonical data exceeds maximum total node count")
     if _depth > MAX_CANONICAL_DEPTH:
         raise ValueError("canonical data exceeds maximum nesting depth")
     if isinstance(value, Mapping):
@@ -60,16 +83,19 @@ def _deep_freeze(value: Any, _depth: int = 0) -> Any:
                 raise ValueError("mapping keys must be strings")
             if len(key) > MAX_CANONICAL_STRING_CHARS:
                 raise ValueError("canonical mapping key is too long")
-            out[key] = _deep_freeze(item, _depth + 1)
+            _budget[1] -= len(key.encode("utf-8"))
+            if _budget[1] < 0:
+                raise ValueError("canonical data exceeds maximum total size")
+            out[key] = _deep_freeze(item, _depth + 1, _budget)
         return MappingProxyType(out)
     if isinstance(value, (list, tuple)):
         if len(value) > MAX_CANONICAL_CONTAINER_ITEMS:
             raise ValueError("canonical sequence exceeds maximum item count")
-        return tuple(_deep_freeze(v, _depth + 1) for v in value)
+        return tuple(_deep_freeze(v, _depth + 1, _budget) for v in value)
     if isinstance(value, (set, frozenset)):
         if len(value) > MAX_CANONICAL_CONTAINER_ITEMS:
             raise ValueError("canonical set exceeds maximum item count")
-        return frozenset(_deep_freeze(v, _depth + 1) for v in value)
+        return frozenset(_deep_freeze(v, _depth + 1, _budget) for v in value)
     if isinstance(value, Decimal):
         if not value.is_finite():
             raise ValueError("non-finite Decimals are not allowed in canonical data")
@@ -81,6 +107,9 @@ def _deep_freeze(value: Any, _depth: int = 0) -> Any:
     if isinstance(value, str):
         if len(value) > MAX_CANONICAL_STRING_CHARS:
             raise ValueError("canonical string is too long")
+        _budget[1] -= len(value.encode("utf-8"))
+        if _budget[1] < 0:
+            raise ValueError("canonical data exceeds maximum total size")
         return value
     if isinstance(value, datetime):
         if not _aware(value):
@@ -93,6 +122,13 @@ def _deep_freeze(value: Any, _depth: int = 0) -> Any:
             raise ValueError("canonical integer exceeds maximum bit length")
         return value
     raise ValueError(f"unsupported canonical value type: {type(value).__name__}")
+
+
+# Upper bound for every time-valued limit (one leap year) and, separately, for a
+# clock-skew allowance: a skew of hours would disable the future-dated checks and
+# make every permit window unclosable, so it is capped at one hour.
+MAX_LIMIT_SECONDS = 366 * 86_400
+MAX_CLOCK_SKEW_SECONDS = 3_600
 
 
 def _require_int(name: str, value: int, *, minimum: int | None = None, maximum: int = MAX_SAFE_INT) -> None:
@@ -147,6 +183,9 @@ class EconomicPrimitive(StrEnum):
     CANCEL_ORDER = "CANCEL_ORDER"
 
 
+SLIPPAGE_BOUND_PRIMITIVES = frozenset({
+    EconomicPrimitive.SWAP, EconomicPrimitive.BUY, EconomicPrimitive.SELL, EconomicPrimitive.PLACE_ORDER,
+})
 MONETARY_PRIMITIVES = frozenset({
     EconomicPrimitive.PAY,
     EconomicPrimitive.SWAP,
@@ -189,7 +228,14 @@ class SettlementStatus(StrEnum):
     NONE = "NONE"
     UNKNOWN = "UNKNOWN"
     CONFIRMED = "CONFIRMED"
+    # An order that exists at the venue, has filled for `amount_usd` so far and can
+    # still fill further. Non-terminal: the runtime reconciles again later and never
+    # submits a second attempt for the remainder.
+    PARTIALLY_FILLED = "PARTIALLY_FILLED"
     FINALIZED = "FINALIZED"
+    # Terminal at the venue: no further fill is possible. `amount_usd` is the amount
+    # filled before cancellation (0/None for an unfilled order).
+    CANCELLED = "CANCELLED"
     CONTRADICTORY = "CONTRADICTORY"
 
 
@@ -222,6 +268,19 @@ class AuthorityDecision:
     reason_codes: tuple[str, ...] = ()
     source: str = "external"
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "posture", AuthorityPosture(self.posture))
+        object.__setattr__(self, "primitive", AuthorityPrimitive(self.primitive))
+        # Reason codes are persisted on the intent row and copied into evidence;
+        # even a trusted signer cannot make a terminal transition unpersistable.
+        codes = tuple(self.reason_codes)
+        if len(codes) > MAX_REASON_CODES:
+            raise ValueError(f"authority reason_codes exceed {MAX_REASON_CODES} entries")
+        for code in codes:
+            if not isinstance(code, str) or len(code) > MAX_REASON_CODE_CHARS:
+                raise ValueError(f"authority reason codes must be strings of at most {MAX_REASON_CODE_CHARS} characters")
+        object.__setattr__(self, "reason_codes", codes)
+
 
 @dataclass(frozen=True)
 class CapabilityLimits:
@@ -250,20 +309,20 @@ class CapabilityLimits:
             if value is not None and not isinstance(value, Decimal):
                 raise ValueError(f"{name} must be Decimal or None")
             _finite_nonnegative_decimal(name, value)
-        for name in (
-            "max_slippage_bps",
-            "max_price_impact_bps",
-            "max_market_data_age_seconds",
-            "max_risk_snapshot_age_seconds",
-            "max_intent_ttl_seconds",
-            "max_clock_skew_seconds",
-            "max_actions_per_window",
-        ):
+        for name in ("max_slippage_bps", "max_price_impact_bps", "max_actions_per_window"):
             value = getattr(self, name)
             if value is not None:
                 _require_int(name, value, minimum=0)
+        # Time-valued limits are bounded so the gates can always form a timedelta
+        # from them; an absurd value must fail at the document boundary, not raise
+        # OverflowError out of process() after the intent is registered.
+        for name in ("max_market_data_age_seconds", "max_risk_snapshot_age_seconds", "max_intent_ttl_seconds"):
+            value = getattr(self, name)
+            if value is not None:
+                _require_int(name, value, minimum=0, maximum=MAX_LIMIT_SECONDS)
+        _require_int("max_clock_skew_seconds", self.max_clock_skew_seconds, minimum=0, maximum=MAX_CLOCK_SKEW_SECONDS)
         if self.action_window_seconds is not None:
-            _require_int("action_window_seconds", self.action_window_seconds, minimum=1)
+            _require_int("action_window_seconds", self.action_window_seconds, minimum=1, maximum=MAX_LIMIT_SECONDS)
         if self.max_actions_per_window is not None and self.action_window_seconds is None:
             raise ValueError("action_window_seconds is required when max_actions_per_window is set")
         _require_int("max_submission_attempts", self.max_submission_attempts, minimum=1)
@@ -319,6 +378,11 @@ class CapabilityGrant:
             raise ValueError("all grants require max_actions_per_window and action_window_seconds")
         if self.limits.max_actions_per_window <= 0:
             raise ValueError("max_actions_per_window must be > 0")
+        # A missing financial limit never reads as infinity: a grant that allows a
+        # traded primitive must state the slippage cap that turns the executor-side
+        # bound on (I-39).
+        if self.allowed_primitives.intersection(SLIPPAGE_BOUND_PRIMITIVES) and self.limits.max_slippage_bps is None:
+            raise ValueError("SWAP/BUY/SELL/PLACE_ORDER grants require max_slippage_bps")
 
         if self.valid_until is not None and not _aware(self.valid_until):
             raise ValueError("grant valid_until must be timezone-aware")
@@ -563,6 +627,30 @@ class Attestation:
             raise ValueError("attestation expires_at must be after issued_at")
 
 
+def _bounded_amount(name: str, value: object) -> Decimal | None:
+    """A settlement or receipt amount: a finite Decimal inside the canonical bounds,
+    stored as a plain canonical Decimal (a subclass with overridden formatting is
+    not carried into evidence)."""
+    if value is None:
+        return None
+    if not isinstance(value, Decimal) or not value.is_finite():
+        raise ValueError(f"{name} must be a finite Decimal or None")
+    bounded = parse_bounded_decimal(value)
+    if bounded is None:
+        raise ValueError(f"{name} is outside the canonical amount bounds")
+    return bounded
+
+
+def _require_bounded_evidence(evidence: Mapping[str, Any]) -> None:
+    """Evidence copied into the chain must canonicalize, UTF-8 encode, and stay small."""
+    try:
+        encoded = canonical_json(evidence).encode("utf-8")
+    except (ValueError, TypeError, UnicodeEncodeError) as exc:
+        raise ValueError(f"evidence is not canonical JSON: {type(exc).__name__}") from exc
+    if len(encoded) > MAX_EVIDENCE_BYTES:
+        raise ValueError("evidence exceeds the maximum canonical size")
+
+
 @dataclass(frozen=True)
 class SettlementRecord:
     status: SettlementStatus
@@ -574,13 +662,18 @@ class SettlementRecord:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "status", SettlementStatus(self.status))
+        if self.effect_id is not None and (not isinstance(self.effect_id, str) or len(self.effect_id) > MAX_CANONICAL_STRING_CHARS):
+            raise ValueError("settlement effect_id must be a bounded string or None")
+        if self.verified_request_hash is not None and (
+            not isinstance(self.verified_request_hash, str) or len(self.verified_request_hash) > MAX_CANONICAL_STRING_CHARS
+        ):
+            raise ValueError("verified_request_hash must be a bounded string or None")
         object.__setattr__(self, "evidence", _deep_freeze(self.evidence))
+        _require_bounded_evidence(self.evidence)
         _require_bool("authoritative", self.authoritative)
         if self.authoritative and not self.verified_request_hash:
             raise ValueError("authoritative settlement records require verified_request_hash")
-        if self.amount_usd is not None:
-            if not isinstance(self.amount_usd, Decimal) or not self.amount_usd.is_finite():
-                raise ValueError("settlement amount_usd must be finite Decimal or None")
+        object.__setattr__(self, "amount_usd", _bounded_amount("settlement amount_usd", self.amount_usd))
 
 
 @dataclass(frozen=True)
@@ -593,9 +686,8 @@ class ExecutionReceipt:
     def __post_init__(self) -> None:
         object.__setattr__(self, "status", SettlementStatus(self.status))
         object.__setattr__(self, "evidence", _deep_freeze(self.evidence))
-        if self.amount_usd is not None:
-            if not isinstance(self.amount_usd, Decimal) or not self.amount_usd.is_finite():
-                raise ValueError("execution amount_usd must be finite Decimal or None")
+        _require_bounded_evidence(self.evidence)
+        object.__setattr__(self, "amount_usd", _bounded_amount("execution amount_usd", self.amount_usd))
         # effect_id validity is deliberately enforced by the runtime, not here.
         # Adapter output is a trust boundary and malformed output must become an
         # explicit STOP rather than an adapter-construction exception/UNKNOWN.

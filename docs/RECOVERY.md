@@ -25,15 +25,25 @@ Both reconcile first. Submitter output never decides which.
 |---|---|---|
 | `FINALIZED`, authoritative, bound to this request, valid effect id, amount inside envelope | | `FINALIZED`, usage COMMITTED |
 | `CONFIRMED`, same conditions | | `CONFIRMED` (reconciles again later) |
-| `CONFIRMED`/`FINALIZED`, not authoritative | | `UNKNOWN (SETTLEMENT_POSITIVE_NOT_AUTHORITATIVE)`, usage HELD |
+| `PARTIALLY_FILLED`, authoritative, bound, valid effect id, 0 < amount <= authorized | | `CONFIRMED (SETTLEMENT_PARTIAL_FILL_OPEN)`, usage HELD; reconciled again later, never resubmitted |
+| `PARTIALLY_FILLED`, authoritative, bound, valid effect id, amount 0 | not `PAY` (`PAYMENT_PARTIAL_NOT_ALLOWED` stops) | `CONFIRMED (SETTLEMENT_ORDER_OPEN)`, usage HELD; the order is admitted and resting |
+| any positive status or `CANCELLED`, authoritative, amount below the last accepted cumulative fill | a fill was recorded | `STOPPED (SETTLEMENT_FILL_REGRESSED)`, usage HELD |
+| `CANCELLED`, authoritative, filled amount > 0 | | `FINALIZED (SETTLEMENT_CANCELLED_AFTER_PARTIAL_FILL)`, usage COMMITTED |
+| `CANCELLED`, authoritative, nothing filled | no fill recorded (an open order counts as none) | `FAILED_SAFE (SETTLEMENT_CANCELLED_UNFILLED)`, usage RELEASED, no resubmission under this intent |
+| `CANCELLED`, authoritative, nothing filled | effect id owned by another intent at this venue (decided by the unique index in the release transaction) | `STOPPED (EFFECT_ID_ALREADY_CLAIMED)`, usage HELD |
+| `CANCELLED`, authoritative, nothing filled | a fill was recorded | `STOPPED (SETTLEMENT_CANCEL_CONTRADICTS_RECORDED_EFFECT)`, usage HELD |
+| `CONFIRMED`/`FINALIZED`/`PARTIALLY_FILLED`, not authoritative | | `UNKNOWN (SETTLEMENT_POSITIVE_NOT_AUTHORITATIVE)`, usage HELD |
+| `CANCELLED`, not authoritative | | `UNKNOWN (SETTLEMENT_CANCEL_NOT_AUTHORITATIVE)`, usage HELD |
 | `NONE`, not authoritative | | `UNKNOWN (SETTLEMENT_NONE_NOT_AUTHORITATIVE)`, usage HELD |
 | `NONE`, authoritative | last attempt's permit window still open | `UNKNOWN (SETTLEMENT_NONE_WITHIN_PERMIT_WINDOW)`, usage HELD |
-| `NONE`, authoritative | window closed, resubmission blocked | `FAILED_SAFE` (deterministic adapter failure) or `STOPPED` (grant not active), usage RELEASED |
+| `NONE`, authoritative | window closed, a permit of this intent was consumed | `STOPPED (SETTLEMENT_NONE_AFTER_PERMIT_CONSUMED)`, usage HELD; unconsumed permits voided |
+| `NONE`, authoritative | window closed, no permit consumed, resubmission blocked | `FAILED_SAFE` (deterministic adapter failure) or `STOPPED` (grant not active), usage RELEASED; unconsumed permits voided |
 | `NONE`, authoritative | window closed, retry predicates hold | new submission attempt |
 | `NONE`, authoritative | window closed, a retry predicate fails | `STOPPED` with the failing predicate, usage RELEASED |
 | `UNKNOWN` (including a quorum short of votes because sources were unreachable) | | `UNKNOWN (SETTLEMENT_UNKNOWN)`, usage HELD |
 | `CONTRADICTORY` | any authority | `STOPPED (SETTLEMENT_CONTRADICTORY)`, usage HELD |
-| verifier raised | | `UNKNOWN (RECONCILIATION_EXCEPTION)`, usage HELD |
+| verifier raised (including a record that fails its own bounds) | | `UNKNOWN (RECONCILIATION_EXCEPTION)`, usage HELD |
+| verifier returned something other than a `SettlementRecord`, or a record the chain cannot carry | | `STOPPED (SETTLEMENT_RECORD_MALFORMED)`, usage HELD |
 | authoritative record bound to a different request | | `STOPPED (SETTLEMENT_REQUEST_BINDING_MISMATCH)`, usage HELD |
 | authoritative positive record with malformed effect id | | `STOPPED (SETTLED_EFFECT_ID_INVALID)`, usage HELD |
 | authoritative record contradicting a recorded effect | previous effect id known | `STOPPED (SETTLEMENT_LOST_PREVIOUS_EFFECT / SETTLEMENT_EFFECT_ID_MISMATCH)`, usage HELD |
@@ -47,6 +57,8 @@ Pre-settlement terminal paths:
 | permit issuance refused / raised | `FAILED_SAFE (EXECUTION_PERMIT_REJECTED / EXECUTION_PERMIT_EXCEPTION)`, usage RELEASED (no capability was transported) |
 | permit issuance refused because an earlier permit for this intent is still live | `UNKNOWN (EXECUTION_PERMIT_REJECTED, PERMIT_PREVIOUS_ATTEMPT_LIVE)`, usage HELD; reconcile after the recorded window |
 | evidence chain refuses an append | no transition; result `EVIDENCE_INTEGRITY_FAILURE` (operator: `rebuild-evidence-head`) |
+| too many abandoned adapter calls still running in this process | `STOPPED (ADAPTER_ORPHAN_LIMIT_REACHED)`, usage RELEASED (no permit was minted) |
+| scope exposure cap would be exceeded | `DEFERRED (EXPOSURE_CAP_EXCEEDED)` at reservation time |
 | grant not ACTIVE (paused, revoked, halted, regressed) before submission | `STOPPED (GRANT_RUNTIME_<STATUS>)`, usage RELEASED |
 | grant not ACTIVE while an attempt is in flight | reconcile with resubmission blocked; effect is still recorded if found |
 | adapter missing | `STOPPED (ADAPTER_NOT_CONFIGURED)`; usage RELEASED only from PROPOSED/AUTHORIZED/RESERVED |
@@ -131,3 +143,16 @@ the lost history are reconciled by hand. See [`OPERATIONS.md`](OPERATIONS.md) §
 
 `submission_count` is persisted so restarting the process does not reset retry
 authority. The default reference limit is intentionally small.
+
+## Crash recovery at every persistence boundary
+
+`FINALIZED` and the usage commit are one store transaction, as are every
+terminal transition and its release. `evals/run_crash_injection.py` (`make crash`)
+kills a worker process immediately before each store call a clean run makes, for
+seven scenarios (success, timeout before and after the effect, ambiguous venue,
+deterministic rejection, partial fill then cancel), then recovers exactly as
+`OPERATIONS.md` §2 prescribes and asserts: at most one effect and two adapter
+calls, an effect implies `FINALIZED` with usage `COMMITTED`, a terminal intent
+without an effect has released its budget (unless the stop is settlement-derived),
+and recovery never raises or ends non-terminal. A replay of a `FINALIZED` intent
+whose budget is still `HELD` (a row written by an older version) commits it.

@@ -200,6 +200,182 @@ ATTACK_CLASSES: dict[str, tuple[str, ...]] = {
         "test_store_hardening.LegacyChainTests.test_tampered_chain_is_not_adopted_by_the_bulk_rebuild",
         "test_cli.OperatorCliTests.test_rebuild_evidence_heads_for_a_legacy_database",
     ),
+    # --- live-money pass: order semantics, exposure, crash safety ----------------------
+    "partial fill remainder resubmitted as a second order": (
+        "test_partial_fills.PartialFillTests.test_partial_fill_confirms_with_its_effect_and_never_resubmits",
+        "test_partial_fills.PartialFillTests.test_mock_venue_partial_fill_completes_or_cancels_without_a_second_order",
+    ),
+    "cancellation contradicting or releasing a recorded fill": (
+        "test_partial_fills.PartialFillTests.test_cancel_after_partial_fill_finalizes_the_filled_effect",
+        "test_partial_fills.PartialFillTests.test_cancel_reporting_no_fill_after_a_recorded_fill_stops",
+        "test_partial_fills.PartialFillTests.test_recorded_partial_fill_then_authoritative_none_stops",
+    ),
+    "unfilled cancellation resubmitted under the same intent": ("test_partial_fills.PartialFillTests.test_cancel_without_fill_fails_safe_releases_and_never_resubmits",),
+    "partial fill beyond the authorized notional or on PAY": (
+        "test_partial_fills.PartialFillTests.test_partial_fill_integrity_checks",
+        "test_partial_fills.PartialFillTests.test_pay_cannot_partially_fill",
+    ),
+    "weak partial-fill or cancel observation acted on": ("test_partial_fills.PartialFillTests.test_weak_partial_or_cancel_observations_carry_no_weight",),
+    "quorum split on the filled amount": ("test_partial_fills.PartialFillTests.test_quorum_agrees_on_partial_fills_and_contests_differing_fills",),
+    "fleet exposure beyond the funded cap": (
+        "test_exposure_cap.ExposureCapTests.test_global_cap_bounds_the_whole_fleet_across_grants_and_principals",
+        "test_exposure_cap.ExposureCapTests.test_principal_cap_isolates_principals_and_can_be_cleared",
+        "test_exposure_cap.ExposureCapTests.test_runtime_defers_an_intent_over_the_cap_before_any_permit",
+    ),
+    "exposure cap changed without the anchor": ("test_exposure_cap.ExposureCapTests.test_caps_are_authority_changes_on_an_anchored_database",),
+    "unbounded abandoned adapter calls": ("test_orphan_cap.OrphanedAdapterCallCapTests.test_process_stops_submitting_while_too_many_abandoned_calls_are_running",),
+    "crash between finalize and commit stranding budget": ("test_runtime_hardening.RuntimeHardeningTests.test_finalize_and_commit_are_one_transaction_and_replay_repairs_older_rows",),
+    # --- live-money pass: compromised adapter, malicious settlement source ------------
+    "permit for one venue consumed at another venue's gateway": ("test_live_money_redteam.CompromisedAdapterTests.test_permit_for_one_venue_is_refused_by_another_venues_gateway",),
+    "adapter-controlled content crashing the state machine": (
+        "test_live_money_redteam.CompromisedAdapterTests.test_adapter_content_cannot_crash_the_state_machine",
+        "test_live_money_redteam.CompromisedAdapterTests.test_base_exception_from_the_adapter_is_recorded_before_it_propagates",
+    ),
+    "consumed permit with authoritative absence released or retried": (
+        "test_live_money_redteam.CompromisedAdapterTests.test_consumed_permit_with_authoritative_absence_stops_instead_of_releasing",
+        "test_live_money_redteam.CompromisedAdapterTests.test_permit_is_voided_when_absence_is_acted_on_whatever_the_venue_clock_says",
+    ),
+    "malformed or unbounded settlement content": (
+        "test_live_money_redteam.MaliciousSettlementSourceTests.test_malformed_settlement_content_fails_in_the_verifier_not_after_reconciling",
+        "test_live_money_redteam.MaliciousSettlementSourceTests.test_dag_shaped_evidence_is_bounded_by_the_node_budget",
+    ),
+    "finality lag between quorum members treated as a contest": ("test_live_money_redteam.MaliciousSettlementSourceTests.test_finality_lag_between_sources_is_not_a_contest",),
+    "garbage-returning quorum member wedging the quorum": ("test_live_money_redteam.MaliciousSettlementSourceTests.test_a_garbage_returning_minority_member_cannot_wedge_the_quorum",),
+    "definition of done decoupled from the runtime verdict": ("test_live_money_redteam.MaliciousSettlementSourceTests.test_outcome_verifier_follows_the_runtime_verdict",),
+    "quorum aggregate failing its own evidence bounds": (
+        "test_live_money_redteam.MaliciousSettlementSourceTests.test_quorum_aggregate_never_fails_its_own_bounds",
+        "test_live_money_redteam.MaliciousSettlementSourceTests.test_overlong_member_effect_id_cannot_wedge_the_quorum",
+    ),
+    "Decimal subclass lying about comparison or formatting": ("test_live_money_redteam.MaliciousSettlementSourceTests.test_decimal_subclass_never_survives_record_construction",),
+    "exposure cap blocking zero-notional actions or raising on corrupt rows": (
+        "test_exposure_cap.ExposureCapTests.test_zero_notional_actions_pass_a_cap_tightened_below_current_turnover",
+        "test_exposure_cap.ExposureCapTests.test_unreadable_stored_cap_fails_closed_with_a_reason",
+    ),
+    # --- live-money pass: chaos engineer, time attacker --------------------------------
+    "anchor behind the datastore after a crash or anchor failure": (
+        "test_chaos_and_time.AnchorOrderingTests.test_authority_never_exists_without_its_anchor_mark",
+        "test_chaos_and_time.AnchorOrderingTests.test_stopping_commits_even_when_the_anchor_fails_and_loosening_does_not",
+    ),
+    "stalled anchor lock hanging workers and the halt": ("test_chaos_and_time.AnchorOrderingTests.test_anchor_lock_wait_is_bounded_and_the_halt_still_commits",),
+    "lease without liveness identity cleared under a live worker": (
+        "test_chaos_and_time.LeaseAndBusyStoreTests.test_lease_records_liveness_and_refuses_to_clear_a_live_local_owner",
+        "test_chaos_and_time.LeaseAndBusyStoreTests.test_owner_can_reacquire_its_own_lease_after_a_failed_release",
+    ),
+    "busy datastore escaping as a traceback": ("test_chaos_and_time.LeaseAndBusyStoreTests.test_busy_datastore_is_a_result_not_a_traceback",),
+    "checkpoint reporting success while WAL frames remain": ("test_chaos_and_time.LeaseAndBusyStoreTests.test_checkpoint_reports_when_the_wal_could_not_be_folded",),
+    "trailing window shortened by second truncation": ("test_chaos_and_time.TimeBoundaryTests.test_trailing_windows_are_never_shorter_than_configured",),
+    "unbounded time limits, skews, or a naive clock crashing the runtime": (
+        "test_chaos_and_time.TimeBoundaryTests.test_time_valued_limits_and_skews_are_bounded",
+        "test_chaos_and_time.TimeBoundaryTests.test_naive_clock_fails_before_anything_is_registered",
+    ),
+    "foreign grant shortening an in-flight intent's ambiguity window": ("test_chaos_and_time.TimeBoundaryTests.test_reconciliation_is_bound_to_the_intents_own_grant",),
+    # --- live-money pass: operator and authority --------------------------------------
+    "fresh or replaced anchor un-regressing a restored database": (
+        "test_operator_redteam.AnchorIdentityTests.test_a_fresh_or_different_anchor_cannot_un_regress_a_restored_database",
+        "test_operator_redteam.AnchorIdentityTests.test_databases_bound_before_identities_existed_adopt_the_anchor_identity",
+    ),
+    "evidence truncation laundered through the head rebuild": ("test_operator_redteam.EvidenceLaunderingTests.test_a_deleted_head_is_tampering_not_a_legacy_chain",),
+    "halt or cap on a mistyped principal reporting success": ("test_operator_redteam.ControlScopeTests.test_controls_refuse_scopes_that_match_nothing",),
+    "restore reinstating a looser exposure cap": ("test_operator_redteam.ControlScopeTests.test_exposure_caps_are_anchored_against_restore",),
+    # --- live-money pass: economic logic ----------------------------------------------
+    "velocity slot freed by cancelled or rejected attempts (order spam through FAAR)": (
+        "test_economic_redteam.VelocityBoundsVenueAttemptsTests.test_cancelled_unfilled_attempts_keep_their_velocity_slot",
+        "test_economic_redteam.VelocityBoundsVenueAttemptsTests.test_store_counts_submitted_rows_after_release_but_not_unsubmitted_ones",
+    ),
+    "grant re-provisioning restarting the trailing windows": (
+        "test_economic_redteam.WindowsSpanGrantVersionsTests.test_new_grant_version_does_not_restart_turnover_or_velocity_windows",
+    ),
+    "slippage cap enforced only on a signer claim, not at execution": (
+        "test_economic_redteam.ExecutorSideSlippageBoundTests.test_capped_grant_requires_a_bound_no_looser_than_the_cap",
+        "test_economic_redteam.ExecutorSideSlippageBoundTests.test_orders_may_carry_a_limit_price_instead",
+        "test_economic_redteam.ExecutorSideSlippageBoundTests.test_bound_travels_in_the_hash_bound_request",
+        "test_economic_redteam.ExecutorSideSlippageBoundTests.test_runtime_denies_an_unbounded_swap_before_the_adapter",
+    ),
+    "risk state version owned by a retry reserved by another intent": (
+        "test_economic_redteam.RiskVersionOwnershipTests.test_reservation_refuses_a_version_the_permit_ledger_bound_to_another_intent",
+        "test_permits.PermitBoundaryTests.test_fresh_retry_risk_state_cannot_be_reused_by_different_intent",
+    ),
+    "shrinking cumulative fill accepted as newer truth": (
+        "test_economic_redteam.FillMonotonicityTests.test_a_shrinking_cumulative_fill_stops_the_intent",
+        "test_economic_redteam.FillMonotonicityTests.test_equal_or_growing_fills_progress",
+        "test_economic_redteam.FillMonotonicityTests.test_cancel_with_nothing_filled_after_a_fill_keeps_its_own_code",
+    ),
+    "admitted unfilled order stopped before it fills": (
+        "test_economic_redteam.OpenOrderTests.test_an_admitted_unfilled_order_is_open_not_a_stop",
+        "test_economic_redteam.OpenOrderTests.test_an_open_order_cancelled_unfilled_fails_safe_and_releases",
+        "test_economic_redteam.OpenOrderTests.test_an_open_order_that_starts_filling_becomes_a_partial_fill",
+        "test_economic_redteam.OpenOrderTests.test_an_open_order_that_vanishes_is_a_lost_effect",
+        "test_economic_redteam.OpenOrderTests.test_mock_venue_open_order_end_to_end",
+    ),
+    "JSON numbers bypassing the money grammar": (
+        "test_economic_redteam.JsonNumberGrammarTests.test_json_numbers_take_the_string_grammar",
+        "test_economic_redteam.JsonNumberGrammarTests.test_gate_and_ledger_reject_numbers_outside_the_grammar",
+    ),
+    # --- live-money pass: state machine and resources ---------------------------------
+    "public reconcile() ignoring the durable resubmission block": (
+        "test_state_machine_redteam.DurableBlockTests.test_public_reconcile_with_fresh_authorization_honours_the_block",
+        "test_state_machine_redteam.DurableBlockTests.test_bare_reconcile_keeps_the_block_on_the_row",
+    ),
+    "resubmission block wiped by the RECONCILING transition": (
+        "test_state_machine_redteam.DurableBlockTests.test_block_survives_a_worker_dying_during_the_settlement_lookup",
+    ),
+    "reconcile before submission without a reason code": (
+        "test_state_machine_redteam.DurableBlockTests.test_reconcile_before_submission_is_machine_readable_and_mutates_nothing",
+    ),
+    "terminal stop leaving a live permit for a late venue call": (
+        "test_state_machine_redteam.StopVoidsPermitsTests.test_settlement_derived_stops_void_the_live_permit",
+    ),
+    "unfilled cancel carrying another intent's order identity released as absence": (
+        "test_state_machine_redteam.StopVoidsPermitsTests.test_cancel_carrying_another_intents_order_identity_stops",
+    ),
+    "untrusted payload content copied into reason codes and evidence": (
+        "test_state_machine_redteam.ReasonCodeBoundsTests.test_gate_reason_codes_never_carry_untrusted_content_verbatim",
+        "test_state_machine_redteam.ReasonCodeBoundsTests.test_store_refuses_oversized_reason_codes_and_evidence_rows",
+    ),
+    "multi-megabyte intent document accepted, canonicalised and stored": (
+        "test_state_machine_redteam.IntentByteBudgetTests.test_intent_documents_are_bounded_in_bytes_not_only_nodes",
+    ),
+    "per-intent lookups degrading to table scans with history": (
+        "test_state_machine_redteam.IndexCoverageTests.test_per_intent_and_window_lookups_use_indexes",
+    ),
+    "orphaned-call cap multiplied by runtime instances": (
+        "test_state_machine_redteam.OrphanCapScopeTests.test_the_orphan_cap_is_process_wide",
+    ),
+    # --- self-review of the live-money pass ------------------------------------------
+    "unfilled-cancel identity check overtaken by a concurrent claim": (
+        "test_selfreview_redteam.AtomicIdentityClaimTests.test_unfilled_cancel_release_cannot_be_overtaken_by_a_concurrent_claim",
+    ),
+    "grant id shared across principals exhausting another tenant's window": (
+        "test_selfreview_redteam.PrincipalScopedWindowsTests.test_windows_are_per_principal_and_grant_id_and_count_legacy_rows",
+    ),
+    "anchor left behind by a committed stop, re-run a silent no-op": (
+        "test_selfreview_redteam.AnchorRepairTests.test_a_stop_whose_anchor_write_failed_is_repaired_on_rerun_and_on_open",
+    ),
+    "pause or revoke rolled back by an unreadable anchor": (
+        "test_selfreview_redteam.AnchorRepairTests.test_stops_commit_under_an_unreadable_anchor_and_loosening_does_not",
+        "test_selfreview_redteam.AnchorRepairTests.test_cli_reports_whether_a_stop_committed",
+    ),
+    "lease token bound to a thread wedging a pooled worker": (
+        "test_selfreview_redteam.LeaseTokenTests.test_any_thread_of_the_owning_instance_reacquires_its_lease",
+        "test_selfreview_redteam.LeaseTokenTests.test_release_wait_is_bounded_and_the_owner_recovers",
+    ),
+    "pre-release head-writing databases classified as legacy chains": (
+        "test_selfreview_redteam.HeadsSinceTests.test_databases_written_by_an_earlier_head_writing_build_are_not_legacy",
+    ),
+    "authority reason codes too large to persist a terminal decision": (
+        "test_selfreview_redteam.BoundedAuthorityAndOutcomeTests.test_authority_reason_codes_are_bounded_at_construction",
+    ),
+    "task-outcome evaluation record exceeding the canonical budget": (
+        "test_selfreview_redteam.BoundedAuthorityAndOutcomeTests.test_an_outcome_evaluation_past_the_budget_is_not_done",
+    ),
+    "trade grant without a slippage cap, or a market order with a decorative limit price": (
+        "test_selfreview_redteam.TradeGrantsRequireSlippageCapTests.test_a_trade_grant_cannot_omit_the_cap",
+        "test_selfreview_redteam.TradeGrantsRequireSlippageCapTests.test_a_limit_price_only_bounds_a_declared_limit_order",
+    ),
+    "operator commands dying on a write-locked datastore": (
+        "test_selfreview_redteam.ReadOnlyOpenTests.test_operator_reads_do_not_need_the_write_lock",
+        "test_selfreview_redteam.ReadOnlyOpenTests.test_a_busy_datastore_is_a_typed_refusal_for_the_cli",
+    ),
 }
 
 

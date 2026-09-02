@@ -43,7 +43,13 @@ ACTIVE/PAUSED -> REVOKED
 REVOKED -X-> ACTIVE
 ```
 
-A revoked version cannot be resurrected; create a new version instead.
+A revoked version cannot be resurrected; create a new version instead. Trailing
+turnover and velocity windows are summed over every version of a grant id owned
+by the same principal, so a new version never restarts a budget; its own limits
+apply to the total. A grant that allows SWAP, BUY, SELL or PLACE_ORDER must set
+`limits.max_slippage_bps`: it is the cap the executor-side bound in every trade
+request is checked against (I-39), and a grant without it is refused at
+construction and by the schema.
 
 ## Revocation and ambiguous effects
 

@@ -66,11 +66,11 @@ Before resubmission, FAAR rechecks intent expiry, grant expiry/status, signed au
 
 ## I-13 — Aggregate usage is atomic
 
-Turnover and velocity constraints are reserved transactionally across distinct intents. Both are trailing windows (24 h and `action_window_seconds`), never calendar buckets. A money-moving intent whose amount cannot be parsed as a bounded decimal cannot reserve.
+Turnover and velocity constraints are reserved transactionally across distinct intents. Both are trailing windows (24 h and `action_window_seconds`), never calendar buckets, and both span every version of a grant id for the principal that owns it (a new version never restarts a budget; rows migrated without a principal count for every principal of the grant id). Velocity bounds venue actions, not effects: a reservation that began an attempt keeps its slot for the window even after its budget was released. A retry of the same intent is the same row, so venue attempts per window are bounded by `max_actions_per_window x max_submission_attempts`. A money-moving intent whose amount cannot be parsed as a bounded decimal cannot reserve.
 
 ## I-14 — Risk state is single-consumption and monotonic
 
-A `(grant_id, version, risk_scope, state_version)` authorizes at most one new economic intent, and a version older than one already consumed by any intent or retry is refused in both ledgers.
+A `(grant_id, version, risk_scope, state_version)` authorizes at most one new economic intent, a version older than one already consumed by any intent or retry is refused in both ledgers, and reservation refuses the exact version another intent's retry bound in the permit ledger (`RISK_STATE_VERSION_ALREADY_CLAIMED`).
 
 ## I-15 — Upstream decisions are intent-bound
 
@@ -86,7 +86,7 @@ In-process: once `set_grant_status(REVOKED)` returns, no later adapter submissio
 
 ## I-18 — Malformed numeric/time data fails closed
 
-NaN, infinity, invalid negative ages/limits, naive timestamps, impossible TTLs, over-long identifiers, oversized integers, non-canonical numeric strings, and amounts beyond canonical precision/exponent bounds cannot be interpreted as a permissive value or exhaust memory.
+NaN, infinity, invalid negative ages/limits, naive timestamps, impossible TTLs, over-long identifiers, oversized integers, non-canonical numeric strings and numbers (a JSON number is admitted only when its shortest form satisfies the string grammar), and amounts beyond canonical precision/exponent bounds cannot be interpreted as a permissive value. Every untrusted document is bounded in nodes, depth and bytes (`MAX_CANONICAL_TOTAL_BYTES`) while it is frozen, so it cannot exhaust memory before it is rejected; gate reason codes never carry payload content verbatim, and the store refuses oversized reason-code lists and evidence rows.
 
 ## I-19 — Evidence is append-linked and head-committed
 
@@ -138,7 +138,7 @@ An `intent_id`, its usage reservation, its permits and its evidence belong to on
 
 ## I-30 — In-flight attempts are bounded by their permit
 
-Any attempt can be acted on by the venue until its permit expires, whatever the adapter reported (timeout, exception, deterministic rejection, receipt, or an uninterpretable value). The store persists that instant together with the permit, the runtime neither trusts absence nor retries before it has passed, the store refuses a second live permit for one intent, and a later permit supersedes an earlier one at consumption (`test_runtime_hardening`, `test_permits`, `evals/model_check_permit_protocol.py`).
+Any attempt can be acted on by the venue until its permit expires, whatever the adapter reported (timeout, exception, deterministic rejection, receipt, or an uninterpretable value). The store persists that instant together with the permit, the runtime neither trusts absence nor retries before it has passed, the store refuses a second live permit for one intent, a later permit supersedes an earlier one at consumption, and before absence is acted on every unconsumed permit is voided and a consumed one turns absence into a STOP (`test_runtime_hardening`, `test_permits`, `test_live_money_redteam`, `evals/model_check_permit_protocol.py`).
 
 ## I-31 — Adapter calls are bounded
 
@@ -150,8 +150,32 @@ With `adapter_deadline_seconds` configured, a hung adapter call cannot hold the 
 
 ## I-33 — Consumed authority cannot be resurrected by restore
 
-With an authority anchor kept outside the backup set, a grant version whose `(runtime_epoch, fence_counter)` regressed behind the anchor is `REGRESSED`: no permit is issued or consumed under it and its lifecycle cannot be changed except by `revoke_after_restore`. The fence counter advances at issuance and at consumption, so a snapshot between the two is detected. Once a database has been opened with an anchor, an instance without one cannot consume or change authority (`ANCHOR_REQUIRED`), and an unreadable anchor fails closed (`ANCHOR_UNAVAILABLE`). Without an anchor this invariant does not hold; the test suite documents that ceiling.
+With an authority anchor kept outside the backup set, a grant version whose `(runtime_epoch, fence_counter)` regressed behind the anchor is `REGRESSED`: no permit is issued or consumed under it and its lifecycle cannot be changed except by `revoke_after_restore`. The fence counter advances at issuance and at consumption, so a snapshot between the two is detected; the mark is raised inside the datastore transaction, so authority never exists without it. Stop-direction changes (pause, revoke, halt, cap tightening, `revoke_after_restore`) commit even when the anchor is unreachable or unreadable and report `AnchorUnavailableAfterCommit`; the mark they could not raise is raised by re-running the stop and at every anchored open, so the anchor can never stay behind the datastore. Loosening (re-activation, cap loosening) rolls back on any anchor failure. Once a database has been opened with an anchor, an instance without one cannot consume or change authority (`ANCHOR_REQUIRED`), and an unreadable anchor fails closed (`ANCHOR_UNAVAILABLE`). Without an anchor this invariant does not hold; the test suite documents that ceiling.
 
 ## I-34 — Key lifecycle is enforced at verification
 
 Attestation keys and permit signers carry optional validity windows and a revocation flag; artifacts issued outside a window or under a revoked key are rejected, unknown key ids are always rejected, and an artifact issued inside a window remains verifiable for its own lifetime after the window closes. Because `issued_at` is signer-controlled, verifiers also bound each artifact's lifetime (`ATTESTATION_TTL_EXCEEDED`, `PERMIT_TTL_EXCEEDED`), capping a retired key's exposure to `not_after + lifetime`; revocation remains the hard control.
+
+## I-35 — Partial fills and cancellations never create a second attempt
+
+An authoritative `PARTIALLY_FILLED` record confirms the intent with the order's effect id and is reconciled again later; a zero cumulative amount is an admitted, open order (`SETTLEMENT_ORDER_OPEN`); the unfilled remainder is never resubmitted. The last accepted cumulative fill is persisted and never decreases (`SETTLEMENT_FILL_REGRESSED`). `CANCELLED` is terminal: with a fill it finalizes the intent, without one it fails safe and releases the budget while claiming the order identity in the same transaction (another owner is `EFFECT_ID_ALREADY_CLAIMED`, budget held), and it never contradicts a recorded fill silently (`test_partial_fills`, `test_economic_redteam`, `test_selfreview_redteam`).
+
+## I-36 — Abandoned adapter calls are bounded
+
+A call abandoned at the adapter deadline keeps running; the runtime counts them and refuses to submit (`ADAPTER_ORPHAN_LIMIT_REACHED`, budget released, no permit minted) while more than `max_orphaned_adapter_calls` are outstanding in the process (`test_orphan_cap`).
+
+## I-37 — Fleet exposure is capped independently of grants
+
+An operator cap on trailing-window turnover per scope (`global`, `principal:<id>`) is enforced atomically inside `reserve_usage` across every grant and principal in the scope (`EXPOSURE_CAP_EXCEEDED`); tightening or loosening it is an authority change and requires the anchor on an anchored database (`test_exposure_cap`).
+
+## I-38 — Every persistence boundary is crash-safe
+
+Finalize-and-commit and terminalize-and-release are single store transactions, and a worker killed before any store call can be recovered by the documented runbook without a duplicate effect, a lost effect, or stranded budget (`evals/run_crash_injection.py`).
+
+## I-39 — A slippage cap is an execution-side bound
+
+A grant that allows SWAP/BUY/SELL/PLACE_ORDER must set `max_slippage_bps` (a missing financial limit never reads as infinity), and every such request must carry `max_slippage_bps` (an order declared `order_type: limit` may carry `limit_price` instead), typed and no looser than the cap; the bound is part of the sanitized request and therefore of the permit's request hash, so the adapter cannot drop it without invalidating the permit. `RiskSnapshot.requested_slippage_bps` remains a signer claim about the snapshot (`test_economic_redteam.ExecutorSideSlippageBoundTests`, `test_selfreview_redteam`).
+
+## I-40 — Terminal means no live capability and no forgotten block
+
+Every terminal stop voids the attempt's unconsumed permits before the transition, so a queued or late venue call cannot create an effect the ledger no longer attributes; the durable deterministic-failure block binds every entry point and travels with the row through `RECONCILING` (`test_state_machine_redteam`).

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from datetime import datetime, timedelta
 from decimal import Decimal
 
@@ -57,6 +58,33 @@ def _assets(intent: Intent) -> set[str]:
     return {str(intent.payload[f]) for f in fields if intent.payload.get(f) not in (None, "")}
 
 
+# Reason codes are persisted on the intent row and copied into evidence, so they
+# never carry untrusted content verbatim: offending names are sanitised to a
+# fixed alphabet and truncated, and only a few are listed.
+_REASON_DETAIL_ITEMS = 8
+_REASON_DETAIL_CHARS = 32
+_REASON_DETAIL_UNSAFE = re.compile(r"[^A-Za-z0-9_.:/-]")
+
+
+def _bounded_names(names) -> str:
+    ordered = sorted(str(n) for n in names)
+    shown = [_REASON_DETAIL_UNSAFE.sub("?", n[:_REASON_DETAIL_CHARS]) for n in ordered[:_REASON_DETAIL_ITEMS]]
+    extra = len(ordered) - len(shown)
+    if extra > 0:
+        shown.append(f"+{extra}")
+    return ",".join(shown)
+
+
+# Executor-side slippage bound (basis points). Unlike `RiskSnapshot.requested_
+# slippage_bps`, which is a signer claim about the snapshot, this field travels
+# in the sanitized request, is bound into the permit's request hash, and must be
+# enforced by the adapter at the venue (min-out / limit price).
+MAX_SLIPPAGE_BPS = 10_000
+_SLIPPAGE_BOUND_PRIMITIVES = frozenset({
+    EconomicPrimitive.SWAP, EconomicPrimitive.BUY, EconomicPrimitive.SELL, EconomicPrimitive.PLACE_ORDER,
+})
+
+
 _RAW_EXECUTION_FIELDS = {
     "raw_calldata",
     "calldata",
@@ -75,18 +103,18 @@ _RAW_EXECUTION_FIELDS = {
 # Strategy/debug context belongs in Intent.metadata, which adapters must ignore.
 _ALLOWED_PAYLOAD_FIELDS: dict[EconomicPrimitive, frozenset[str]] = {
     EconomicPrimitive.PAY: frozenset({"asset", "amount_usd", "target", "payment_reference"}),
-    EconomicPrimitive.SWAP: frozenset({"from_asset", "to_asset", "amount_usd", "target"}),
+    EconomicPrimitive.SWAP: frozenset({"from_asset", "to_asset", "amount_usd", "target", "max_slippage_bps"}),
     EconomicPrimitive.BUY: frozenset({
         "base_asset", "quote_asset", "amount_usd", "notional_usd", "target",
-        "order_type", "limit_price", "time_in_force",
+        "order_type", "limit_price", "time_in_force", "max_slippage_bps",
     }),
     EconomicPrimitive.SELL: frozenset({
         "base_asset", "quote_asset", "amount_usd", "notional_usd", "target",
-        "order_type", "limit_price", "time_in_force",
+        "order_type", "limit_price", "time_in_force", "max_slippage_bps",
     }),
     EconomicPrimitive.PLACE_ORDER: frozenset({
         "base_asset", "quote_asset", "amount_usd", "notional_usd", "target",
-        "order_type", "limit_price", "time_in_force",
+        "order_type", "limit_price", "time_in_force", "max_slippage_bps",
     }),
     EconomicPrimitive.CANCEL_ORDER: frozenset({"order_id", "target"}),
 }
@@ -100,7 +128,7 @@ def _validate_intent_shape(intent: Intent) -> list[str]:
     allowed = _ALLOWED_PAYLOAD_FIELDS[intent.primitive]
     unknown = sorted(set(payload) - allowed)
     if unknown:
-        reasons.append("UNKNOWN_EXECUTION_FIELDS:" + ",".join(unknown))
+        reasons.append("UNKNOWN_EXECUTION_FIELDS:" + _bounded_names(unknown))
 
     if intent.primitive == EconomicPrimitive.PAY:
         for field in ("asset", "amount_usd", "target"):
@@ -128,6 +156,16 @@ def _validate_intent_shape(intent: Intent) -> list[str]:
     elif intent.primitive == EconomicPrimitive.CANCEL_ORDER:
         if payload.get("order_id") in (None, ""):
             reasons.append("PAYLOAD_FIELD_REQUIRED:order_id")
+    # Executor-side price bounds are typed like every other economic field: a
+    # bound the adapter cannot interpret is not a bound.
+    if "max_slippage_bps" in payload:
+        bound = payload["max_slippage_bps"]
+        if isinstance(bound, bool) or not isinstance(bound, int) or not 0 <= bound <= MAX_SLIPPAGE_BPS:
+            reasons.append("SLIPPAGE_BOUND_INVALID")
+    if "limit_price" in payload:
+        price = _decimal(payload["limit_price"])
+        if price is None or price <= 0:
+            reasons.append("LIMIT_PRICE_INVALID")
     return reasons
 
 
@@ -181,7 +219,7 @@ def evaluate_capability(intent: Intent, grant: CapabilityGrant, now: datetime) -
     if grant.allowed_assets:
         unknown = sorted(assets - grant.allowed_assets)
         if unknown:
-            reasons.append("ASSET_NOT_ALLOWED:" + ",".join(unknown))
+            reasons.append("ASSET_NOT_ALLOWED:" + _bounded_names(unknown))
 
     amount_raw = intent.payload.get("amount_usd", intent.payload.get("notional_usd"))
     amount = _amount_usd(intent)
@@ -194,6 +232,26 @@ def evaluate_capability(intent: Intent, grant: CapabilityGrant, now: datetime) -
             reasons.append("MAX_ORDER_USD_EXCEEDED")
     elif intent.primitive in MONETARY_PRIMITIVES:
         reasons.append("AMOUNT_REQUIRED")
+
+    # A grant that caps slippage promises a control the execution boundary must
+    # be able to honour: the request itself must carry an executor-side bound no
+    # looser than the grant's (a swap without a min-out has no such bound; an
+    # order may carry a limit price instead).
+    slippage_cap = grant.limits.max_slippage_bps
+    if slippage_cap is not None and intent.primitive in _SLIPPAGE_BOUND_PRIMITIVES:
+        bound = intent.payload.get("max_slippage_bps")
+        # A limit price bounds the fill only for an order declared as a limit order;
+        # a market order with a decorative limit_price has no executor-side bound.
+        has_limit_price = (
+            intent.primitive != EconomicPrimitive.SWAP
+            and intent.payload.get("limit_price") is not None
+            and str(intent.payload.get("order_type", "")).lower() == "limit"
+        )
+        if bound is None:
+            if not has_limit_price:
+                reasons.append("PAYLOAD_FIELD_REQUIRED:max_slippage_bps")
+        elif isinstance(bound, int) and not isinstance(bound, bool) and bound > slippage_cap:
+            reasons.append("SLIPPAGE_BOUND_EXCEEDS_GRANT")
 
     return _decision("capability", reasons)
 

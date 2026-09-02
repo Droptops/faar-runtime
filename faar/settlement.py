@@ -28,6 +28,9 @@ class SettlementSecurityProfile:
 
 REFERENCE_SETTLEMENT_PROFILE = SettlementSecurityProfile(True, True, True, True)
 
+# Effect-id characters carried into aggregate (quorum) evidence per member.
+_FACT_ID_CHARS = 512
+
 
 class SettlementVerifier(Protocol):
     name: str
@@ -105,6 +108,22 @@ class QuorumSettlementVerifier:
             raise ValueError("settlement quorum sources must have unique identities")
 
     @staticmethod
+    def _fact_view(fact: tuple[str, str | None, str | None]) -> list:
+        """A fact as written into aggregate evidence: effect ids are truncated so a
+        member cannot inflate the aggregate record past the evidence bounds."""
+        status, effect_id, amount = fact
+        return [status, None if effect_id is None else effect_id[:_FACT_ID_CHARS], amount]
+
+    def _record(self, status: SettlementStatus, *, evidence: dict, compact: dict, **fields) -> SettlementRecord:
+        """Build the aggregate record; if the merged evidence exceeds the record
+        bounds (every member inside the bound, the sum outside it), fall back to
+        the compact form so an honest quorum can never fail its own constructor."""
+        try:
+            return SettlementRecord(status, evidence=evidence, **fields)
+        except ValueError:
+            return SettlementRecord(status, evidence={**compact, "evidence_truncated": True}, **fields)
+
+    @staticmethod
     def _fact(record: SettlementRecord) -> tuple[str, str | None, str | None]:
         # Vote on the numeric value, not its textual scale: Decimal("50") and
         # Decimal("50.00") from two honest sources are one fact, not a contradiction.
@@ -119,46 +138,70 @@ class QuorumSettlementVerifier:
         # know"; it can never contribute to a positive or negative quorum.
         observations: list[tuple[str, SettlementRecord]] = []
         errors: dict[str, str] = {}
-        for source in self.sources:
-            try:
-                observations.append((source.name, source.verify(request)))
-            except Exception as exc:
-                errors[source.name] = type(exc).__name__
-                observations.append((source.name, SettlementRecord(
-                    SettlementStatus.UNKNOWN, evidence={"verifier": source.name, "error": type(exc).__name__},
-                    authoritative=False,
-                )))
-        records = [record for _, record in observations]
         counts: dict[tuple[str, str | None, str | None], int] = {}
+        facts: list[tuple[str, str | None, str | None]] = []
         binding_mismatches = 0
-        for record in records:
+        for source in self.sources:
+            name = str(source.name)
+            try:
+                record = source.verify(request)
+                # Everything derived from a source's answer happens inside the
+                # per-source guard: a member that returns garbage instead of raising
+                # must not wedge the quorum either (I-8: zero weight in either direction).
+                if not isinstance(record, SettlementRecord):
+                    raise TypeError(f"source returned {type(record).__name__}")
+                fact = self._fact(record)
+            except Exception as exc:
+                errors[name] = type(exc).__name__
+                record = SettlementRecord(
+                    SettlementStatus.UNKNOWN, evidence={"verifier": name, "error": type(exc).__name__},
+                    authoritative=False,
+                )
+                fact = self._fact(record)
+            observations.append((name, record))
+            facts.append(fact)
             if not record.authoritative:
                 continue
             if record.verified_request_hash != expected_hash:
                 binding_mismatches += 1
                 continue
-            fact = self._fact(record)
             counts[fact] = counts.get(fact, 0) + 1
-        facts = [self._fact(r) for r in records]
+        records = [record for _, record in observations]
+        # Finality lag is not a contest. Independent sources cross the finality
+        # threshold at different times; CONFIRMED and FINALIZED for the same effect
+        # id and amount agree on *what* settled and differ only on *how final* it
+        # is. Reached finality is not vetoed by a lagging member; otherwise the
+        # weaker status carries the combined votes and the runtime reconciles again.
+        agree_statuses: set[str] = set()
+        if not binding_mismatches and len(counts) == 2:
+            keys = list(counts)
+            if {k[0] for k in keys} == {"CONFIRMED", "FINALIZED"} and len({(k[1], k[2]) for k in keys}) == 1:
+                final = next(k for k in keys if k[0] == "FINALIZED")
+                confirmed = next(k for k in keys if k[0] == "CONFIRMED")
+                if counts[final] >= self.quorum:
+                    counts = {final: counts[final]}
+                else:
+                    agree_statuses = {"CONFIRMED", "FINALIZED"}
+                    counts = {confirmed: counts[final] + counts[confirmed]}
+        fact_views = [self._fact_view(f) for f in facts]
         if binding_mismatches or len(counts) > 1:
             # Two distinct authoritative facts (a 2-2 split is the canonical case), or
             # an authoritative record bound to another request, is a contested
             # settlement: fail closed whether or not any fact reached quorum.
-            return SettlementRecord(
+            kind = "request-binding-mismatch" if binding_mismatches and len(counts) <= 1 else "contested"
+            return self._record(
                 SettlementStatus.CONTRADICTORY,
-                evidence={
-                    "quorum": "request-binding-mismatch" if binding_mismatches and len(counts) <= 1 else "contested",
-                    "required": self.quorum,
-                    "facts": facts,
-                    "binding_mismatches": binding_mismatches,
-                    "errors": errors,
-                },
+                evidence={"quorum": kind, "required": self.quorum, "facts": fact_views, "binding_mismatches": binding_mismatches, "errors": errors},
+                compact={"quorum": kind, "required": self.quorum, "binding_mismatches": binding_mismatches, "errors": errors},
                 authoritative=True,
                 verified_request_hash=expected_hash,
             )
         if not counts:
-            return SettlementRecord(
-                SettlementStatus.UNKNOWN, evidence={"quorum": "no-authoritative-facts", "errors": errors}, authoritative=False,
+            return self._record(
+                SettlementStatus.UNKNOWN,
+                evidence={"quorum": "no-authoritative-facts", "errors": errors},
+                compact={"quorum": "no-authoritative-facts"},
+                authoritative=False,
             )
         ((fact, count),) = counts.items()
         if count < self.quorum:
@@ -166,12 +209,13 @@ class QuorumSettlementVerifier:
             # or non-authoritative) is insufficient evidence, not a contradiction. A
             # weak UNKNOWN keeps the intent retriable; CONTRADICTORY would terminally
             # STOP an intent whose effect exists on a single transient source error.
-            return SettlementRecord(
+            return self._record(
                 SettlementStatus.UNKNOWN,
                 evidence={
                     "quorum": "quorum-not-reached", "votes": count, "required": self.quorum,
-                    "fact": list(fact), "facts": facts, "errors": errors,
+                    "fact": self._fact_view(fact), "facts": fact_views, "errors": errors,
                 },
+                compact={"quorum": "quorum-not-reached", "votes": count, "required": self.quorum, "fact": self._fact_view(fact)},
                 authoritative=False,
             )
         status = SettlementStatus(fact[0])
@@ -182,25 +226,31 @@ class QuorumSettlementVerifier:
         # per-source evidence is always available under `source_evidence`. The
         # runtime-owned standard fields (effect_id, amount_usd, status) still
         # override same-named evidence keys at outcome evaluation.
+        agree_statuses = agree_statuses or {fact[0]}
         agreeing = [
             (name, record) for name, record in observations
-            if record.authoritative and record.verified_request_hash == expected_hash and self._fact(record) == fact
+            if record.authoritative and record.verified_request_hash == expected_hash
+            and self._fact(record)[1:] == fact[1:] and self._fact(record)[0] in agree_statuses
         ]
         evidence: dict = {}
         if agreeing and len({canonical_hash(record.evidence) for _, record in agreeing}) == 1:
             evidence.update(dict(agreeing[0][1].evidence))
-        evidence.update({
+        summary = {
             "quorum": count,
             "required": self.quorum,
             "sources": [s.name for s in self.sources],
-            "source_evidence": {name: dict(record.evidence) for name, record in agreeing},
             "errors": errors,
-        })
-        return SettlementRecord(
-            status=status,
+        }
+        evidence.update({**summary, "source_evidence": {name: dict(record.evidence) for name, record in agreeing}})
+        # Members inside the evidence bound can still sum past it; the compact form
+        # keeps every member's evidence hash so the aggregate stays auditable.
+        compact = {**summary, "source_evidence_hashes": {name: canonical_hash(record.evidence) for name, record in agreeing}}
+        return self._record(
+            status,
+            evidence=evidence,
+            compact=compact,
             effect_id=fact[1],
             amount_usd=amount,
-            evidence=evidence,
             authoritative=True,
             verified_request_hash=expected_hash,
         )

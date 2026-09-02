@@ -18,7 +18,7 @@ class GateTests(unittest.TestCase):
             allowed_assets=frozenset({"AAA", "USD"}),
             limits=CapabilityLimits(
                 max_order_usd=Decimal("100"), max_daily_turnover_usd=Decimal("1000"),
-                max_actions_per_window=10, action_window_seconds=60,
+                max_actions_per_window=10, action_window_seconds=60, max_slippage_bps=100,
             ),
         )
         intent = Intent(
@@ -41,7 +41,7 @@ class GateTests(unittest.TestCase):
             limits=CapabilityLimits(
                 max_order_usd=Decimal("100"), max_position_usd=Decimal("100"),
                 max_daily_turnover_usd=Decimal("1000"), max_actions_per_window=10,
-                action_window_seconds=60,
+                action_window_seconds=60, max_slippage_bps=100,
             ),
         )
         intent = Intent(
@@ -64,7 +64,7 @@ class GateTests(unittest.TestCase):
                 allowed_assets=frozenset({"AAA", "USD"}),
                 limits=CapabilityLimits(
                     max_daily_turnover_usd=Decimal("1000"),
-                    max_actions_per_window=10, action_window_seconds=60,
+                    max_actions_per_window=10, action_window_seconds=60, max_slippage_bps=100,
                 ),
             )
 
@@ -76,7 +76,7 @@ class GateTests(unittest.TestCase):
                 allowed_assets=frozenset({"AAA", "USD"}),
                 limits=CapabilityLimits(
                     max_order_usd=Decimal("100"),
-                    max_actions_per_window=10, action_window_seconds=60,
+                    max_actions_per_window=10, action_window_seconds=60, max_slippage_bps=100,
                 ),
             )
 
@@ -88,7 +88,7 @@ class GateTests(unittest.TestCase):
                 allowed_primitives=frozenset({EconomicPrimitive.BUY}), allowed_venues=frozenset({"v"}),
                 limits=CapabilityLimits(
                     max_order_usd=Decimal("100"), max_daily_turnover_usd=Decimal("1000"),
-                    max_actions_per_window=10, action_window_seconds=60,
+                    max_actions_per_window=10, action_window_seconds=60, max_slippage_bps=100,
                 ),
             )
         with self.assertRaisesRegex(ValueError, "allowed_targets"):
@@ -99,7 +99,7 @@ class GateTests(unittest.TestCase):
                 allowed_assets=frozenset({"AAA", "USD"}),
                 limits=CapabilityLimits(
                     max_order_usd=Decimal("100"), max_daily_turnover_usd=Decimal("1000"),
-                    max_actions_per_window=10, action_window_seconds=60,
+                    max_actions_per_window=10, action_window_seconds=60, max_slippage_bps=100,
                 ),
             )
         with self.assertRaisesRegex(ValueError, "max_actions_per_window"):
@@ -124,7 +124,7 @@ class GateTests(unittest.TestCase):
             allowed_assets=frozenset({"BTC", "USD"}),
             limits=CapabilityLimits(
                 max_order_usd=Decimal("100"), max_daily_turnover_usd=Decimal("1000"),
-                max_actions_per_window=10, action_window_seconds=60,
+                max_actions_per_window=10, action_window_seconds=60, max_slippage_bps=100,
             ),
         )
         intent = Intent(
@@ -148,7 +148,7 @@ class GateTests(unittest.TestCase):
             allowed_assets=frozenset({"BTC", "USD"}), denied_targets=frozenset({"0"}),
             limits=CapabilityLimits(
                 max_order_usd=Decimal("100"), max_daily_turnover_usd=Decimal("1000"),
-                max_actions_per_window=10, action_window_seconds=60,
+                max_actions_per_window=10, action_window_seconds=60, max_slippage_bps=100,
             ),
         )
         intent = Intent(

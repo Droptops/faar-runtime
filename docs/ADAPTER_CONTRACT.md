@@ -29,7 +29,19 @@ Material changes require a new intent and a new authorization pass. Forbidden:
 
 The payload carries exactly one economic amount field; a BUY/SELL/PLACE_ORDER
 payload with both `amount_usd` and `notional_usd` is denied before the adapter
-sees it. Amount strings are plain ASCII decimals (`50`, `50.00`, `0.5`).
+sees it. Amounts are plain ASCII decimals (`50`, `50.00`, `0.5`); a JSON number
+is accepted only when its shortest form fits the same grammar.
+
+**Executor-side price bound.** A grant that allows SWAP/BUY/SELL/PLACE_ORDER
+sets `max_slippage_bps`, and every such payload carries `max_slippage_bps` (an
+integer, at most the grant's cap; an order declared `order_type: limit` may carry
+a positive decimal `limit_price` instead, a market order may not). The
+bound is part of the request hash the permit binds, so the adapter receives it
+unchanged and **must** enforce it at the venue (minimum output, limit price, or
+the venue's own slippage parameter) or refuse to execute. The risk snapshot's
+`requested_slippage_bps` is a signer claim and is not a substitute. The
+reference venues fill at a fixed reference price (zero slippage); a real
+adapter's review document states how the bound is enforced.
 
 ### A2. Stable logical identity
 
@@ -38,6 +50,12 @@ FAAR `intent_id` whenever supported: idempotency key, client order ID,
 payment-intent ID, contract intent hash/nonce.
 
 ### A3. The permit must be consumed before any effect
+
+A gateway has an identity. It refuses a permit presented for a request addressed
+to another venue (`PERMIT_VENUE_MISMATCH`): construct the gateway with
+`ExecutionPermitVerifier(..., venue=<its name>)` or pass `venue=` on every
+`consume()`, as `MockVenue` and `PaperTradingVenue` do. Without this, a
+compromised adapter for venue A could move the money at venue B with A's permit.
 
 The venue, or a capability gateway in front of it, calls
 `ExecutionPermitVerifier.consume(permit, request, now=...)` and creates an effect
@@ -57,7 +75,7 @@ effect id is recorded as such.
 | Adapter raises | Runtime records | Then |
 |---|---|---|
 | `AmbiguousExecution` (incl. `AdapterDeadlineExceeded`) | `UNKNOWN (EXECUTION_AMBIGUOUS / EXECUTION_DEADLINE_EXCEEDED)` with `ambiguity_until = permit.expires_at` | independent reconciliation; absence is not trusted until the permit window closes |
-| `DeterministicFailure` | `UNKNOWN (EXECUTION_DETERMINISTIC_FAILURE_UNVERIFIED)` | independent reconciliation; on authoritative NONE the intent ends `FAILED_SAFE` with usage released and no resubmission. A new intent is required. The permit may legitimately show `consumed_at` with no effect. |
+| `DeterministicFailure` | `UNKNOWN (EXECUTION_DETERMINISTIC_FAILURE_UNVERIFIED)` | independent reconciliation; on authoritative NONE after the permit window the intent ends `FAILED_SAFE` with usage released and no resubmission, **provided the permit was never consumed**. A consumed permit is the venue's admission of the request: admission with no settlement record is `STOPPED (SETTLEMENT_NONE_AFTER_PERMIT_CONSUMED)`, budget held. A venue that admits and then rejects must therefore leave an authoritative record (`CANCELLED` with nothing filled), as the paper venue does. |
 | any other exception | `UNKNOWN (ADAPTER_EXECUTION_EXCEPTION)` with the ambiguity window | as for ambiguous |
 | returns a receipt | `UNKNOWN (AWAITING_INDEPENDENT_SETTLEMENT)` | independent reconciliation |
 
@@ -124,6 +142,14 @@ SettlementRecord(
 the effect was produced for. A record bound to any other request is a
 `SETTLEMENT_REQUEST_BINDING_MISMATCH` stop.
 
+Records are bounded at construction: `effect_id` and `verified_request_hash`
+are strings, `amount_usd` is a finite Decimal inside the canonical amount bounds,
+and `evidence` is canonical JSON of at most 64 KiB and 10 000 nodes. A record that
+violates these never exists; the verifier raises instead, which a quorum treats
+as one erroring member and a single-source runtime as `RECONCILIATION_EXCEPTION`
+(retriable). A verifier that returns something other than a `SettlementRecord`
+stops the intent (`SETTLEMENT_RECORD_MALFORMED`, budget held).
+
 ### B3. Authoritative absence
 
 `NONE, authoritative=True` may be returned only if the lookup is authoritative
@@ -132,7 +158,13 @@ create an effect. A single RPC/provider "not found", a transient 404, a cache mi
 or a timeout is `authoritative=False`.
 
 Even an authoritative NONE is ignored by the runtime while the last attempt's
-permit is still live (see the ambiguity window in `EXECUTION_PERMITS.md`).
+permit is still live (see the ambiguity window in `EXECUTION_PERMITS.md`). When
+the runtime does act on absence it first voids every permit of the intent the
+venue has not consumed (a later consumption is refused with `PERMIT_VOIDED`
+whatever the venue's clock says) and then reads the ledger: if any permit of the
+intent was consumed, absence contradicts the venue's own admission and the intent
+is `STOPPED (SETTLEMENT_NONE_AFTER_PERMIT_CONSUMED)` rather than released or
+retried.
 
 ### B4. Authoritative positive evidence
 
@@ -149,10 +181,16 @@ intent `UNKNOWN`, never confirm, and never invalidate a previously recorded effe
 ### B5. Quorum semantics
 
 `QuorumSettlementVerifier` votes on `(status, effect_id, numeric amount)`; two
-sources reporting `50` and `50.00` agree. A source that raises contributes a
-non-authoritative UNKNOWN and is listed under `evidence["errors"]`. Two distinct
-authoritative facts, whether or not either reaches quorum, or any authoritative
-record bound to another request, are `CONTRADICTORY` (authoritative; the runtime
+sources reporting `50` and `50.00` agree. A source that raises, or that returns
+anything other than a well-formed `SettlementRecord`, contributes a
+non-authoritative UNKNOWN and is listed under `evidence["errors"]`; nothing a
+single member returns can wedge the quorum. Finality lag is not a contest:
+`CONFIRMED` and `FINALIZED` for the same effect id and amount agree on what
+settled; reached finality is not vetoed by a lagging member, otherwise the
+combined votes carry the weaker status and the runtime reconciles again. Two
+distinct authoritative facts otherwise (positive versus `NONE`, different effect
+ids or amounts), whether or not either reaches quorum, or any authoritative record
+bound to another request, are `CONTRADICTORY` (authoritative; the runtime
 stops). One uncontested fact short of quorum is insufficient evidence, reported
 as a non-authoritative UNKNOWN (`quorum-not-reached`) that the runtime retries;
 a single transient source error therefore never terminally stops an intent.
@@ -162,18 +200,50 @@ remain evaluable.
 
 ## Part C — Partial fills and cancellation
 
-Order adapters must document:
+The runtime models two further authoritative settlement statuses. Both require
+the order's effect id; `amount_usd` is the **cumulative** filled amount.
 
-- how partial fills map to `effect_id` and settlement evidence;
-- whether cancel is idempotent;
-- late-fill-after-cancel behaviour;
-- when held usage may be committed/released;
-- how the risk engine receives partial-fill reservations/effects.
+| Verifier reports | Meaning at the venue | Runtime |
+|---|---|---|
+| `PARTIALLY_FILLED`, amount > 0 | the order exists, has filled for `amount_usd` so far, and may fill further | `CONFIRMED` with that effect id (`SETTLEMENT_PARTIAL_FILL_OPEN`); reconciled again later; **never resubmitted**; usage HELD |
+| `PARTIALLY_FILLED`, amount 0 | the order is admitted and resting, nothing filled yet | `CONFIRMED` with that effect id (`SETTLEMENT_ORDER_OPEN`); reconciled again later; usage HELD |
+| any positive status, cumulative amount below the last accepted one | contradictory history (venue bug, wrong-leg lookup) | `STOPPED` (`SETTLEMENT_FILL_REGRESSED`); usage HELD |
+| `CANCELLED`, filled amount > 0 | terminal; the fill so far is the intent's one effect | `FINALIZED` (`SETTLEMENT_CANCELLED_AFTER_PARTIAL_FILL`); the authorized notional is committed |
+| `CANCELLED`, nothing filled, no fill recorded (an open order included) | terminal; no economic effect | `FAILED_SAFE` (`SETTLEMENT_CANCELLED_UNFILLED`); usage RELEASED; never resubmitted under this intent (a new intent is the caller's decision) |
+| `CANCELLED`, nothing filled, effect id owned by another intent at this venue | identity evidence contradicts the venue namespace | `STOPPED` (`EFFECT_ID_ALREADY_CLAIMED`); usage HELD; the claim and the release are one transaction |
+| `CANCELLED`, nothing filled, a fill was recorded earlier | contradictory history | `STOPPED` (`SETTLEMENT_CANCEL_CONTRADICTS_RECORDED_EFFECT`); usage HELD |
+| either, not authoritative | no weight | `UNKNOWN` (`SETTLEMENT_POSITIVE_NOT_AUTHORITATIVE` / `SETTLEMENT_CANCEL_NOT_AUTHORITATIVE`); usage HELD |
 
-The reference runtime has no partial-fill state: any authoritative FINALIZED
-amount at or below the authorized notional finalizes the intent and the ledger
-commits the **authorized** notional, never less (conservative for turnover). Cancel
-and late-fill linkage is out of scope for v0.4 and is an open go-live item.
+Integrity rules: the filled amount must be finite, non-negative and bounded by
+the authorized notional (`SETTLED_AMOUNT_EXCEEDS_AUTHORIZED`); cumulative amounts
+never decrease across observations (the runtime persists the last accepted one);
+`PAY` cannot partially fill (`PAYMENT_PARTIAL_NOT_ALLOWED`); a missing
+effect id is `SETTLED_EFFECT_ID_REQUIRED`; a later authoritative `NONE` for a
+recorded partial fill is `SETTLEMENT_LOST_PREVIOUS_EFFECT`; a quorum votes on
+`(status, effect id, amount)`, so sources disagreeing about the filled amount or
+about cancelled-versus-open are `CONTRADICTORY`.
+
+Venue obligations an adapter's review document must confirm:
+
+- `CANCELLED` is reported only once the venue guarantees no further fill (after
+  the cancel is acknowledged, never while a cancel request is merely pending). A
+  fill after `CANCELLED` is a venue contract violation outside the model.
+- the effect id is the order identity and stays stable across partial fills;
+- cancel is idempotent and a cancel of a fully filled order is a no-op;
+- `amount_usd` is the cumulative fill in the intent's amount unit.
+
+Ledger: the authorized notional stays committed for the trailing window even when
+less filled (conservative for turnover). Committing only the filled amount would
+need a per-intent ledger split and is deliberately not done in 0.4.
+
+Definition of done: a cancelled order never satisfies a task contract, even when
+the intent is `FINALIZED`, because the settlement status is not `FINALIZED`.
+
+The reference `MockVenue` implements this with `MockMode.PARTIAL_FILL`,
+`MockMode.OPEN_ORDER`, `complete_fill()` and `cancel_order()` (a cancelled order
+never fills afterwards); `test/test_partial_fills.py`, `test/test_economic_redteam.py`
+and the `partial_fill_then_cancel` scenario of `evals/run_crash_injection.py`
+exercise it.
 
 ## Required review document
 

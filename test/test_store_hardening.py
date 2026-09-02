@@ -50,12 +50,19 @@ class SchemaMigrationTests(unittest.TestCase):
         store.close()
         conn = sqlite3.connect(path)
         conn.execute("DROP INDEX IF EXISTS ix_usage_grant_velocity_ts")
+        conn.execute("DROP INDEX IF EXISTS ix_usage_principal_velocity_ts")
+        conn.execute("DROP INDEX IF EXISTS ix_usage_velocity_status")
+        conn.execute("DROP INDEX IF EXISTS ix_evidence_intent_id")
+        conn.execute("DROP INDEX IF EXISTS ix_permits_intent")
         conn.execute("DROP INDEX IF EXISTS ux_effect_id_per_venue")
+        conn.execute("DROP TABLE IF EXISTS exposure_caps")
         conn.execute("ALTER TABLE usage_reservations DROP COLUMN velocity_ts")
+        conn.execute("ALTER TABLE usage_reservations DROP COLUMN submitted")
         conn.execute("ALTER TABLE execution_permits DROP COLUMN consumed_at")
         conn.execute("ALTER TABLE execution_permits DROP COLUMN expires_at")
         conn.execute("ALTER TABLE intents DROP COLUMN venue")
         conn.execute("ALTER TABLE intents DROP COLUMN ambiguity_until")
+        conn.execute("ALTER TABLE intents DROP COLUMN filled_amount_usd")
         conn.execute("DROP TABLE store_settings")
         conn.execute("CREATE UNIQUE INDEX ux_effect_id_nonnull ON intents(effect_id) WHERE effect_id IS NOT NULL")
         conn.execute(
@@ -65,6 +72,12 @@ class SchemaMigrationTests(unittest.TestCase):
         conn.execute(
             "UPDATE intents SET state='UNKNOWN', reason_codes='[\"SETTLEMENT_UNKNOWN\"]', submission_count=1, updated_at=? WHERE intent_id=?",
             (self.LEGACY_UPDATED_AT, self.LEGACY_INFLIGHT),
+        )
+        # The in-flight legacy attempt holds a permit whose expiry 0.3.x never stored.
+        conn.execute(
+            "INSERT INTO execution_permits(permit_id,intent_id,principal_id,grant_id,grant_version,grant_epoch,fence_token,permit_hash,issued_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?)",
+            ("permit_legacy_1", self.LEGACY_INFLIGHT, PRINCIPAL, "grant:test", 1, 1, 1, "h", self.LEGACY_UPDATED_AT),
         )
         stamp = created_at if created_at is not None else (NOW - timedelta(seconds=30)).isoformat()
         for iid, amount in (("legacy_held_000000000001", "50"), ("legacy_held_000000000002", "20")):
@@ -148,8 +161,22 @@ class SchemaMigrationTests(unittest.TestCase):
             expected = datetime.fromisoformat(self.LEGACY_UPDATED_AT) + timedelta(seconds=60)
             self.assertEqual(expected.isoformat(), row.ambiguity_until)
             self.assertIsNone(store.get(self.LEGACY_FINAL).ambiguity_until, "terminal rows get no window")
+            # A row that never obtained a permit transported nothing: no window, so a
+            # worker that crashed between begin_submission and the permit record is
+            # retried as soon as absence is authoritative.
+            i = intent(intent_id="post_upgrade_00000000009")
+            store.register(i, canonical_hash(i))
+            self.assertTrue(store.transition(i.intent_id, IntentState.PROPOSED, IntentState.AUTHORIZED))
+            self.assertTrue(store.transition(i.intent_id, IntentState.AUTHORIZED, IntentState.RESERVED))
+            self.assertEqual((True, False, 1), store.begin_submission(i.intent_id, {IntentState.RESERVED}, max_attempts=2))
         finally:
             store.close()
+        reopened = SQLiteIntentStore(path)
+        try:
+            self.assertEqual(IntentState.SUBMITTED, reopened.get("post_upgrade_00000000009").state)
+            self.assertIsNone(reopened.get("post_upgrade_00000000009").ambiguity_until)
+        finally:
+            reopened.close()
 
     def test_unreadable_legacy_timestamp_fails_closed(self):
         path = temp_path(self)
@@ -365,6 +392,11 @@ class EvidenceIntegrityTests(unittest.TestCase):
     def test_rebuild_head_only_for_verified_legacy_chains(self):
         store, iid = self._seed(EVIDENCE_KEY)
         store._conn.execute("DELETE FROM evidence_head WHERE intent_id=?", (iid,))  # pre-head database shape
+        # Declare the existing events pre-head, as the first 0.4 open of a 0.3.x
+        # database does; without this the missing head is tampering (head_deleted).
+        store._conn.execute("UPDATE store_settings SET value=? WHERE key='heads_since'", (str(10 ** 9),))
+        store._conn.commit()
+        store._heads_since = 10 ** 9
         with self.assertRaises(EvidenceIntegrityError):
             store.add_evidence(iid, "blocked", {})
         self.assertTrue(store.rebuild_evidence_head(iid))
@@ -415,8 +447,14 @@ class LegacyChainTests(unittest.TestCase):
 
     @staticmethod
     def _drop_heads(path, *, empty_intent=None):
+        # Simulate a database written before signed heads existed: the heads are
+        # gone and the "heads since" mark is unset, so the next open treats every
+        # existing event as legacy (exactly what a real 0.3.x upgrade sees).
         conn = sqlite3.connect(path)
         conn.execute("DELETE FROM evidence_head")
+        # Every chain here starts at registration, which a real pre-head database's
+        # chains never did; the watermark is pushed past them explicitly.
+        conn.execute("UPDATE store_settings SET value='1000000000' WHERE key='heads_since'")
         if empty_intent is not None:
             conn.execute("DELETE FROM evidence WHERE intent_id=?", (empty_intent,))
         conn.commit()

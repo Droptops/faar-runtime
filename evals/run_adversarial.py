@@ -81,7 +81,7 @@ def main() -> None:
         return replace(base, **changes)
 
     def make(iid: str, **payload_overrides) -> Intent:
-        payload = {"from_asset": "USDC", "to_asset": "MEME", "amount_usd": "50", "target": "router:ok"}
+        payload = {"from_asset": "USDC", "to_asset": "MEME", "amount_usd": "50", "target": "router:ok", "max_slippage_bps": 50}
         payload.update(payload_overrides)
         return Intent(
             principal_id="principal:test",

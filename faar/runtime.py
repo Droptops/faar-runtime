@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 import threading
 from dataclasses import dataclass
 from decimal import Decimal
@@ -35,6 +36,7 @@ from .store import (
     GrantConflict,
     IntentBusy,
     SQLiteIntentStore,
+    StoreUnavailable,
     TERMINAL_STATES,
     UnknownGrant,
     UnknownIntent,
@@ -48,6 +50,12 @@ MAX_EFFECT_ID_CHARS = 512
 
 # Reason codes that durably block resubmission of an intent. They are persisted on
 # the intent row so the block survives across process() calls and worker restarts.
+# Abandoned adapter calls are counted per process (I-36): several runtimes over
+# one store (one per venue, per worker thread, or per CLI request) must not each
+# accept the cap on their own.
+_ORPHAN_LOCK = threading.Lock()
+_ORPHANED = [0]
+
 _DETERMINISTIC_FAILURE_BLOCK = "EXECUTION_DETERMINISTIC_FAILURE"
 _RESUBMIT_BLOCKING_REASONS = frozenset({
     _DETERMINISTIC_FAILURE_BLOCK,
@@ -64,11 +72,29 @@ def _valid_effect_id(value: object) -> bool:
     return isinstance(value, str) and 0 < len(value) <= MAX_EFFECT_ID_CHARS
 
 
+def _grant_bound(intent: Intent, grant: CapabilityGrant) -> bool:
+    return grant.grant_id == intent.grant_id and grant.version == intent.grant_version
+
+
 def _untrusted_repr(value: object) -> str | None:
+    """Bounded, exception-free rendering of a value from an untrusted component."""
     if value is None:
         return None
-    text = value if isinstance(value, str) else f"{type(value).__name__}:{value!r}"
+    if isinstance(value, str):
+        return value[:MAX_EFFECT_ID_CHARS]
+    try:
+        text = f"{type(value).__name__}:{value!r}"
+    except Exception:
+        text = f"{type(value).__name__}:<unrepresentable>"
     return text[:MAX_EFFECT_ID_CHARS]
+
+
+def _untrusted_message(exc: BaseException) -> str:
+    """`str(exc)` from an untrusted adapter or verifier may itself raise or be huge."""
+    try:
+        return str(exc)[:MAX_EFFECT_ID_CHARS]
+    except Exception:
+        return "<unrepresentable>"
 
 
 @dataclass(frozen=True)
@@ -94,9 +120,16 @@ class FAARRuntime:
         clock: Callable[[], datetime] = utcnow,
         allow_test_time_override: bool = False,
         adapter_deadline_seconds: float | None = None,
+        max_orphaned_adapter_calls: int = 8,
     ) -> None:
         self.store = store
         self.adapters = dict(adapters)
+        if not isinstance(max_orphaned_adapter_calls, int) or max_orphaned_adapter_calls < 1:
+            raise ValueError("max_orphaned_adapter_calls must be a positive integer")
+        # Adapter calls abandoned at the deadline keep running in their threads.
+        # Each one is a possible in-flight effect and a leaked thread; past this
+        # many, the process stops submitting until they drain.
+        self.max_orphaned_adapter_calls = max_orphaned_adapter_calls
         if adapter_deadline_seconds is not None and not adapter_deadline_seconds > 0:
             raise ValueError("adapter_deadline_seconds must be positive or None")
         # Bounded adapter calls: a hung venue call must not hold the per-grant
@@ -138,6 +171,7 @@ class FAARRuntime:
             return adapter.execute(request, permit)
         outcome: dict[str, object] = {}
         done = threading.Event()
+        state = {"orphaned": False}
 
         def run() -> None:
             try:
@@ -145,17 +179,30 @@ class FAARRuntime:
             except BaseException as exc:  # propagated to the caller below
                 outcome["error"] = exc
             finally:
-                done.set()
+                with _ORPHAN_LOCK:
+                    done.set()
+                    if state["orphaned"]:
+                        _ORPHANED[0] -= 1
 
         worker = threading.Thread(target=run, name=f"faar-adapter-{request.intent_id}", daemon=True)
         worker.start()
         if not done.wait(self.adapter_deadline_seconds):
-            raise AdapterDeadlineExceeded(
-                f"adapter call exceeded {self.adapter_deadline_seconds}s; request may still be in flight"
-            )
+            with _ORPHAN_LOCK:
+                if not done.is_set():
+                    state["orphaned"] = True
+                    _ORPHANED[0] += 1
+                    raise AdapterDeadlineExceeded(
+                        f"adapter call exceeded {self.adapter_deadline_seconds}s; request may still be in flight"
+                    )
         if "error" in outcome:
             raise outcome["error"]  # type: ignore[misc]
         return outcome["receipt"]
+
+    @property
+    def orphaned_adapter_calls(self) -> int:
+        """Adapter calls abandoned at the deadline that are still running in this process."""
+        with _ORPHAN_LOCK:
+            return _ORPHANED[0]
 
     @staticmethod
     def _ambiguity_window_closes_at(stored, grant: CapabilityGrant) -> datetime | None:
@@ -175,7 +222,14 @@ class FAARRuntime:
         # may opt in explicitly; production/runtime callers get the trusted clock.
         if override is not None and self.allow_test_time_override:
             return override
-        return self.clock()
+        # The trusted clock must yield timezone-aware datetimes: every artifact
+        # timestamp is aware, and a naive clock (datetime.utcnow) would otherwise
+        # raise TypeError out of the first comparison. Checked before any state
+        # is registered so a misconfigured clock fails fast and mutates nothing.
+        now = self.clock()
+        if not isinstance(now, datetime) or now.tzinfo is None or now.utcoffset() is None:
+            raise ValueError("runtime clock must return timezone-aware datetimes")
+        return now
 
     def process(
         self,
@@ -188,6 +242,8 @@ class FAARRuntime:
         risk_attestation: Attestation,
         now: datetime | None = None,
     ) -> RuntimeResult:
+        # Read the security clock once, before anything is registered.
+        decision_now = self._decision_time(now)
         # Bind the canonical payload before waiting on the lease. A competing caller
         # cannot hide a changed payload behind an already-running intent id.
         stored = self.store.register(intent, canonical_hash(intent))
@@ -199,7 +255,7 @@ class FAARRuntime:
                 return self._process_unlocked(
                     intent, authority, grant, risk,
                     authority_attestation=authority_attestation,
-                    risk_attestation=risk_attestation, now=now,
+                    risk_attestation=risk_attestation, now=now, decision_now=decision_now,
                 )
         except IntentBusy:
             current = self.store.get(intent.intent_id)
@@ -210,6 +266,23 @@ class FAARRuntime:
             )
         except EvidenceIntegrityError:
             return self._integrity_failure(intent.intent_id)
+        except (StoreUnavailable, sqlite3.OperationalError) as exc:
+            return self._store_unavailable(intent.intent_id, exc)
+
+    def _store_unavailable(self, intent_id: str, exc: Exception) -> RuntimeResult:
+        """The datastore refused a write past its busy timeout.
+
+        Every store method is one transaction, so the durable state is whatever the
+        last successful call left; nothing is coerced. The caller gets a code and
+        retries later instead of a raw driver exception.
+        """
+        if isinstance(exc, sqlite3.OperationalError) and "locked" not in str(exc).lower() and "busy" not in str(exc).lower():
+            raise exc
+        current = self.store.get(intent_id)
+        return RuntimeResult(
+            intent_id=intent_id, state=current.state, effect_id=current.effect_id,
+            reason_codes=("STORE_UNAVAILABLE",), replayed=True, submission_count=current.submission_count,
+        )
 
     def _integrity_failure(self, intent_id: str) -> RuntimeResult:
         """The evidence chain refused an append: nothing advances, the caller gets a code.
@@ -237,7 +310,12 @@ class FAARRuntime:
         an orphan either: the verifier attributed an effect to this intent that the
         runtime could not accept, and that needs a human (OPERATIONS.md §4).
         """
-        if stored.state not in TERMINAL_STATES or stored.state == IntentState.FINALIZED or stored.submission_count != 0:
+        if stored.state == IntentState.FINALIZED:
+            # Finalize and commit are one transaction since 0.4.0; a row finalized
+            # by an older version between the two statements is repaired here.
+            self.store.commit_usage(stored.intent_id)
+            return
+        if stored.state not in TERMINAL_STATES or stored.submission_count != 0:
             return
         if any(reason.startswith(_SETTLEMENT_DERIVED_PREFIXES) for reason in stored.reason_codes):
             return
@@ -253,16 +331,17 @@ class FAARRuntime:
         authority_attestation: Attestation,
         risk_attestation: Attestation,
         now: datetime | None = None,
+        decision_now: datetime | None = None,
     ) -> RuntimeResult:
         now_override = now if self.allow_test_time_override else None
-        decision_now = self._decision_time(now)
+        if decision_now is None:
+            decision_now = self._decision_time(now)
         intent_hash = canonical_hash(intent)
         existing = self.store.register(intent, intent_hash)
         if existing.state not in TERMINAL_STATES:
             # Every decision below records evidence. If the chain will refuse the
             # append, fail here, before any state is advanced.
             self.store.assert_evidence_appendable(intent.intent_id)
-
         # The complete grant envelope is provisioned by a separate principal.
         # Matching only grant_id/version is insufficient because a compromised
         # coordinator could otherwise substitute broader contents under the same ID.
@@ -272,6 +351,12 @@ class FAARRuntime:
             return self._stop_if_possible(existing, ("GRANT_NOT_PROVISIONED",))
         except GrantConflict:
             return self._stop_if_possible(existing, ("GRANT_ENVELOPE_MISMATCH",))
+        if existing.state not in TERMINAL_STATES and existing.state != IntentState.PROPOSED and not _grant_bound(intent, grant):
+            # An in-flight intent is reconciled only with its own grant: another
+            # provisioned grant's clock skew, status or expiry must not shorten the
+            # ambiguity window or terminalize the attempt. Fresh intents are denied
+            # by the capability gate instead (GRANT_ID_MISMATCH).
+            return self._stored_result(existing, replayed=True, reason_codes=("GRANT_NOT_BOUND_TO_INTENT",))
 
         if existing.state in TERMINAL_STATES:
             return self._stored_result(existing, replayed=True)
@@ -490,6 +575,13 @@ class FAARRuntime:
             return self._stop_execution_state(intent.intent_id, ("ADAPTER_NOT_CONFIGURED",), decisions, release_usage=True)
 
         adapter = self.adapters[intent.venue]
+        if self.orphaned_adapter_calls >= self.max_orphaned_adapter_calls:
+            # This process is still waiting on too many abandoned adapter calls to
+            # be a trustworthy submitter. Fail closed before any permit is minted;
+            # nothing was transported, so the reservation is released.
+            return self._stop_execution_state(
+                intent.intent_id, ("ADAPTER_ORPHAN_LIMIT_REACHED",), decisions, release_usage=True,
+            )
         reauth_kwargs = dict(
             authority=reauth[0] if reauth else None,
             risk=reauth[1] if reauth else None,
@@ -614,9 +706,11 @@ class FAARRuntime:
                 ambiguity_until = permit.permit.expires_at
                 try:
                     receipt = self._execute_adapter(adapter, request, permit)
-                    if not isinstance(receipt, ExecutionReceipt):
+                    if type(receipt) is not ExecutionReceipt:
                         # Adapter output is a trust boundary: a value the runtime cannot
-                        # interpret is an unobserved outcome, never a crash.
+                        # interpret (including a subclass or a `__class__` spoof that
+                        # bypassed the receipt's own validation) is an unobserved
+                        # outcome, never a crash.
                         raise AmbiguousExecution(
                             f"adapter returned {type(receipt).__name__}, not an ExecutionReceipt"
                         )
@@ -628,7 +722,7 @@ class FAARRuntime:
                         reason_codes=(reason,), ambiguity_until=ambiguity_until,
                     )
                     self.store.add_evidence(intent.intent_id, "execution_ambiguous", {
-                        "message": str(exc), "attempt": attempt, "reason": reason,
+                        "message": _untrusted_message(exc), "attempt": attempt, "reason": reason,
                         "ambiguity_until": ambiguity_until.isoformat(),
                     })
                 except DeterministicFailure as exc:
@@ -643,20 +737,25 @@ class FAARRuntime:
                         reason_codes=("EXECUTION_DETERMINISTIC_FAILURE_UNVERIFIED",), ambiguity_until=ambiguity_until,
                     )
                     self.store.add_evidence(intent.intent_id, "adapter_rejection_untrusted", {
-                        "message": str(exc), "attempt": attempt, "ambiguity_until": ambiguity_until.isoformat(),
+                        "message": _untrusted_message(exc), "attempt": attempt, "ambiguity_until": ambiguity_until.isoformat(),
                     })
-                except Exception as exc:
+                except BaseException as exc:
                     # Adapter crashes are economically ambiguous. The independent
                     # verifier, never the submitter, decides whether an effect exists.
+                    # Venue SDKs raise BaseException subclasses (cancellation scopes,
+                    # green-thread timeouts); the durable state is made consistent
+                    # first, then only interpreter-level signals keep propagating.
                     outcome = "exception"
                     self.store.transition(
                         intent.intent_id, IntentState.SUBMITTED, IntentState.UNKNOWN,
                         reason_codes=("ADAPTER_EXECUTION_EXCEPTION",), ambiguity_until=ambiguity_until,
                     )
                     self.store.add_evidence(intent.intent_id, "adapter_execution_exception", {
-                        "type": type(exc).__name__, "message": str(exc), "attempt": attempt,
+                        "type": type(exc).__name__, "message": _untrusted_message(exc), "attempt": attempt,
                         "ambiguity_until": ambiguity_until.isoformat(),
                     })
+                    if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                        raise
                 else:
                     # A submitter receipt is telemetry, not settlement authority. Never
                     # persist its effect id or amount as economic truth. Only the
@@ -665,17 +764,24 @@ class FAARRuntime:
                     # because adapter output is a trust boundary and must not be able to
                     # crash evidence recording. A receipt does not close the window: a
                     # venue that acknowledged the request may not have processed it.
-                    self.store.add_evidence(intent.intent_id, "adapter_receipt_untrusted", {
-                        "reported_status": receipt.status.value,
-                        "reported_effect_id": _untrusted_repr(receipt.effect_id),
-                        "reported_effect_id_well_formed": _valid_effect_id(receipt.effect_id),
-                        "reported_amount_usd": format(receipt.amount_usd, "f") if receipt.amount_usd is not None else None,
-                        "evidence": dict(receipt.evidence),
-                    })
                     self.store.transition(
                         intent.intent_id, IntentState.SUBMITTED, IntentState.UNKNOWN,
                         reason_codes=("AWAITING_INDEPENDENT_SETTLEMENT",), ambiguity_until=ambiguity_until,
                     )
+                    try:
+                        self.store.add_evidence(intent.intent_id, "adapter_receipt_untrusted", {
+                            "reported_status": receipt.status.value,
+                            "reported_effect_id": _untrusted_repr(receipt.effect_id),
+                            "reported_effect_id_well_formed": _valid_effect_id(receipt.effect_id),
+                            "reported_amount_usd": format(receipt.amount_usd, "f") if receipt.amount_usd is not None else None,
+                            "evidence": dict(receipt.evidence),
+                        })
+                    except EvidenceIntegrityError:
+                        raise
+                    except Exception as exc:
+                        self.store.add_evidence(intent.intent_id, "adapter_receipt_untrusted", {
+                            "uninterpretable": True, "type": type(exc).__name__,
+                        })
 
         if outcome == "deterministic":
             return self.reconcile(
@@ -718,6 +824,8 @@ class FAARRuntime:
             )
         except EvidenceIntegrityError:
             return self._integrity_failure(intent.intent_id)
+        except (StoreUnavailable, sqlite3.OperationalError) as exc:
+            return self._store_unavailable(intent.intent_id, exc)
 
     def _reconcile_unlocked(
         self,
@@ -741,17 +849,28 @@ class FAARRuntime:
         previous_effect_id = stored.effect_id
         if stored.state in TERMINAL_STATES:
             return self._stored_result(stored, decisions=decisions, replayed=True)
+        # The durable resubmission block lives on the row (RT-44) and binds every
+        # entry point, not only process(): a bare reconcile() must neither retry
+        # nor rewrite the row without it.
+        if _block_reason is None and any(r in _RESUBMIT_BLOCKING_REASONS for r in stored.reason_codes):
+            _block_reason = _DETERMINISTIC_FAILURE_BLOCK
+            _allow_resubmit = False
+        durable_block = tuple(r for r in stored.reason_codes if r in _RESUBMIT_BLOCKING_REASONS)
+        recorded_fill = self._recorded_fill(stored)
         self.store.assert_evidence_appendable(intent.intent_id)
 
-        # The presented grant must be the provisioned envelope before any state
-        # mutation. A caller presenting the wrong grant is not evidence about the
-        # in-flight intent, so the result is machine-readable and non-mutating.
+        # The presented grant must be the provisioned envelope, and the intent's
+        # own, before any state mutation. A caller presenting the wrong grant is
+        # not evidence about the in-flight intent, so the result is
+        # machine-readable and non-mutating.
         try:
             self.store.verify_grant(grant, canonical_hash(grant))
         except UnknownGrant:
             return self._stored_result(stored, decisions=decisions, replayed=True, reason_codes=("GRANT_NOT_PROVISIONED",))
         except GrantConflict:
             return self._stored_result(stored, decisions=decisions, replayed=True, reason_codes=("GRANT_ENVELOPE_MISMATCH",))
+        if not _grant_bound(intent, grant):
+            return self._stored_result(stored, decisions=decisions, replayed=True, reason_codes=("GRANT_NOT_BOUND_TO_INTENT",))
 
         if intent.venue not in self.adapters:
             # PROPOSED/AUTHORIZED/RESERVED prove that begin_submission never ran, so
@@ -763,12 +882,18 @@ class FAARRuntime:
             )
 
         # Move to RECONCILING from every non-terminal execution state where legal.
+        # The durable block travels with the row through RECONCILING, so a worker
+        # that dies during the settlement lookup leaves it in place for the next.
         if stored.state == IntentState.CONFIRMED:
-            self.store.transition(intent.intent_id, IntentState.CONFIRMED, IntentState.RECONCILING)
+            self.store.transition(intent.intent_id, IntentState.CONFIRMED, IntentState.RECONCILING, reason_codes=durable_block)
         elif stored.state in {IntentState.RESERVED, IntentState.SUBMITTED, IntentState.UNKNOWN}:
-            self.store.transition(intent.intent_id, stored.state, IntentState.RECONCILING)
+            self.store.transition(intent.intent_id, stored.state, IntentState.RECONCILING, reason_codes=durable_block)
         elif stored.state != IntentState.RECONCILING:
-            return self._stored_result(stored, decisions=decisions, replayed=True)
+            # PROPOSED/AUTHORIZED: nothing was submitted, process() is the entry
+            # point; say so instead of echoing an empty non-terminal result.
+            return self._stored_result(
+                stored, decisions=decisions, replayed=True, reason_codes=("RECONCILE_NOT_APPLICABLE_BEFORE_SUBMISSION",),
+            )
 
         verifier = self.settlement_verifiers[intent.venue]
         request = ExecutionRequest.from_intent(intent)
@@ -780,22 +905,39 @@ class FAARRuntime:
             self.store.transition(intent.intent_id, IntentState.RECONCILING, IntentState.UNKNOWN, reason_codes=reasons)
             self.store.add_evidence(intent.intent_id, "reconciliation_exception", {
                 "type": type(exc).__name__,
-                "message": str(exc),
+                "message": _untrusted_message(exc),
             })
             return self._current_result(intent.intent_id, decisions=decisions, reason_codes=reasons, replayed=True)
 
-        # Verifier output is a trust boundary: the effect identity is validated before
-        # it can enter the evidence chain or the intents table.
+        # Verifier output is a trust boundary: the record itself, not only the
+        # call, may be malformed. Anything that is not a SettlementRecord (or that
+        # the chain cannot carry) is a malformed settlement: fail closed with a
+        # code and the budget held instead of a traceback after RECONCILING.
+        if not isinstance(settlement, SettlementRecord):
+            return self._stop_execution_state(
+                intent.intent_id, ("SETTLEMENT_RECORD_MALFORMED",), decisions,
+                effect_id=previous_effect_id, release_usage=False, replayed=True,
+                detail={"type": type(settlement).__name__},
+            )
         effect_id_well_formed = settlement.effect_id is None or _valid_effect_id(settlement.effect_id)
-        self.store.add_evidence(intent.intent_id, "reconciliation", {
-            "status": settlement.status.value,
-            "effect_id": _untrusted_repr(settlement.effect_id),
-            "effect_id_well_formed": effect_id_well_formed,
-            "amount_usd": format(settlement.amount_usd, "f") if settlement.amount_usd is not None else None,
-            "authoritative": settlement.authoritative,
-            "verified_request_hash": settlement.verified_request_hash,
-            "evidence": dict(settlement.evidence),
-        })
+        try:
+            self.store.add_evidence(intent.intent_id, "reconciliation", {
+                "status": settlement.status.value,
+                "effect_id": _untrusted_repr(settlement.effect_id),
+                "effect_id_well_formed": effect_id_well_formed,
+                "amount_usd": format(settlement.amount_usd, "f") if settlement.amount_usd is not None else None,
+                "authoritative": settlement.authoritative,
+                "verified_request_hash": settlement.verified_request_hash,
+                "evidence": dict(settlement.evidence),
+            })
+        except EvidenceIntegrityError:
+            raise
+        except Exception as exc:
+            return self._stop_execution_state(
+                intent.intent_id, ("SETTLEMENT_RECORD_MALFORMED",), decisions,
+                effect_id=previous_effect_id, release_usage=False, replayed=True,
+                detail={"type": type(exc).__name__},
+            )
 
         # A non-authoritative observation carries no economic weight in either
         # direction (I-8, I-9, I-23): a weak "not found" is not loss of a previous
@@ -805,12 +947,12 @@ class FAARRuntime:
         # against authoritative records only.
         if not settlement.authoritative and settlement.status in {
             SettlementStatus.CONFIRMED, SettlementStatus.FINALIZED, SettlementStatus.NONE,
+            SettlementStatus.PARTIALLY_FILLED, SettlementStatus.CANCELLED,
         }:
-            reason = (
-                "SETTLEMENT_NONE_NOT_AUTHORITATIVE"
-                if settlement.status == SettlementStatus.NONE
-                else "SETTLEMENT_POSITIVE_NOT_AUTHORITATIVE"
-            )
+            reason = {
+                SettlementStatus.NONE: "SETTLEMENT_NONE_NOT_AUTHORITATIVE",
+                SettlementStatus.CANCELLED: "SETTLEMENT_CANCEL_NOT_AUTHORITATIVE",
+            }.get(settlement.status, "SETTLEMENT_POSITIVE_NOT_AUTHORITATIVE")
             reasons = self._with_block(reason, _block_reason)
             self.store.transition(intent.intent_id, IntentState.RECONCILING, IntentState.UNKNOWN, reason_codes=reasons)
             return self._current_result(intent.intent_id, decisions=decisions, reason_codes=reasons, replayed=True)
@@ -848,30 +990,147 @@ class FAARRuntime:
                 release_usage=False, replayed=True,
             )
 
+        # Cumulative fills never shrink. An authoritative amount below the last
+        # accepted one (venue bug, wrong-leg lookup, trade-id/order-id confusion)
+        # is contradictory history, not a newer truth: stop, budget held.
+        if (
+            settlement.authoritative and recorded_fill is not None and settlement.amount_usd is not None
+            and settlement.status in {
+                SettlementStatus.CONFIRMED, SettlementStatus.FINALIZED,
+                SettlementStatus.PARTIALLY_FILLED, SettlementStatus.CANCELLED,
+            }
+            and settlement.amount_usd < recorded_fill
+            # A cancel that reports nothing filled against a recorded fill keeps
+            # its own, more specific code below.
+            and not (settlement.status == SettlementStatus.CANCELLED and settlement.amount_usd == 0)
+        ):
+            return self._stop_execution_state(
+                intent.intent_id, ("SETTLEMENT_FILL_REGRESSED",), decisions, effect_id=previous_effect_id,
+                release_usage=False, replayed=True,
+                detail={
+                    "recorded_filled_amount_usd": format(recorded_fill, "f"),
+                    "reported_amount_usd": format(settlement.amount_usd, "f"),
+                },
+            )
+
         if settlement.status == SettlementStatus.FINALIZED:
+            # Finalize and commit in one transaction: a crash between the two
+            # would otherwise leave HELD budget on a FINALIZED intent forever.
             try:
-                self.store.transition(intent.intent_id, IntentState.RECONCILING, IntentState.FINALIZED, effect_id=settlement.effect_id)
+                self.store.transition(
+                    intent.intent_id, IntentState.RECONCILING, IntentState.FINALIZED,
+                    effect_id=settlement.effect_id, commit_usage=True, filled_amount_usd=settlement.amount_usd,
+                )
             except EffectConflict:
                 return self._stop_execution_state(
                     intent.intent_id, ("EFFECT_ID_ALREADY_CLAIMED",), decisions, release_usage=False, replayed=True
                 )
-            self.store.commit_usage(intent.intent_id)
             return self._current_result(intent.intent_id, decisions=decisions, effect_id=settlement.effect_id, replayed=True)
         if settlement.status == SettlementStatus.CONFIRMED:
             try:
-                self.store.transition(intent.intent_id, IntentState.RECONCILING, IntentState.CONFIRMED, effect_id=settlement.effect_id)
+                self.store.transition(
+                    intent.intent_id, IntentState.RECONCILING, IntentState.CONFIRMED,
+                    effect_id=settlement.effect_id, filled_amount_usd=settlement.amount_usd,
+                )
             except EffectConflict:
                 return self._stop_execution_state(
                     intent.intent_id, ("EFFECT_ID_ALREADY_CLAIMED",), decisions, release_usage=False, replayed=True
                 )
             return self._current_result(intent.intent_id, decisions=decisions, effect_id=settlement.effect_id, replayed=True)
-        if settlement.status in {SettlementStatus.UNKNOWN, SettlementStatus.CONTRADICTORY}:
-            state = IntentState.STOPPED if settlement.status == SettlementStatus.CONTRADICTORY else IntentState.UNKNOWN
-            reason = "SETTLEMENT_CONTRADICTORY" if settlement.status == SettlementStatus.CONTRADICTORY else "SETTLEMENT_UNKNOWN"
-            reasons = self._with_block(reason, _block_reason)
-            self.store.transition(intent.intent_id, IntentState.RECONCILING, state, reason_codes=reasons)
-            if state == IntentState.STOPPED:
-                self.store.add_evidence(intent.intent_id, "execution_stopped", {"reason_codes": list(reasons)})
+        if settlement.status == SettlementStatus.PARTIALLY_FILLED:
+            # The order exists at the venue and may fill further. With a positive
+            # cumulative amount an effect exists (the fill so far); with zero the
+            # order is admitted and resting, nothing filled yet. Either way the
+            # intent is CONFIRMED with the order's effect identity: reconciled again
+            # later, never resubmitted (a second attempt for the remainder would be
+            # a second order, I-3), budget held in full until the order is terminal.
+            filled = settlement.amount_usd if settlement.amount_usd is not None else Decimal("0")
+            open_reason = "SETTLEMENT_PARTIAL_FILL_OPEN" if filled > 0 else "SETTLEMENT_ORDER_OPEN"
+            try:
+                self.store.transition(
+                    intent.intent_id, IntentState.RECONCILING, IntentState.CONFIRMED,
+                    reason_codes=(open_reason,), effect_id=settlement.effect_id, filled_amount_usd=filled,
+                )
+            except EffectConflict:
+                return self._stop_execution_state(
+                    intent.intent_id, ("EFFECT_ID_ALREADY_CLAIMED",), decisions, release_usage=False, replayed=True
+                )
+            self.store.add_evidence(intent.intent_id, "partial_fill" if filled > 0 else "order_open", {
+                "effect_id": settlement.effect_id,
+                "filled_amount_usd": format(filled, "f"),
+            })
+            return self._current_result(
+                intent.intent_id, decisions=decisions, effect_id=settlement.effect_id,
+                reason_codes=(open_reason,), replayed=True,
+            )
+        if settlement.status == SettlementStatus.CANCELLED:
+            filled = settlement.amount_usd if settlement.amount_usd is not None else Decimal("0")
+            if filled > 0:
+                # Terminal at the venue with a partial fill: the fill is the intent's
+                # one effect. The ledger commits the authorized notional (never less),
+                # so the unfilled remainder stays counted for the trailing window.
+                try:
+                    self.store.transition(
+                        intent.intent_id, IntentState.RECONCILING, IntentState.FINALIZED,
+                        reason_codes=("SETTLEMENT_CANCELLED_AFTER_PARTIAL_FILL",), effect_id=settlement.effect_id,
+                        commit_usage=True, filled_amount_usd=filled,
+                    )
+                except EffectConflict:
+                    return self._stop_execution_state(
+                        intent.intent_id, ("EFFECT_ID_ALREADY_CLAIMED",), decisions, release_usage=False, replayed=True
+                    )
+                self.store.add_evidence(intent.intent_id, "cancelled_after_partial_fill", {
+                    "effect_id": settlement.effect_id, "filled_amount_usd": format(filled, "f"),
+                })
+                return self._current_result(
+                    intent.intent_id, decisions=decisions, effect_id=settlement.effect_id,
+                    reason_codes=("SETTLEMENT_CANCELLED_AFTER_PARTIAL_FILL",), replayed=True,
+                )
+            if previous_effect_id is not None and (recorded_fill is None or recorded_fill > 0):
+                # A fill was recorded earlier and the venue now reports nothing
+                # filled: contradictory history, a human decides. (An order that
+                # was recorded as open with nothing filled may be cancelled.)
+                return self._stop_execution_state(
+                    intent.intent_id, ("SETTLEMENT_CANCEL_CONTRADICTS_RECORDED_EFFECT",), decisions,
+                    effect_id=previous_effect_id, release_usage=False, replayed=True,
+                )
+            # Cancelled before any fill: no economic effect, terminal at the venue.
+            # The intent ends FAILED_SAFE with its budget released and is never
+            # resubmitted under this id (a cancel/fill race at the venue is the
+            # venue's contract to exclude; see ADAPTER_CONTRACT.md Part C). A permit
+            # the venue has not consumed is voided first so it cannot be used after
+            # the release. The order identity is claimed in the same transaction as
+            # the release: a cancel record carrying another intent's effect id at
+            # this venue is identity evidence that contradicts the venue namespace
+            # (I-11), not proof that nothing happened here, and the unique index
+            # decides that atomically rather than a lookup a concurrent claim could
+            # overtake.
+            voided = self.store.void_unconsumed_permits(intent.intent_id)
+            if voided:
+                self.store.add_evidence(intent.intent_id, "permits_voided", {"count": voided})
+            reasons = ("SETTLEMENT_CANCELLED_UNFILLED",)
+            try:
+                self.store.transition(
+                    intent.intent_id, IntentState.RECONCILING, IntentState.FAILED_SAFE,
+                    reason_codes=reasons, effect_id=settlement.effect_id, release_usage=True,
+                )
+            except EffectConflict:
+                return self._stop_execution_state(
+                    intent.intent_id, ("EFFECT_ID_ALREADY_CLAIMED",), decisions,
+                    effect_id=previous_effect_id, release_usage=False, replayed=True,
+                )
+            self.store.add_evidence(intent.intent_id, "cancelled_unfilled", {"effect_id": settlement.effect_id})
+            return self._current_result(intent.intent_id, decisions=decisions, reason_codes=reasons, replayed=True)
+        if settlement.status == SettlementStatus.CONTRADICTORY:
+            # Terminal for a human; like every settlement-derived stop it voids the
+            # attempt's unconsumed permit so a late request cannot land afterwards.
+            return self._stop_execution_state(
+                intent.intent_id, self._with_block("SETTLEMENT_CONTRADICTORY", _block_reason), decisions,
+                effect_id=previous_effect_id, release_usage=False, replayed=True,
+            )
+        if settlement.status == SettlementStatus.UNKNOWN:
+            reasons = self._with_block("SETTLEMENT_UNKNOWN", _block_reason)
+            self.store.transition(intent.intent_id, IntentState.RECONCILING, IntentState.UNKNOWN, reason_codes=reasons)
             return self._current_result(intent.intent_id, decisions=decisions, reason_codes=reasons, replayed=True)
 
         if settlement.status == SettlementStatus.NONE:
@@ -888,6 +1147,22 @@ class FAARRuntime:
                     "closes_at": window_closes_at.isoformat(), "observed_at": decision_now.isoformat(),
                 })
                 return self._current_result(intent.intent_id, decisions=decisions, reason_codes=reasons, replayed=True)
+
+            # Absence is about to be acted on (release or retry). Void every permit
+            # of this intent the venue has not consumed, so a late consumption is
+            # refused whatever the venue's clock says, and check the ledger: a
+            # consumed permit is the venue's admission of the request. Admission
+            # without any settlement record is a contradiction between the ledger
+            # and the verifier, never a reason to release budget or issue a retry.
+            voided = self.store.void_unconsumed_permits(intent.intent_id)
+            if voided:
+                self.store.add_evidence(intent.intent_id, "permits_voided", {"count": voided})
+            issued, consumed = self.store.permit_counts(intent.intent_id)
+            if consumed > 0:
+                return self._stop_execution_state(
+                    intent.intent_id, ("SETTLEMENT_NONE_AFTER_PERMIT_CONSUMED",), decisions,
+                    release_usage=False, replayed=True, detail={"permits_issued": issued, "permits_consumed": consumed},
+                )
 
             if not _allow_resubmit:
                 reason = _block_reason or "RESUBMISSION_BLOCKED"
@@ -963,16 +1238,38 @@ class FAARRuntime:
         status: SettlementStatus,
         actual_amount: Decimal | None,
     ) -> str | None:
-        if status not in {SettlementStatus.CONFIRMED, SettlementStatus.FINALIZED}:
+        positive = {SettlementStatus.CONFIRMED, SettlementStatus.FINALIZED, SettlementStatus.PARTIALLY_FILLED}
+        if status not in positive and status != SettlementStatus.CANCELLED:
             return None
         if intent.primitive not in MONETARY_PRIMITIVES:
             return None
         intended = parse_bounded_decimal(intent.payload.get("amount_usd", intent.payload.get("notional_usd")))
         if intended is None or intended <= 0:
             return "AUTHORIZED_EFFECT_AMOUNT_INVALID"
+        if status == SettlementStatus.CANCELLED:
+            # The filled-so-far amount; absent means nothing filled.
+            if actual_amount is None:
+                return None
+            if not actual_amount.is_finite() or actual_amount < 0:
+                return "SETTLED_AMOUNT_INVALID"
+            if actual_amount > intended:
+                return "SETTLED_AMOUNT_EXCEEDS_AUTHORIZED"
+            if intent.primitive.value == "PAY" and actual_amount != 0 and actual_amount != intended:
+                return "PAYMENT_PARTIAL_NOT_ALLOWED"
+            return None
         if actual_amount is None:
             return "SETTLED_AMOUNT_REQUIRED"
-        if not actual_amount.is_finite() or actual_amount <= 0:
+        if not actual_amount.is_finite() or actual_amount < 0:
+            return "SETTLED_AMOUNT_INVALID"
+        if status == SettlementStatus.PARTIALLY_FILLED:
+            # The cumulative fill of an open order: zero means admitted and
+            # resting, nothing filled yet.
+            if intent.primitive.value == "PAY":
+                return "PAYMENT_PARTIAL_NOT_ALLOWED"
+            if actual_amount > intended:
+                return "SETTLED_AMOUNT_EXCEEDS_AUTHORIZED"
+            return None
+        if actual_amount == 0:
             return "SETTLED_AMOUNT_INVALID"
         if intent.primitive.value == "PAY":
             if actual_amount != intended:
@@ -982,12 +1279,26 @@ class FAARRuntime:
         return None
 
     @staticmethod
+    def _recorded_fill(stored) -> Decimal | None:
+        raw = getattr(stored, "filled_amount_usd", None)
+        if raw is None:
+            return None
+        try:
+            value = Decimal(str(raw))
+        except (ArithmeticError, ValueError, TypeError):
+            return None
+        return value if value.is_finite() and value >= 0 else None
+
+    @staticmethod
     def _effect_integrity_reason(
         previous_effect_id: str | None,
         status: SettlementStatus,
         effect_id: str | None,
     ) -> str | None:
-        if status in {SettlementStatus.CONFIRMED, SettlementStatus.FINALIZED} and not effect_id:
+        if status in {
+            SettlementStatus.CONFIRMED, SettlementStatus.FINALIZED,
+            SettlementStatus.PARTIALLY_FILLED, SettlementStatus.CANCELLED,
+        } and not effect_id:
             return "SETTLED_EFFECT_ID_REQUIRED"
         if previous_effect_id is not None:
             if status == SettlementStatus.NONE:
@@ -1012,8 +1323,15 @@ class FAARRuntime:
         effect_id: str | None = None,
         release_usage: bool,
         replayed: bool = False,
+        detail: dict | None = None,
     ) -> RuntimeResult:
         stored = self.store.get(intent_id)
+        # A terminal intent must not leave a live capability behind: a permit the
+        # venue has not consumed is voided first, so a queued or late request
+        # cannot create an effect the ledger can no longer attribute.
+        voided = self.store.void_unconsumed_permits(intent_id)
+        if voided:
+            self.store.add_evidence(intent_id, "permits_voided", {"count": voided})
         transitioned = False
         if stored.state not in TERMINAL_STATES and IntentState.STOPPED in self._allowed_from(stored.state):
             transitioned = self.store.transition(
@@ -1022,7 +1340,10 @@ class FAARRuntime:
             )
         if release_usage and not transitioned:
             self.store.release_usage(intent_id)
-        self.store.add_evidence(intent_id, "execution_stopped", {"reason_codes": list(reasons)})
+        payload = {"reason_codes": list(reasons)}
+        if detail:
+            payload["detail"] = detail
+        self.store.add_evidence(intent_id, "execution_stopped", payload)
         return self._current_result(intent_id, decisions=decisions, effect_id=effect_id, reason_codes=reasons, replayed=replayed)
 
     @staticmethod

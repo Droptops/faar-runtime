@@ -66,8 +66,10 @@ calls `store.consume_execution_permit`, one `BEGIN IMMEDIATE` transaction that:
 
 1. finds the permit row written at issuance and checks the ledger binding
    (`permit_hash`, fence token, epoch);
-2. rejects an already consumed permit (`PERMIT_ALREADY_CONSUMED`) and a permit
-   that a later permit for the same intent has superseded (`PERMIT_SUPERSEDED`);
+2. rejects an already consumed permit (`PERMIT_ALREADY_CONSUMED`), a permit the
+   runtime voided when it acted on authoritative absence (`PERMIT_VOIDED`), and a
+   permit that a later permit for the same intent has superseded
+   (`PERMIT_SUPERSEDED`);
 3. re-reads the grant row and rejects unless it is ACTIVE with the same epoch
    (`PERMIT_GRANT_NOT_ACTIVE`, `PERMIT_GRANT_EPOCH_STALE`), the scope is not
    halted (`PERMIT_HALTED`), the store can consult its authority anchor
@@ -77,8 +79,15 @@ calls `store.consume_execution_permit`, one `BEGIN IMMEDIATE` transaction that:
    pushed to the authority anchor.
 
 The gateway's pre-check (`verify`) reports the same status-specific codes, so a
-venue operator can tell a halt or a restore apart from an ordinary pause. It also
-bounds the permit's own lifetime (`PERMIT_TTL_EXCEEDED`, 60 s by default).
+venue operator can tell a halt or a restore apart from an ordinary pause. Its
+`max_clock_skew_seconds` (default 5 s, the grant default) must be at least the
+largest grant skew the deployment issues, or a venue clock inside the grant's
+allowance rejects every permit as `PERMIT_FROM_FUTURE`. It also
+bounds the permit's own lifetime (`PERMIT_TTL_EXCEEDED`, 60 s by default) and,
+when the gateway knows which venue it serves (`ExecutionPermitVerifier(...,
+venue=...)` or `consume(..., venue=...)`), refuses a permit for a request
+addressed to any other venue (`PERMIT_VENUE_MISMATCH`) before anything is
+consumed.
 
 Because `set_grant_status`, `halt`, and consumption all run as IMMEDIATE
 transactions on the same store, a permit either consumes before a lifecycle change
@@ -100,6 +109,13 @@ The store therefore records `permit.expires_at` as the intent's `ambiguity_until
 permit for an intent while an earlier one can still be honoured
 (`PERMIT_PREVIOUS_ATTEMPT_LIVE`; the runtime keeps the budget held). Until that
 instant plus the grant's `max_clock_skew_seconds` has passed:
+
+When the window has closed and absence is about to be acted on, the runtime voids
+every unconsumed permit of the intent first (so a venue whose clock lags cannot
+consume it afterwards) and refuses to release or retry if the ledger shows a
+permit of the intent was consumed (`SETTLEMENT_NONE_AFTER_PERMIT_CONSUMED`). Every
+terminal stop voids the same way before it transitions, so no terminal intent
+leaves a live capability behind.
 
 - an authoritative `NONE` from the settlement verifier is **not** trusted
   (`SETTLEMENT_NONE_WITHIN_PERMIT_WINDOW`), the reservation stays HELD, and no

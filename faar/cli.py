@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import sqlite3
 import os
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from .adapters import MockMode, MockVenue
-from .anchor import AnchorUnavailable, AuthorityRegression, FileAuthorityAnchor
+from .anchor import AnchorMismatch, AnchorUnavailable, AnchorUnavailableAfterCommit, AuthorityRegression, FileAuthorityAnchor
 from .attestation import Ed25519TrustStore
 from .canonical import canonical_hash
 from .gates import evaluate_authority, evaluate_capability, evaluate_risk
@@ -19,9 +21,12 @@ from .store import (
     AuthorityAnchorRequired,
     EvidenceIntegrityError,
     GrantConflict,
+    LeaseOwnerAlive,
     MigrationError,
     SQLiteIntentStore,
+    StoreUnavailable,
     UnknownGrant,
+    UnknownPrincipal,
 )
 
 
@@ -157,15 +162,26 @@ def build_parser() -> argparse.ArgumentParser:
     p_cl = with_db(sub.add_parser("clear-lease", help="OPERATOR: clear a stale lease after reconciling external settlement"), anchor=False)
     p_cl.add_argument("--intent-id", required=True)
     p_cl.add_argument("--owner-token", required=True, help="exact owner_token printed by list-leases")
+    p_cl.add_argument("--force", action="store_true", help="clear even if the owner pid is alive on this host")
 
     p_halt = with_db(sub.add_parser("halt", help="EMERGENCY: stop every grant in scope and fence outstanding permits"))
     p_halt.add_argument("--scope", required=True, help="'global' or 'principal:<principal_id>'")
     p_halt.add_argument("--reason", required=True)
+    p_halt.add_argument("--allow-unprovisioned-principal", action="store_true", help="halt a principal scope that has no provisioned grant yet")
 
     p_resume = with_db(sub.add_parser("resume", help="lift a halt; permits issued before it stay dead"))
     p_resume.add_argument("--scope", required=True)
 
     with_db(sub.add_parser("controls", help="show emergency control records"), anchor=False)
+
+    p_cap = with_db(sub.add_parser("set-exposure-cap", help="OPERATOR: cap trailing-window turnover for a scope, independent of grants"))
+    p_cap.add_argument("--scope", required=True, help="'global' or 'principal:<principal_id>'")
+    group = p_cap.add_mutually_exclusive_group(required=True)
+    group.add_argument("--max-usd", help="positive amount (plain decimal string)")
+    group.add_argument("--clear", action="store_true", help="remove the cap for the scope")
+    p_cap.add_argument("--allow-unprovisioned-principal", action="store_true", help="cap a principal scope that has no provisioned grant yet")
+
+    with_db(sub.add_parser("exposure-caps", help="show scope exposure caps"), anchor=False)
 
     p_rar = with_db(sub.add_parser("revoke-after-restore", help="OPERATOR: close a grant version whose authority state regressed behind its anchor"))
     p_rar.add_argument("--grant-id", required=True)
@@ -179,7 +195,8 @@ def build_parser() -> argparse.ArgumentParser:
 # printed as JSON and exit 2 so scripts can branch on them.
 _OPERATOR_ERRORS = (
     AuthorityAnchorRequired, AuthorityRegression, AnchorUnavailable, EvidenceIntegrityError,
-    GrantConflict, MigrationError, UnknownGrant,
+    GrantConflict, MigrationError, UnknownGrant, InvalidOperation, ValueError, LeaseOwnerAlive, StoreUnavailable,
+    UnknownPrincipal, AnchorMismatch,
 )
 
 
@@ -187,7 +204,18 @@ def main(argv=None) -> None:
     try:
         _main(argv)
     except _OPERATOR_ERRORS as exc:
-        _emit({"error": type(exc).__name__, "message": str(exc)})
+        payload = {"error": type(exc).__name__, "message": str(exc)}
+        if isinstance(exc, AnchorUnavailable):
+            # A stop that committed but could not raise the anchor is an alert to
+            # act on, not a failed stop; scripts must be able to tell the two apart.
+            payload["committed"] = isinstance(exc, AnchorUnavailableAfterCommit)
+        _emit(payload)
+        raise SystemExit(2)
+    except sqlite3.OperationalError as exc:
+        text = str(exc).lower()
+        if "locked" not in text and "busy" not in text:
+            raise
+        _emit({"error": "StoreUnavailable", "message": f"datastore busy: {exc}"})
         raise SystemExit(2)
 
 
@@ -263,7 +291,7 @@ def _main(argv=None) -> None:
         return
 
     if command == "clear-lease":
-        cleared = SQLiteIntentStore(args.db).clear_stale_intent_lease(args.intent_id, expected_owner_token=args.owner_token)
+        cleared = SQLiteIntentStore(args.db).clear_stale_intent_lease(args.intent_id, expected_owner_token=args.owner_token, force=args.force)
         _emit({"intent_id": args.intent_id, "cleared": cleared})
         if not cleared:
             raise SystemExit(2)
@@ -271,7 +299,7 @@ def _main(argv=None) -> None:
 
     if command == "halt":
         store = _open_store(args)
-        fenced = store.halt(args.scope, reason=args.reason)
+        fenced = store.halt(args.scope, reason=args.reason, allow_unprovisioned=args.allow_unprovisioned_principal)
         _emit({"scope": args.scope, "halted": True, "grant_versions_fenced": fenced})
         return
 
@@ -285,6 +313,17 @@ def _main(argv=None) -> None:
         _emit(SQLiteIntentStore(args.db).controls())
         return
 
+    if command == "set-exposure-cap":
+        store = _open_store(args)
+        cap = None if args.clear else Decimal(str(args.max_usd))
+        matched = store.set_exposure_cap(args.scope, cap, allow_unprovisioned=args.allow_unprovisioned_principal)
+        _emit({"scope": args.scope, "max_turnover_usd": None if cap is None else format(cap, "f"), "grant_versions_in_scope": matched})
+        return
+
+    if command == "exposure-caps":
+        _emit(SQLiteIntentStore(args.db).exposure_caps())
+        return
+
     if command == "revoke-after-restore":
         store = _open_store(args)
         epoch, fence = store.revoke_after_restore(args.grant_id, args.grant_version)
@@ -292,8 +331,10 @@ def _main(argv=None) -> None:
         return
 
     if command == "checkpoint":
-        SQLiteIntentStore(args.db).checkpoint()
-        _emit({"db": args.db, "checkpointed": True})
+        ok = SQLiteIntentStore(args.db).checkpoint()
+        _emit({"db": args.db, "checkpointed": ok})
+        if not ok:
+            raise SystemExit(2)
         return
 
     intent = parse_intent(_load(args.intent))
