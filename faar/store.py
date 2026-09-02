@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import json
 import os
+import socket
 import sqlite3
 import threading
 import time
@@ -15,7 +16,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Iterable, Iterator
 
-from .anchor import AnchorUnavailable, AuthorityAnchor, AuthorityRegression, regressed
+from .anchor import AnchorMismatch, AnchorUnavailable, AuthorityAnchor, AuthorityRegression, regressed
 from .canonical import canonical_json, parse_bounded_decimal
 from .models import CapabilityGrant, Intent, IntentState, MONETARY_PRIMITIVES, RiskSnapshot
 
@@ -30,6 +31,7 @@ TURNOVER_WINDOW_SECONDS = 86_400
 # Ambiguity window granted to in-flight rows written by a version that did not
 # persist permit expiry (pre-0.4). Generous relative to the 5 s default permit TTL.
 LEGACY_AMBIGUITY_WINDOW_SECONDS = 60
+BUSY_TIMEOUT_MS = 30_000
 
 # Per-grant execution fences are shared by every store instance opened on the same
 # database file inside one process. Keying them per instance would let an
@@ -105,6 +107,23 @@ class PermitConflict(RuntimeError):
     """A new permit would overlap a permit for the same intent that the venue can still consume."""
 
 
+class StoreUnavailable(RuntimeError):
+    """The datastore refused a write past its busy timeout; nothing was changed by the failed call."""
+
+
+class LeaseOwnerAlive(RuntimeError):
+    """The lease belongs to a process that is still running on this host."""
+
+
+class UnknownPrincipal(KeyError):
+    """A control scope names a principal that has no provisioned grant."""
+
+
+# Anchor key under which the exposure-cap table version is recorded, so a restore
+# cannot silently reinstate a looser cap.
+EXPOSURE_CAPS_ANCHOR_KEY = "__exposure_caps__"
+
+
 class EvidenceIntegrityError(RuntimeError):
     """The persisted evidence chain no longer matches its signed head commitment.
 
@@ -165,6 +184,7 @@ class SQLiteIntentStore:
         self._intent_lock_guard = threading.Lock()
         self._intent_locks: dict[str, tuple[threading.RLock, int]] = {}
         self._intent_guard_local = threading.local()
+        self._host = socket.gethostname()
         self._instance_id = uuid.uuid4().hex
         # ":memory:" databases are private to their connection, so their fences are
         # private too. File-backed stores share fences per resolved path.
@@ -175,7 +195,7 @@ class SQLiteIntentStore:
 
         self._conn = sqlite3.connect(self.path, timeout=30, isolation_level=None, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA busy_timeout = 30000")
+        self._conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
         self._conn.execute("PRAGMA foreign_keys = ON")
         self._execute_with_busy_retry("PRAGMA journal_mode = WAL")
         self._conn.execute("PRAGMA synchronous = FULL")
@@ -251,7 +271,9 @@ class SQLiteIntentStore:
             CREATE TABLE IF NOT EXISTS intent_leases (
                 intent_id TEXT PRIMARY KEY,
                 owner_token TEXT NOT NULL,
-                acquired_at TEXT NOT NULL
+                acquired_at TEXT NOT NULL,
+                host TEXT,
+                pid INTEGER
             );
             CREATE TABLE IF NOT EXISTS evidence (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -309,6 +331,37 @@ class SQLiteIntentStore:
         self._migrate_columns()
         self._create_dependent_indexes()
         self._bind_anchor_setting()
+        self._bind_heads_since()
+
+    def _bind_heads_since(self) -> None:
+        """Record, once, the first evidence id written by a version with signed heads.
+
+        Every chain whose first event has this id or higher was born with a head
+        commitment; a missing head on such a chain is tampering (`head_deleted`)
+        and is never rebuilt over. Chains older than the mark are legacy and may be
+        adopted by the operator's rebuild. On a database first opened by this
+        version the mark is the next id, so nothing is ever mistaken for legacy.
+        """
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute("SELECT value FROM store_settings WHERE key='heads_since'").fetchone()
+                if row is None:
+                    last = self._conn.execute("SELECT COALESCE(MAX(id), 0) AS n FROM evidence").fetchone()["n"]
+                    row_value = str(int(last) + 1)
+                    self._conn.execute(
+                        "INSERT INTO store_settings(key,value,updated_at) VALUES('heads_since',?,?)", (row_value, self._now())
+                    )
+                else:
+                    row_value = str(row["value"])
+                self._conn.execute("COMMIT")
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
+        try:
+            self._heads_since = int(row_value)
+        except ValueError as exc:
+            raise MigrationError("store_settings.heads_since is not an integer") from exc
 
     def _bind_anchor_setting(self) -> None:
         """Remember durably that this database runs under an authority anchor.
@@ -322,6 +375,26 @@ class SQLiteIntentStore:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
                 if self._anchor is not None:
+                    # Bind identity, not just presence: a fresh or replaced anchor at
+                    # the same path (unmounted volume, wrong host) would otherwise
+                    # silently un-regress a restored datastore.
+                    bound = self._conn.execute("SELECT value FROM store_settings WHERE key='anchor_id'").fetchone()
+                    db_id = None if bound is None else str(bound["value"])
+                    anchor_id = self._anchor.identity()
+                    if db_id is None and anchor_id is None:
+                        anchor_id = uuid.uuid4().hex
+                        self._anchor.bind_identity(anchor_id)
+                    elif db_id is not None and anchor_id != db_id:
+                        raise AnchorMismatch(
+                            f"this database is bound to anchor {db_id}; the presented anchor "
+                            f"{'carries no identity (fresh or replaced)' if anchor_id is None else 'is ' + anchor_id}"
+                        )
+                    if db_id is None:
+                        self._conn.execute(
+                            "INSERT INTO store_settings(key,value,updated_at) VALUES('anchor_id',?,?) "
+                            "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+                            (anchor_id, self._now()),
+                        )
                     self._conn.execute(
                         "INSERT INTO store_settings(key,value,updated_at) VALUES('anchor_required','1',?) "
                         "ON CONFLICT(key) DO UPDATE SET value='1', updated_at=excluded.updated_at",
@@ -379,6 +452,8 @@ class SQLiteIntentStore:
         ("execution_permits", "consumed_at", "TEXT"),
         ("execution_permits", "expires_at", "TEXT"),
         ("execution_permits", "voided_at", "TEXT"),
+        ("intent_leases", "host", "TEXT"),
+        ("intent_leases", "pid", "INTEGER"),
     )
 
     def _migrate_columns(self) -> None:
@@ -486,15 +561,37 @@ class SQLiteIntentStore:
                 self._conn.execute("ROLLBACK")
                 raise
 
-    def checkpoint(self) -> None:
+    def checkpoint(self, *, attempts: int = 10) -> bool:
         """Fold the WAL into the main database file.
 
         Operators must call this (or close every connection) before copying the
         file for a backup; a bare copy of a WAL-mode database misses every
         transaction still in the write-ahead log.
+        Returns False when the checkpoint could not complete because a reader or
+        writer held the WAL past the retry budget; a copy taken then would miss
+        committed transactions, so the CLI reports it and exits non-zero.
         """
         with self._lock:
-            self._execute_with_busy_retry("PRAGMA wal_checkpoint(TRUNCATE)")
+            # A TRUNCATE checkpoint waits on readers through the busy handler; bound
+            # that wait per attempt so the operator gets an answer in seconds rather
+            # than attempts x busy_timeout.
+            self._conn.execute("PRAGMA busy_timeout=200")
+            try:
+                for attempt in range(attempts):
+                    try:
+                        row = self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+                    except sqlite3.OperationalError as exc:
+                        if "locked" not in str(exc).lower() or attempt == attempts - 1:
+                            raise
+                        time.sleep(0.05)
+                        continue
+                    busy, log_frames, checkpointed = (int(row[0]), int(row[1]), int(row[2])) if row else (0, 0, 0)
+                    if busy == 0 and (log_frames <= 0 or checkpointed >= log_frames):
+                        return True
+                    time.sleep(0.05)
+            finally:
+                self._conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+        return False
 
     def close(self) -> None:
         with self._lock:
@@ -575,13 +672,20 @@ class SQLiteIntentStore:
             while not acquired:
                 with self._lock:
                     try:
-                        self._conn.execute(
-                            "INSERT INTO intent_leases(intent_id,owner_token,acquired_at) VALUES(?,?,?)",
-                            (intent_id, owner, self._now()),
+                        # The same owner may re-acquire its own lease: a release that
+                        # failed on a busy datastore must not lock the live worker out
+                        # of its own intent for ever.
+                        cur = self._conn.execute(
+                            "INSERT INTO intent_leases(intent_id,owner_token,acquired_at,host,pid) VALUES(?,?,?,?,?) "
+                            "ON CONFLICT(intent_id) DO UPDATE SET acquired_at=excluded.acquired_at, host=excluded.host, pid=excluded.pid "
+                            "WHERE intent_leases.owner_token=excluded.owner_token",
+                            (intent_id, owner, self._now(), self._host, os.getpid()),
                         )
-                        acquired = True
-                    except sqlite3.IntegrityError:
-                        acquired = False
+                        acquired = cur.rowcount == 1
+                    except sqlite3.OperationalError as exc:
+                        if "locked" not in str(exc).lower() and "busy" not in str(exc).lower():
+                            raise
+                        raise StoreUnavailable(f"could not acquire the lease for {intent_id}: {exc}") from exc
                 if acquired:
                     break
                 if time.monotonic() >= deadline:
@@ -595,13 +699,32 @@ class SQLiteIntentStore:
             finally:
                 active2 = set(getattr(self._intent_guard_local, "active", set()))
                 active2.discard(intent_id); self._intent_guard_local.active = active2
+                self._release_lease(intent_id, owner)
+        finally:
+            self._release_intent_lock(intent_id, local_lock)
+
+    def _release_lease(self, intent_id: str, owner: str, *, attempts: int = 100) -> None:
+        """Release with bounded retry; a datastore that stays busy raises StoreUnavailable.
+
+        The owner keeps the right to re-acquire its own lease, so a failed release
+        cannot wedge the intent for the live worker; an operator sees the row in
+        `list_leases` with the owner's host and pid.
+        """
+        last: Exception | None = None
+        for attempt in range(attempts):
+            try:
                 with self._lock:
                     self._conn.execute(
                         "DELETE FROM intent_leases WHERE intent_id=? AND owner_token=?",
                         (intent_id, owner),
                     )
-        finally:
-            self._release_intent_lock(intent_id, local_lock)
+                return
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc).lower() and "busy" not in str(exc).lower():
+                    raise
+                last = exc
+                time.sleep(0.01)
+        raise StoreUnavailable(f"could not release the lease for {intent_id}: {last}") from last
 
     def intent_lease(self, intent_id: str) -> dict | None:
         with self._lock:
@@ -610,9 +733,37 @@ class SQLiteIntentStore:
             ).fetchone()
         return None if row is None else dict(row)
 
-    def clear_stale_intent_lease(self, intent_id: str, *, expected_owner_token: str) -> bool:
-        """Administrative recovery primitive; never called automatically by runtime."""
+    @staticmethod
+    def _pid_alive(pid: int) -> bool:
+        try:
+            os.kill(int(pid), 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except (OSError, ValueError, OverflowError):
+            return False
+        return True
+
+    def clear_stale_intent_lease(self, intent_id: str, *, expected_owner_token: str, force: bool = False) -> bool:
+        """Administrative recovery primitive; never called automatically by runtime.
+
+        The lease records the owner's host and pid. When the owner is a live process
+        on this host the lease is refused (`LeaseOwnerAlive`) unless `force` is set:
+        two workers inside one intent's state machine is exactly the race the lease
+        prevents. Cross-host liveness cannot be checked here and stays the operator's
+        responsibility (docs/OPERATIONS.md §2).
+        """
         with self._lock:
+            row = self._conn.execute(
+                "SELECT owner_token,host,pid FROM intent_leases WHERE intent_id=?", (intent_id,)
+            ).fetchone()
+            if row is None or str(row["owner_token"]) != expected_owner_token:
+                return False
+            if not force and row["pid"] is not None and row["host"] == self._host and self._pid_alive(row["pid"]):
+                raise LeaseOwnerAlive(
+                    f"lease for {intent_id} is held by live process {row['pid']} on {row['host']}; refuse unless forced"
+                )
             cur = self._conn.execute(
                 "DELETE FROM intent_leases WHERE intent_id=? AND owner_token=?",
                 (intent_id, expected_owner_token),
@@ -637,12 +788,15 @@ class SQLiteIntentStore:
                     )
                 elif row["grant_hash"] != grant_hash or row["principal_id"] != grant.principal_id:
                     raise GrantConflict("grant_id/version already provisioned with a different principal or capability envelope")
+                if row is None:
+                    # Anchor before commit: authority never exists in the datastore
+                    # without its mark, so a crash or anchor failure here leaves the
+                    # anchor ahead (fail closed), never behind (undetectable restore).
+                    self._anchor_record(grant.grant_id, grant.version, 1, 0)
                 self._conn.execute("COMMIT")
             except Exception:
                 self._conn.execute("ROLLBACK")
                 raise
-            if row is None:
-                self._anchor_record(grant.grant_id, grant.version, 1, 0)
 
     # ---- external authority anchor -------------------------------------------------
 
@@ -694,12 +848,20 @@ class SQLiteIntentStore:
                     "UPDATE grants SET runtime_status='REVOKED', runtime_epoch=?, fence_counter=? WHERE grant_id=? AND version=?",
                     (epoch, fence, grant_id, version),
                 )
+                anchor_error: Exception | None = None
+                if self._anchor is not None:
+                    try:
+                        self._anchor.reset(grant_id, version, epoch, fence)
+                    except Exception as exc:  # stopping is the safe direction: commit, then report
+                        anchor_error = exc
                 self._conn.execute("COMMIT")
             except Exception:
                 self._conn.execute("ROLLBACK")
                 raise
-            if self._anchor is not None:
-                self._anchor.reset(grant_id, version, epoch, fence)
+            if anchor_error is not None:
+                raise AnchorUnavailable(
+                    f"grant {grant_id}@{version} revoked and committed; anchor not updated: {anchor_error}"
+                ) from anchor_error
             return epoch, fence
 
     # ---- emergency controls (kill switch) ------------------------------------------
@@ -709,9 +871,16 @@ class SQLiteIntentStore:
         """Returns the principal for a principal scope, None for the global scope."""
         if scope == GLOBAL_CONTROL_SCOPE:
             return None
-        if isinstance(scope, str) and scope.startswith(PRINCIPAL_CONTROL_PREFIX) and len(scope) > len(PRINCIPAL_CONTROL_PREFIX):
+        if (
+            isinstance(scope, str) and scope.startswith(PRINCIPAL_CONTROL_PREFIX)
+            and len(scope) > len(PRINCIPAL_CONTROL_PREFIX) and scope == scope.strip() and not any(c.isspace() for c in scope)
+        ):
             return scope[len(PRINCIPAL_CONTROL_PREFIX):]
-        raise ValueError("control scope must be 'global' or 'principal:<principal_id>'")
+        raise ValueError("control scope must be 'global' or 'principal:<principal_id>' without whitespace")
+
+    def _principal_grant_count_locked(self, principal_id: str) -> int:
+        row = self._conn.execute("SELECT COUNT(*) AS n FROM grants WHERE principal_id=?", (principal_id,)).fetchone()
+        return int(row["n"] or 0)
 
     def _active_halt_locked(self, principal_id: str) -> str | None:
         row = self._conn.execute(
@@ -721,7 +890,7 @@ class SQLiteIntentStore:
         ).fetchone()
         return None if row is None else str(row["scope"])
 
-    def halt(self, scope: str, *, reason: str) -> int:
+    def halt(self, scope: str, *, reason: str, allow_unprovisioned: bool = False) -> int:
         """Emergency stop for every grant in `scope` ('global' or 'principal:<id>').
 
         Marks the scope halted and advances the runtime epoch of every affected grant
@@ -739,6 +908,11 @@ class SQLiteIntentStore:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
                 now = self._now()
+                if principal is not None and not allow_unprovisioned and self._principal_grant_count_locked(principal) == 0:
+                    # A halt that fences nothing is a silent no-op an operator would
+                    # mistake for protection (ids are themselves 'principal:<name>',
+                    # so the scope is easy to mistype).
+                    raise UnknownPrincipal(f"no provisioned grant for principal {principal!r}; pass allow_unprovisioned to halt it anyway")
                 self._conn.execute(
                     "INSERT INTO runtime_controls(scope,halted,reason,control_epoch,updated_at) VALUES(?,?,?,?,?) "
                     "ON CONFLICT(scope) DO UPDATE SET halted=1, reason=excluded.reason, "
@@ -754,12 +928,21 @@ class SQLiteIntentStore:
                         "SELECT grant_id,version,runtime_epoch,fence_counter FROM grants WHERE principal_id=?", (principal,)
                     ).fetchall()
                 fenced = cur.rowcount
+                # Stopping is always the safe direction: the epoch bump commits even
+                # if the anchor cannot be reached, and the failure is reported after.
+                anchor_error: Exception | None = None
+                for row in rows:
+                    try:
+                        self._anchor_record(str(row["grant_id"]), int(row["version"]), int(row["runtime_epoch"]), int(row["fence_counter"]))
+                    except Exception as exc:
+                        anchor_error = exc
+                        break
                 self._conn.execute("COMMIT")
             except Exception:
                 self._conn.execute("ROLLBACK")
                 raise
-        for row in rows:
-            self._anchor_record(str(row["grant_id"]), int(row["version"]), int(row["runtime_epoch"]), int(row["fence_counter"]))
+        if anchor_error is not None:
+            raise AnchorUnavailable(f"halt of {scope!r} committed ({fenced} grant versions fenced); anchor not updated: {anchor_error}") from anchor_error
         return fenced
 
     def resume(self, scope: str) -> None:
@@ -787,25 +970,40 @@ class SQLiteIntentStore:
 
     # ---- exposure caps ---------------------------------------------------------------
 
-    def set_exposure_cap(self, scope: str, max_turnover_usd: Decimal | None) -> None:
+    def set_exposure_cap(self, scope: str, max_turnover_usd: Decimal | None, *, allow_unprovisioned: bool = False) -> int:
         """Operator ceiling on trailing-window turnover for a scope, independent of grants.
 
         `scope` is 'global' or 'principal:<id>'. The cap counts every HELD and
         COMMITTED reservation in the scope inside the trailing turnover window, so
         it bounds what the whole fleet can move through FAAR even if every grant
         is generous. `None` clears the cap. Tightening and loosening are both
-        authority changes and require the anchor on an anchored database.
+        authority changes and require the anchor on an anchored database; the cap
+        table's version is anchored so a restore cannot silently reinstate a looser
+        cap (`EXPOSURE_CAPS_REGRESSED` at reservation until caps are re-applied).
+        A principal scope with no provisioned grant is refused unless
+        `allow_unprovisioned` is set. Returns the number of provisioned grant
+        versions inside the scope.
         """
-        self._validate_control_scope(scope)
+        principal = self._validate_control_scope(scope)
         self._require_anchor()
         if max_turnover_usd is not None:
             parsed = parse_bounded_decimal(max_turnover_usd)
             if parsed is None or parsed <= 0:
                 raise ValueError("max_turnover_usd must be a positive bounded amount")
             max_turnover_usd = parsed
+        anchor_error: Exception | None = None
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
+                if principal is None:
+                    matched = int(self._conn.execute("SELECT COUNT(*) AS n FROM grants").fetchone()["n"] or 0)
+                else:
+                    matched = self._principal_grant_count_locked(principal)
+                    if matched == 0 and not allow_unprovisioned:
+                        raise UnknownPrincipal(f"no provisioned grant for principal {principal!r}; pass allow_unprovisioned to cap it anyway")
+                previous_row = self._conn.execute("SELECT max_turnover_usd FROM exposure_caps WHERE scope=?", (scope,)).fetchone()
+                previous = None if previous_row is None else parse_bounded_decimal(previous_row["max_turnover_usd"])
+                tightening = max_turnover_usd is not None and (previous is None or max_turnover_usd < previous)
                 if max_turnover_usd is None:
                     self._conn.execute("DELETE FROM exposure_caps WHERE scope=?", (scope,))
                 else:
@@ -814,32 +1012,66 @@ class SQLiteIntentStore:
                         "ON CONFLICT(scope) DO UPDATE SET max_turnover_usd=excluded.max_turnover_usd, updated_at=excluded.updated_at",
                         (scope, format(max_turnover_usd, "f"), self._now()),
                     )
+                # Version the cap table past both the datastore and the anchor so a
+                # restored datastore reports EXPOSURE_CAPS_REGRESSED until re-applied.
+                current = self._exposure_caps_version_locked()
+                mark = self._anchor.high_water(EXPOSURE_CAPS_ANCHOR_KEY, 0) if self._anchor is not None else None
+                new_version = max(current, mark[0] if mark else 0) + 1
+                self._conn.execute(
+                    "INSERT INTO store_settings(key,value,updated_at) VALUES('exposure_caps_version',?,?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+                    (str(new_version), self._now()),
+                )
+                if self._anchor is not None:
+                    try:
+                        self._anchor.record(EXPOSURE_CAPS_ANCHOR_KEY, 0, new_version, 0)
+                    except Exception as exc:
+                        if not tightening:
+                            raise
+                        anchor_error = exc  # tightening is the safe direction: commit, then report
                 self._conn.execute("COMMIT")
             except Exception:
                 self._conn.execute("ROLLBACK")
                 raise
+        if anchor_error is not None:
+            raise AnchorUnavailable(f"exposure cap for {scope!r} committed; anchor not updated: {anchor_error}") from anchor_error
+        return matched
+
+    def _exposure_caps_version_locked(self) -> int:
+        row = self._conn.execute("SELECT value FROM store_settings WHERE key='exposure_caps_version'").fetchone()
+        try:
+            return int(row["value"]) if row is not None else 0
+        except (TypeError, ValueError):
+            return 0
+
+    def _exposure_caps_regressed_locked(self) -> bool:
+        if self._anchor is None:
+            return False
+        return regressed((self._exposure_caps_version_locked(), 0), self._anchor.high_water(EXPOSURE_CAPS_ANCHOR_KEY, 0))
 
     def exposure_caps(self) -> list[dict]:
         with self._lock:
             rows = self._conn.execute("SELECT * FROM exposure_caps ORDER BY scope").fetchall()
         return [dict(r) for r in rows]
 
-    def _exposure_caps_locked(self, principal_id: str) -> list[tuple[str, Decimal]]:
+    def _exposure_caps_locked(self, principal_id: str) -> list[tuple[str, Decimal | None]]:
+        """Caps that apply to the principal. An unreadable stored cap is returned as
+        None so the caller fails closed instead of raising out of reserve_usage."""
         rows = self._conn.execute(
             "SELECT scope,max_turnover_usd FROM exposure_caps WHERE scope=? OR scope=?",
             (GLOBAL_CONTROL_SCOPE, PRINCIPAL_CONTROL_PREFIX + principal_id),
         ).fetchall()
-        return [(str(r["scope"]), Decimal(str(r["max_turnover_usd"]))) for r in rows]
+        return [(str(r["scope"]), parse_bounded_decimal(r["max_turnover_usd"])) for r in rows]
 
     def _scope_turnover_locked(self, scope: str, principal_id: str, since_ts: int) -> Decimal:
         if scope == GLOBAL_CONTROL_SCOPE:
             rows = self._conn.execute(
-                "SELECT amount_usd FROM usage_reservations WHERE status IN ('HELD','COMMITTED') AND velocity_ts > ?",
+                "SELECT amount_usd FROM usage_reservations WHERE status IN ('HELD','COMMITTED') AND velocity_ts >= ?",
                 (since_ts,),
             ).fetchall()
         else:
             rows = self._conn.execute(
-                "SELECT amount_usd FROM usage_reservations WHERE principal_id=? AND status IN ('HELD','COMMITTED') AND velocity_ts > ?",
+                "SELECT amount_usd FROM usage_reservations WHERE principal_id=? AND status IN ('HELD','COMMITTED') AND velocity_ts >= ?",
                 (principal_id, since_ts),
             ).fetchall()
         return sum((Decimal(r["amount_usd"]) for r in rows), Decimal("0"))
@@ -1019,17 +1251,30 @@ class SQLiteIntentStore:
                 if current == "REVOKED" and status != "REVOKED":
                     raise GrantConflict("revoked grant versions cannot be reactivated; provision a new version")
                 new_epoch = int(row["runtime_epoch"])
+                anchor_error: Exception | None = None
                 if current != status:
                     new_epoch += 1
                     self._conn.execute(
                         "UPDATE grants SET runtime_status=?, runtime_epoch=? WHERE grant_id=? AND version=?",
                         (status, new_epoch, grant_id, version),
                     )
+                    # Anchor before commit. Re-activating without the anchor is refused
+                    # (rollback); pausing or revoking commits regardless and reports the
+                    # anchor failure, because stopping is always the safe direction.
+                    try:
+                        self._anchor_record(grant_id, version, new_epoch, int(row["fence_counter"]))
+                    except Exception as exc:
+                        if status == "ACTIVE":
+                            raise
+                        anchor_error = exc
                 self._conn.execute("COMMIT")
             except Exception:
                 self._conn.execute("ROLLBACK")
                 raise
-            self._anchor_record(grant_id, version, new_epoch, int(row["fence_counter"]))
+            if anchor_error is not None:
+                raise AnchorUnavailable(
+                    f"grant {grant_id}@{version} set to {status} and committed; anchor not updated: {anchor_error}"
+                ) from anchor_error
 
     def next_execution_fence(self, grant: CapabilityGrant) -> tuple[int, int]:
         """Atomically allocate a monotonically increasing fence for an ACTIVE grant.
@@ -1062,11 +1307,12 @@ class SQLiteIntentStore:
                     "UPDATE grants SET fence_counter=? WHERE grant_id=? AND version=?",
                     (counter, grant.grant_id, grant.version),
                 )
+                # Anchor before commit: no fence exists without its mark.
+                self._anchor_record(grant.grant_id, grant.version, epoch, counter)
                 self._conn.execute("COMMIT")
             except Exception:
                 self._conn.execute("ROLLBACK")
                 raise
-            self._anchor_record(grant.grant_id, grant.version, epoch, counter)
             return epoch, counter
 
     def verify_usage_held(self, intent: Intent, grant: CapabilityGrant) -> bool:
@@ -1315,11 +1561,15 @@ class SQLiteIntentStore:
                 new_fence = int(self._conn.execute(
                     "SELECT fence_counter FROM grants WHERE grant_id=? AND version=?", (grant_id, grant_version)
                 ).fetchone()["fence_counter"])
+                # Anchor before commit: a consumption the anchor does not know about
+                # must not exist, otherwise a restore could replay it undetected. On
+                # anchor failure the whole consumption rolls back and the venue is
+                # told the permit was not consumed.
+                self._anchor_record(grant_id, grant_version, grant_epoch, new_fence)
                 self._conn.execute("COMMIT")
             except Exception:
                 self._conn.execute("ROLLBACK")
                 raise
-            self._anchor_record(grant_id, grant_version, grant_epoch, new_fence)
             return True, ()
 
     @staticmethod
@@ -1354,6 +1604,8 @@ class SQLiteIntentStore:
         day_key = now.astimezone(timezone.utc).date().isoformat()
         window = grant.limits.action_window_seconds
         bucket = int(now.timestamp()) // window if window else None
+        # Whole-second stamps with an inclusive lower bound: truncation can only
+        # widen a trailing window, never shorten it below the configured length.
         velocity_ts = int(now.timestamp())
 
         with self._lock:
@@ -1399,7 +1651,7 @@ class SQLiteIntentStore:
                     rows = self._conn.execute(
                         "SELECT amount_usd FROM usage_reservations WHERE grant_id=? AND grant_version=? "
                         "AND status IN ('HELD','COMMITTED') "
-                        "AND ((velocity_ts IS NOT NULL AND velocity_ts > ?) OR (velocity_ts IS NULL AND day_key=?))",
+                        "AND ((velocity_ts IS NOT NULL AND velocity_ts >= ?) OR (velocity_ts IS NULL AND day_key=?))",
                         (grant.grant_id, grant.version, velocity_ts - TURNOVER_WINDOW_SECONDS, day_key),
                     ).fetchall()
                     current = sum((Decimal(r["amount_usd"]) for r in rows), Decimal("0"))
@@ -1407,7 +1659,21 @@ class SQLiteIntentStore:
                         reasons.append("ATOMIC_DAILY_TURNOVER_EXCEEDED")
 
                 # Scope exposure caps (operator control, independent of any grant).
+                # A zero-notional action (e.g. CANCEL_ORDER) adds no exposure and must
+                # stay possible after an emergency tightening below current turnover.
+                if amount > 0:
+                    try:
+                        caps_regressed = self._exposure_caps_regressed_locked()
+                    except AnchorUnavailable:
+                        caps_regressed = True
+                    if caps_regressed:
+                        reasons.append("EXPOSURE_CAPS_REGRESSED")
                 for scope, cap in self._exposure_caps_locked(intent.principal_id):
+                    if cap is None or cap <= 0:
+                        reasons.append("EXPOSURE_CAP_UNREADABLE")
+                        break
+                    if amount <= 0:
+                        continue
                     current = self._scope_turnover_locked(scope, intent.principal_id, velocity_ts - TURNOVER_WINDOW_SECONDS)
                     if current + amount > cap:
                         reasons.append("EXPOSURE_CAP_EXCEEDED")
@@ -1418,7 +1684,7 @@ class SQLiteIntentStore:
                     # tumbling bucket (timestamp // window) would let up to 2x the
                     # limit fire across a bucket boundary.
                     count = self._conn.execute(
-                        "SELECT COUNT(*) AS n FROM usage_reservations WHERE grant_id=? AND grant_version=? AND velocity_ts > ? AND status IN ('HELD','COMMITTED')",
+                        "SELECT COUNT(*) AS n FROM usage_reservations WHERE grant_id=? AND grant_version=? AND velocity_ts >= ? AND status IN ('HELD','COMMITTED')",
                         (grant.grant_id, grant.version, velocity_ts - window),
                     ).fetchone()["n"]
                     if count + 1 > grant.limits.max_actions_per_window:
@@ -1778,6 +2044,14 @@ class SQLiteIntentStore:
                     return False
                 rows = self._evidence_rows_locked(intent_id)
                 ok, count, last_hash = self._verify_chain_rows(intent_id, rows)
+                if rows and self._born_with_head(rows):
+                    # Every 0.4 chain starts at registration with a signed head. A
+                    # head-less chain that starts that way lost its head to tampering
+                    # (typically together with its tail); committing a new head here
+                    # would launder the truncation.
+                    raise EvidenceIntegrityError(
+                        f"evidence chain for {intent_id} was born with a head commitment; its absence is tampering, not a legacy chain"
+                    )
                 if ok and count == 0 and allow_empty:
                     self._append_evidence_in_txn(
                         intent_id, str(principal["principal_id"]), "evidence_head_adopted",
@@ -1796,6 +2070,9 @@ class SQLiteIntentStore:
             except Exception:
                 self._conn.execute("ROLLBACK")
                 raise
+
+    def _born_with_head(self, rows: list) -> bool:
+        return bool(rows) and int(rows[0]["id"]) >= self._heads_since
 
     def rebuild_evidence_heads(self, *, allow_empty: bool = False) -> dict[str, str]:
         """Operator-only bulk form of `rebuild_evidence_head` for a database upgrade.
@@ -1824,11 +2101,12 @@ class SQLiteIntentStore:
 
     def _evidence_rows_locked(self, intent_id: str) -> list[dict]:
         rows = self._conn.execute(
-            "SELECT event_type,payload_json,created_at,prev_hash,event_hash,event_mac FROM evidence WHERE intent_id=? ORDER BY id",
+            "SELECT id,event_type,payload_json,created_at,prev_hash,event_hash,event_mac FROM evidence WHERE intent_id=? ORDER BY id",
             (intent_id,),
         ).fetchall()
         return [
             {
+                "id": int(r["id"]),
                 "event_type": r["event_type"],
                 "payload": json.loads(r["payload_json"]),
                 "created_at": r["created_at"],
@@ -1915,7 +2193,9 @@ class SQLiteIntentStore:
         # detectable without an external anchor (see THREAT_MODEL.md).
         if self._evidence_key is not None:
             if head is None:
-                return result("chain_empty" if count == 0 else "head_missing", count)
+                if count == 0:
+                    return result("chain_empty", 0)
+                return result("head_deleted" if self._born_with_head(events) else "head_missing", count)
             if count == 0 or not head["head_mac"]:
                 return result("head_mismatch", count)
             if int(head["seq"]) != count - 1 or str(head["head_hash"]) != last_hash:

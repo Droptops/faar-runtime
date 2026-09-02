@@ -51,10 +51,30 @@ SCENARIOS = (
     ("success", MockMode.SUCCESS, MockMode.SUCCESS, None),
     ("timeout_before_effect", MockMode.TIMEOUT_BEFORE_EFFECT, MockMode.SUCCESS, None),
     ("timeout_after_effect", MockMode.TIMEOUT_AFTER_EFFECT, MockMode.SUCCESS, None),
-    ("ambiguous_then_recovered", MockMode.AMBIGUOUS, MockMode.SUCCESS, None),
+    ("ambiguous_admission_then_recovered", MockMode.AMBIGUOUS, MockMode.SUCCESS, None),
     ("deterministic_rejection", MockMode.SUCCESS, MockMode.SUCCESS, "reject"),
     ("partial_fill_then_cancel", MockMode.PARTIAL_FILL, MockMode.PARTIAL_FILL, None),
 )
+
+# Per scenario: the largest legitimate number of venue calls, and the acceptable
+# (final state, usage, effects) outcomes. Anything else is a violation, so a change
+# that made every scenario stop with HELD budget, or that submitted twice into the
+# idempotent mock venue, cannot pass.
+EXPECTED = {
+    "success": (1, {("FINALIZED", "COMMITTED", 1)}),
+    # A transport timeout before admission never consumes the permit: the retry is
+    # legitimate and is the only scenario with two venue calls.
+    "timeout_before_effect": (2, {("FINALIZED", "COMMITTED", 1)}),
+    "timeout_after_effect": (1, {("FINALIZED", "COMMITTED", 1)}),
+    # The ambiguous mock admits the request (consumes the permit) and leaves no
+    # record: a crash after admission ends STOPPED with budget held by design; a
+    # crash before it lets the recovered venue execute once.
+    "ambiguous_admission_then_recovered": (1, {("FINALIZED", "COMMITTED", 1), ("STOPPED", "HELD", 0)}),
+    # The rejecting transport never reaches the venue; recovery uses the venue
+    # itself. A persisted deterministic block ends FAILED_SAFE with budget released.
+    "deterministic_rejection": (1, {("FINALIZED", "COMMITTED", 1), ("FAILED_SAFE", "RELEASED", 0)}),
+    "partial_fill_then_cancel": (1, {("FINALIZED", "COMMITTED", 1)}),
+}
 
 
 class PersistentMockVenue(MockVenue):
@@ -231,13 +251,22 @@ def _recover(db: str, venue_path: str, scenario: str) -> dict:
     return out
 
 
-def _violations(case: dict) -> list[str]:
+def _violations(case: dict, scenario: str) -> list[str]:
     v = []
     state = case["final_state"]
+    max_calls, acceptable = EXPECTED[scenario]
     if case["effects"] > 1:
         v.append("DUPLICATE_EFFECT")
-    if case["adapter_calls"] > 2:
+    if case["adapter_calls"] > max_calls:
         v.append("EXCESS_ADAPTER_CALLS")
+    if case["effects_before_recovery"] == 1 and case["adapter_calls"] > 1:
+        v.append("RESUBMITTED_AFTER_EFFECT")
+    if case["permits"][1] > 1:
+        v.append("MULTIPLE_PERMITS_CONSUMED")
+    if (state, case["usage"], case["effects"]) not in acceptable:
+        v.append("UNEXPECTED_OUTCOME")
+    if state == "STOPPED" and case["final_reason_codes"] != ["SETTLEMENT_NONE_AFTER_PERMIT_CONSUMED"]:
+        v.append("UNEXPECTED_STOP_REASON")
     if state not in {s.value for s in TERMINAL_STATES}:
         v.append("NOT_TERMINAL_AFTER_RECOVERY")
     if case["effects"] == 1 and (state != "FINALIZED" or case["usage"] != "COMMITTED"):
@@ -285,7 +314,7 @@ def main() -> None:
                     raise SystemExit(f"worker did not crash where injected: {scenario} crash_at={crash_at} exit={code}")
                 case = _recover(db, venue_path, scenario)
                 case["crash_at"] = crash_at
-                case["violations"] = _violations(case)
+                case["violations"] = _violations(case, scenario)
                 outcomes.append(case)
                 report["cases"] += 1
                 for name in case["violations"]:

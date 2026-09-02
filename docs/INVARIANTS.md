@@ -150,7 +150,7 @@ With `adapter_deadline_seconds` configured, a hung adapter call cannot hold the 
 
 ## I-33 — Consumed authority cannot be resurrected by restore
 
-With an authority anchor kept outside the backup set, a grant version whose `(runtime_epoch, fence_counter)` regressed behind the anchor is `REGRESSED`: no permit is issued or consumed under it and its lifecycle cannot be changed except by `revoke_after_restore`. The fence counter advances at issuance and at consumption, so a snapshot between the two is detected. Once a database has been opened with an anchor, an instance without one cannot consume or change authority (`ANCHOR_REQUIRED`), and an unreadable anchor fails closed (`ANCHOR_UNAVAILABLE`). Without an anchor this invariant does not hold; the test suite documents that ceiling.
+With an authority anchor kept outside the backup set, a grant version whose `(runtime_epoch, fence_counter)` regressed behind the anchor is `REGRESSED`: no permit is issued or consumed under it and its lifecycle cannot be changed except by `revoke_after_restore`. The fence counter advances at issuance and at consumption, so a snapshot between the two is detected; the mark is raised inside the datastore transaction, so authority never exists without it (stop-direction changes commit even when the anchor is unreachable and report it). Once a database has been opened with an anchor, an instance without one cannot consume or change authority (`ANCHOR_REQUIRED`), and an unreadable anchor fails closed (`ANCHOR_UNAVAILABLE`). Without an anchor this invariant does not hold; the test suite documents that ceiling.
 
 ## I-34 — Key lifecycle is enforced at verification
 

@@ -187,8 +187,8 @@ Operator commands (`python -m faar.cli --help`): `provision-grant`, `set-grant-s
 
 See [`docs/V0_4_RELEASE.md`](docs/V0_4_RELEASE.md). The deterministic release gate (`make check`) includes unit tests, adversarial denial/replay checks with adapter-call and permit-consumption metrics, a red-team matrix in which every attack class is mapped to named tests, seeded state-machine fuzz with an advancing clock, the demo CLI path with keyed evidence verification, and the bounded permit protocol model checker. Headline results:
 
-- 289/289 unit/invariant tests
-- 117 targeted red-team attack classes mapped to 157 named tests, 0 unmapped
+- 310/310 unit/invariant tests
+- 132 targeted red-team attack classes mapped to 178 named tests, 0 unmapped
 - 160 adversarial denial cases with 0 unauthorized economic effects and 0 adapter calls
 - 100 same-intent replay attempts with 1 economic effect, 1 adapter call, 1 permit issued and consumed
 - 96 seeded fuzz scenarios with 0 duplicate-effect and 0 aggregate-budget violations

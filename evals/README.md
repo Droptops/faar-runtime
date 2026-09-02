@@ -32,7 +32,7 @@ timeout_after_effect_successful_effects = 1
 
 ## Targeted red team
 
-`run_redteam.py` maps 117 named attack classes to 157 concrete unit tests, loads the suite in-process, asserts that every mapped test exists and passes, and reports any `unmapped_tests`. The headline count therefore cannot drift from real coverage: deleting a mapped test fails the gate.
+`run_redteam.py` maps 132 named attack classes to 178 concrete unit tests, loads the suite in-process, asserts that every mapped test exists and passes, and reports any `unmapped_tests`. The headline count therefore cannot drift from real coverage: deleting a mapped test fails the gate.
 
 ## Crash injection
 

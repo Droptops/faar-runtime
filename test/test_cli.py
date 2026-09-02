@@ -71,9 +71,14 @@ class OperatorCliTests(unittest.TestCase):
         i = intent(intent_id="intent_cli_lease_000000001")
         store.register(i, canonical_hash(i))
         with store.intent_guard(i.intent_id):
-            token = store.intent_lease(i.intent_id)["owner_token"]
+            lease = store.intent_lease(i.intent_id)
+            token = lease["owner_token"]
+            self.assertEqual(os.getpid(), lease["pid"])
             self.run_cli("clear-lease", "--intent-id", i.intent_id, "--owner-token", "wrong", "--db", self.db, expect_exit=2)
-            cleared = self.run_cli("clear-lease", "--intent-id", i.intent_id, "--owner-token", token, "--db", self.db)
+            # The owner is this very process: refused unless forced.
+            refused = self.run_cli("clear-lease", "--intent-id", i.intent_id, "--owner-token", token, "--db", self.db, expect_exit=2)
+            self.assertEqual("LeaseOwnerAlive", refused["error"])
+            cleared = self.run_cli("clear-lease", "--intent-id", i.intent_id, "--owner-token", token, "--db", self.db, "--force")
             self.assertTrue(cleared["cleared"])
         store.close()
 
@@ -116,6 +121,7 @@ class OperatorCliTests(unittest.TestCase):
         conn = sqlite3.connect(self.db)
         conn.execute("DELETE FROM evidence_head")
         conn.execute("DELETE FROM evidence WHERE intent_id=?", (empty.intent_id,))
+        conn.execute("DELETE FROM store_settings WHERE key='heads_since'")  # a pre-head database
         conn.commit()
         conn.close()
         with mock.patch.dict(os.environ, {"FAAR_TEST_EVIDENCE_KEY": key}):

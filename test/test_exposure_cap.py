@@ -11,7 +11,7 @@ from decimal import Decimal
 from faar import cli
 from faar.anchor import FileAuthorityAnchor
 from faar.canonical import canonical_hash
-from faar.models import IntentState
+from faar.models import EconomicPrimitive, IntentState
 from faar.store import AuthorityAnchorRequired, SQLiteIntentStore
 from support import AUTH, NOW, PRINCIPAL, attest_pair, build_mock_runtime, grant, intent, risk, temp_path, trust
 
@@ -81,6 +81,26 @@ class ExposureCapTests(unittest.TestCase):
         self.assertEqual(0, venue.execute_call_count("intent_cap_000000000022"))
         self.assertEqual((0, 0), self.store.permit_counts("intent_cap_000000000022"))
 
+    def test_zero_notional_actions_pass_a_cap_tightened_below_current_turnover(self):
+        # An emergency tightening must not stop agents from cancelling resting
+        # orders: a zero-notional action adds no exposure.
+        self.assertTrue(self.reserve("intent_cap_000000000031", version=1)[0])
+        self.store.set_exposure_cap("global", Decimal("40"))
+        cancel = intent(intent_id="intent_cap_000000000032", primitive=EconomicPrimitive.CANCEL_ORDER, payload={"order_id": "o-1", "target": "router:approved"})
+        self.store.register(cancel, canonical_hash(cancel))
+        ok, reasons = self.store.reserve_usage(cancel, grant(), risk(state_version=2), NOW)
+        self.assertEqual((True, ()), (ok, reasons))
+        ok, reasons = self.reserve("intent_cap_000000000033", version=3)
+        self.assertEqual((False, ("EXPOSURE_CAP_EXCEEDED",)), (ok, reasons))
+
+    def test_unreadable_stored_cap_fails_closed_with_a_reason(self):
+        self.store.set_exposure_cap("global", Decimal("100"))
+        for raw in ("abc", "1e5000", "-5", ""):
+            self.store._conn.execute("UPDATE exposure_caps SET max_turnover_usd=?", (raw,))
+            self.store._conn.commit()
+            ok, reasons = self.reserve(f"intent_cap_00000000004{len(raw)}", version=10 + len(raw))
+            self.assertEqual((False, ("EXPOSURE_CAP_UNREADABLE",)), (ok, reasons), raw)
+
     def test_caps_are_authority_changes_on_an_anchored_database(self):
         anchor_path = temp_path(self, ".anchor.json")
         anchored_path = temp_path(self)
@@ -106,11 +126,11 @@ class ExposureCapTests(unittest.TestCase):
                 self.assertEqual(expect_exit, code, buf.getvalue())
             return json.loads(buf.getvalue()) if buf.getvalue().strip() else None
 
-        self.assertEqual({"scope": "global", "max_turnover_usd": "250"}, run("set-exposure-cap", "--scope", "global", "--max-usd", "250", "--db", self.path))
+        self.assertEqual({"scope": "global", "max_turnover_usd": "250", "grant_versions_in_scope": 2}, run("set-exposure-cap", "--scope", "global", "--max-usd", "250", "--db", self.path))
         self.assertEqual("250", run("exposure-caps", "--db", self.path)[0]["max_turnover_usd"])
         bad = run("set-exposure-cap", "--scope", "global", "--max-usd", "-5", "--db", self.path, expect_exit=2)
         self.assertEqual("ValueError", bad["error"])
-        self.assertEqual({"scope": "global", "max_turnover_usd": None}, run("set-exposure-cap", "--scope", "global", "--clear", "--db", self.path))
+        self.assertEqual({"scope": "global", "max_turnover_usd": None, "grant_versions_in_scope": 2}, run("set-exposure-cap", "--scope", "global", "--clear", "--db", self.path))
         self.assertEqual([], run("exposure-caps", "--db", self.path))
 
 

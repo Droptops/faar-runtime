@@ -242,6 +242,41 @@ ATTACK_CLASSES: dict[str, tuple[str, ...]] = {
     "finality lag between quorum members treated as a contest": ("test_live_money_redteam.MaliciousSettlementSourceTests.test_finality_lag_between_sources_is_not_a_contest",),
     "garbage-returning quorum member wedging the quorum": ("test_live_money_redteam.MaliciousSettlementSourceTests.test_a_garbage_returning_minority_member_cannot_wedge_the_quorum",),
     "definition of done decoupled from the runtime verdict": ("test_live_money_redteam.MaliciousSettlementSourceTests.test_outcome_verifier_follows_the_runtime_verdict",),
+    "quorum aggregate failing its own evidence bounds": (
+        "test_live_money_redteam.MaliciousSettlementSourceTests.test_quorum_aggregate_never_fails_its_own_bounds",
+        "test_live_money_redteam.MaliciousSettlementSourceTests.test_overlong_member_effect_id_cannot_wedge_the_quorum",
+    ),
+    "Decimal subclass lying about comparison or formatting": ("test_live_money_redteam.MaliciousSettlementSourceTests.test_decimal_subclass_never_survives_record_construction",),
+    "exposure cap blocking zero-notional actions or raising on corrupt rows": (
+        "test_exposure_cap.ExposureCapTests.test_zero_notional_actions_pass_a_cap_tightened_below_current_turnover",
+        "test_exposure_cap.ExposureCapTests.test_unreadable_stored_cap_fails_closed_with_a_reason",
+    ),
+    # --- live-money pass: chaos engineer, time attacker --------------------------------
+    "anchor behind the datastore after a crash or anchor failure": (
+        "test_chaos_and_time.AnchorOrderingTests.test_authority_never_exists_without_its_anchor_mark",
+        "test_chaos_and_time.AnchorOrderingTests.test_stopping_commits_even_when_the_anchor_fails_and_loosening_does_not",
+    ),
+    "stalled anchor lock hanging workers and the halt": ("test_chaos_and_time.AnchorOrderingTests.test_anchor_lock_wait_is_bounded_and_the_halt_still_commits",),
+    "lease without liveness identity cleared under a live worker": (
+        "test_chaos_and_time.LeaseAndBusyStoreTests.test_lease_records_liveness_and_refuses_to_clear_a_live_local_owner",
+        "test_chaos_and_time.LeaseAndBusyStoreTests.test_owner_can_reacquire_its_own_lease_after_a_failed_release",
+    ),
+    "busy datastore escaping as a traceback": ("test_chaos_and_time.LeaseAndBusyStoreTests.test_busy_datastore_is_a_result_not_a_traceback",),
+    "checkpoint reporting success while WAL frames remain": ("test_chaos_and_time.LeaseAndBusyStoreTests.test_checkpoint_reports_when_the_wal_could_not_be_folded",),
+    "trailing window shortened by second truncation": ("test_chaos_and_time.TimeBoundaryTests.test_trailing_windows_are_never_shorter_than_configured",),
+    "unbounded time limits, skews, or a naive clock crashing the runtime": (
+        "test_chaos_and_time.TimeBoundaryTests.test_time_valued_limits_and_skews_are_bounded",
+        "test_chaos_and_time.TimeBoundaryTests.test_naive_clock_fails_before_anything_is_registered",
+    ),
+    "foreign grant shortening an in-flight intent's ambiguity window": ("test_chaos_and_time.TimeBoundaryTests.test_reconciliation_is_bound_to_the_intents_own_grant",),
+    # --- live-money pass: operator and authority --------------------------------------
+    "fresh or replaced anchor un-regressing a restored database": (
+        "test_operator_redteam.AnchorIdentityTests.test_a_fresh_or_different_anchor_cannot_un_regress_a_restored_database",
+        "test_operator_redteam.AnchorIdentityTests.test_databases_bound_before_identities_existed_adopt_the_anchor_identity",
+    ),
+    "evidence truncation laundered through the head rebuild": ("test_operator_redteam.EvidenceLaunderingTests.test_a_deleted_head_is_tampering_not_a_legacy_chain",),
+    "halt or cap on a mistyped principal reporting success": ("test_operator_redteam.ControlScopeTests.test_controls_refuse_scopes_that_match_nothing",),
+    "restore reinstating a looser exposure cap": ("test_operator_redteam.ControlScopeTests.test_exposure_caps_are_anchored_against_restore",),
 }
 
 

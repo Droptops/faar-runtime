@@ -387,6 +387,11 @@ class EvidenceIntegrityTests(unittest.TestCase):
     def test_rebuild_head_only_for_verified_legacy_chains(self):
         store, iid = self._seed(EVIDENCE_KEY)
         store._conn.execute("DELETE FROM evidence_head WHERE intent_id=?", (iid,))  # pre-head database shape
+        # Declare the existing events pre-head, as the first 0.4 open of a 0.3.x
+        # database does; without this the missing head is tampering (head_deleted).
+        store._conn.execute("UPDATE store_settings SET value=? WHERE key='heads_since'", (str(10 ** 9),))
+        store._conn.commit()
+        store._heads_since = 10 ** 9
         with self.assertRaises(EvidenceIntegrityError):
             store.add_evidence(iid, "blocked", {})
         self.assertTrue(store.rebuild_evidence_head(iid))
@@ -437,8 +442,12 @@ class LegacyChainTests(unittest.TestCase):
 
     @staticmethod
     def _drop_heads(path, *, empty_intent=None):
+        # Simulate a database written before signed heads existed: the heads are
+        # gone and the "heads since" mark is unset, so the next open treats every
+        # existing event as legacy (exactly what a real 0.3.x upgrade sees).
         conn = sqlite3.connect(path)
         conn.execute("DELETE FROM evidence_head")
+        conn.execute("DELETE FROM store_settings WHERE key='heads_since'")
         if empty_intent is not None:
             conn.execute("DELETE FROM evidence WHERE intent_id=?", (empty_intent,))
         conn.commit()

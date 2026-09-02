@@ -27,6 +27,7 @@ import json
 import os
 import tempfile
 import threading
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator, Protocol
@@ -45,6 +46,23 @@ class AnchorUnavailable(RuntimeError):
     """The anchor could not be read or written; authority checks must fail closed."""
 
 
+class AnchorMismatch(RuntimeError):
+    """The datastore is bound to a different anchor than the one presented (a fresh,
+    replaced or wrong anchor file); opening with it would silently un-regress a
+    restored datastore, so it is refused."""
+
+
+# Reserved key under which the anchor stores the identity it was bound with.
+ANCHOR_IDENTITY_KEY = "__identity__"
+
+
+# Longest wait for the inter-process anchor lock before the anchor is reported
+# unavailable. A stalled holder (frozen process, hung network volume) must turn
+# into a machine-readable failure, never an unbounded hang inside process() or
+# under the emergency halt.
+ANCHOR_LOCK_TIMEOUT_SECONDS = 5.0
+
+
 class AuthorityAnchor(Protocol):
     def high_water(self, grant_id: str, version: int) -> tuple[int, int] | None:
         """Highest (runtime_epoch, fence_counter) recorded for the grant version."""
@@ -54,6 +72,12 @@ class AuthorityAnchor(Protocol):
 
     def reset(self, grant_id: str, version: int, epoch: int, fence: int) -> None:
         """Operator-only: set the mark to the given values after manual reconciliation."""
+
+    def identity(self) -> str | None:
+        """The identity this anchor was bound with, or None for a fresh anchor."""
+
+    def bind_identity(self, anchor_id: str) -> None:
+        """Bind a fresh anchor to an identity; a different existing identity is `AnchorMismatch`."""
 
 
 def regressed(current: tuple[int, int], mark: tuple[int, int] | None) -> bool:
@@ -80,6 +104,17 @@ class InMemoryAuthorityAnchor:
         with self._lock:
             self._marks[(grant_id, version)] = (epoch, fence)
 
+    def identity(self) -> str | None:
+        with self._lock:
+            return getattr(self, "_identity", None)
+
+    def bind_identity(self, anchor_id: str) -> None:
+        with self._lock:
+            current = getattr(self, "_identity", None)
+            if current is not None and current != anchor_id:
+                raise AnchorMismatch(f"anchor is bound to {current}, not {anchor_id}")
+            self._identity = str(anchor_id)
+
 
 class FileAuthorityAnchor:
     """Durable anchor in a small JSON file rewritten atomically (tmp + fsync + rename).
@@ -91,13 +126,17 @@ class FileAuthorityAnchor:
     database backup set.
     """
 
-    def __init__(self, path: str | Path) -> None:
+    def __init__(self, path: str | Path, *, lock_timeout_seconds: float = ANCHOR_LOCK_TIMEOUT_SECONDS) -> None:
         self.path = Path(path)
         self._lock_path = self.path.with_name(self.path.name + ".lock")
         self._lock = threading.Lock()
-        with self._exclusive():
-            if not self.path.exists():
-                self._write({})
+        if not lock_timeout_seconds > 0:
+            raise ValueError("lock_timeout_seconds must be positive")
+        self.lock_timeout_seconds = float(lock_timeout_seconds)
+        if not self.path.exists():
+            with self._exclusive():
+                if not self.path.exists():
+                    self._write({})
 
     @contextmanager
     def _exclusive(self) -> Iterator[None]:
@@ -110,13 +149,23 @@ class FileAuthorityAnchor:
             except OSError as exc:
                 raise AnchorUnavailable(f"cannot open anchor lock {self._lock_path}: {exc}") from exc
             try:
-                fcntl.flock(fd, fcntl.LOCK_EX)
-                yield
-            finally:
+                deadline = time.monotonic() + self.lock_timeout_seconds
+                while True:
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        if time.monotonic() >= deadline:
+                            raise AnchorUnavailable(
+                                f"anchor lock {self._lock_path} not acquired within {self.lock_timeout_seconds}s"
+                            ) from None
+                        time.sleep(0.01)
                 try:
-                    fcntl.flock(fd, fcntl.LOCK_UN)
+                    yield
                 finally:
-                    os.close(fd)
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
 
     @staticmethod
     def _key(grant_id: str, version: int) -> str:
@@ -189,3 +238,22 @@ class FileAuthorityAnchor:
             marks = self._read()
             marks[self._key(grant_id, version)] = [int(epoch), int(fence)]
             self._write(marks)
+
+    def identity(self) -> str | None:
+        with self._exclusive():
+            value = self._read().get(ANCHOR_IDENTITY_KEY)
+        if value is None:
+            return None
+        if not isinstance(value, str) or not value:
+            raise AnchorUnavailable("anchor file carries a malformed identity")
+        return value
+
+    def bind_identity(self, anchor_id: str) -> None:
+        with self._exclusive():
+            marks = self._read()
+            current = marks.get(ANCHOR_IDENTITY_KEY)
+            if current is not None and current != anchor_id:
+                raise AnchorMismatch(f"anchor {self.path} is bound to {current}, not {anchor_id}")
+            if current is None:
+                marks[ANCHOR_IDENTITY_KEY] = str(anchor_id)
+                self._write(marks)

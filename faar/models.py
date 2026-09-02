@@ -111,6 +111,13 @@ def _deep_freeze(value: Any, _depth: int = 0, _budget: list[int] | None = None) 
     raise ValueError(f"unsupported canonical value type: {type(value).__name__}")
 
 
+# Upper bound for every time-valued limit (one leap year) and, separately, for a
+# clock-skew allowance: a skew of hours would disable the future-dated checks and
+# make every permit window unclosable, so it is capped at one hour.
+MAX_LIMIT_SECONDS = 366 * 86_400
+MAX_CLOCK_SKEW_SECONDS = 3_600
+
+
 def _require_int(name: str, value: int, *, minimum: int | None = None, maximum: int = MAX_SAFE_INT) -> None:
     if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError(f"{name} must be an integer")
@@ -273,20 +280,20 @@ class CapabilityLimits:
             if value is not None and not isinstance(value, Decimal):
                 raise ValueError(f"{name} must be Decimal or None")
             _finite_nonnegative_decimal(name, value)
-        for name in (
-            "max_slippage_bps",
-            "max_price_impact_bps",
-            "max_market_data_age_seconds",
-            "max_risk_snapshot_age_seconds",
-            "max_intent_ttl_seconds",
-            "max_clock_skew_seconds",
-            "max_actions_per_window",
-        ):
+        for name in ("max_slippage_bps", "max_price_impact_bps", "max_actions_per_window"):
             value = getattr(self, name)
             if value is not None:
                 _require_int(name, value, minimum=0)
+        # Time-valued limits are bounded so the gates can always form a timedelta
+        # from them; an absurd value must fail at the document boundary, not raise
+        # OverflowError out of process() after the intent is registered.
+        for name in ("max_market_data_age_seconds", "max_risk_snapshot_age_seconds", "max_intent_ttl_seconds"):
+            value = getattr(self, name)
+            if value is not None:
+                _require_int(name, value, minimum=0, maximum=MAX_LIMIT_SECONDS)
+        _require_int("max_clock_skew_seconds", self.max_clock_skew_seconds, minimum=0, maximum=MAX_CLOCK_SKEW_SECONDS)
         if self.action_window_seconds is not None:
-            _require_int("action_window_seconds", self.action_window_seconds, minimum=1)
+            _require_int("action_window_seconds", self.action_window_seconds, minimum=1, maximum=MAX_LIMIT_SECONDS)
         if self.max_actions_per_window is not None and self.action_window_seconds is None:
             raise ValueError("action_window_seconds is required when max_actions_per_window is set")
         _require_int("max_submission_attempts", self.max_submission_attempts, minimum=1)
@@ -621,10 +628,12 @@ class SettlementRecord:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "status", SettlementStatus(self.status))
-        if self.effect_id is not None and not isinstance(self.effect_id, str):
-            raise ValueError("settlement effect_id must be a string or None")
-        if self.verified_request_hash is not None and not isinstance(self.verified_request_hash, str):
-            raise ValueError("verified_request_hash must be a string or None")
+        if self.effect_id is not None and (not isinstance(self.effect_id, str) or len(self.effect_id) > MAX_CANONICAL_STRING_CHARS):
+            raise ValueError("settlement effect_id must be a bounded string or None")
+        if self.verified_request_hash is not None and (
+            not isinstance(self.verified_request_hash, str) or len(self.verified_request_hash) > MAX_CANONICAL_STRING_CHARS
+        ):
+            raise ValueError("verified_request_hash must be a bounded string or None")
         object.__setattr__(self, "evidence", _deep_freeze(self.evidence))
         _require_bounded_evidence(self.evidence)
         _require_bool("authoritative", self.authoritative)

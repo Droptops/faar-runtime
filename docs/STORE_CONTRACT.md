@@ -29,7 +29,7 @@ the single txn whose commit order decides a race.
 | `transition(id, expected, new, *, reason_codes, effect_id, release_usage, commit_usage, ambiguity_until)` | Compare-and-set on the stored state; only transitions in `_ALLOWED_TRANSITIONS`; `release_usage`/`commit_usage` update the reservation in the same txn; setting `effect_id` enforces uniqueness per `(venue, effect_id)` (`EffectConflict`). **LP** for terminalization. | I-3, I-11, I-38 |
 | `begin_submission(id, expected, *, max_attempts)` | CAS into SUBMITTED and increment the durable attempt counter atomically; resets `ambiguity_until`; refuses past the attempt limit. **LP** for "an attempt began". | I-5 |
 | `get(id)` | Reads the row; unknown ids raise `UnknownIntent`. | |
-| `intent_guard(id, wait_seconds)` | Durable per-intent lease: at most one worker inside an intent's state machine across processes; a dead worker's lease is never taken over automatically (`IntentBusy`); `clear_stale_intent_lease` needs the exact owner token. | I-6, OPERATIONS §2 |
+| `intent_guard(id, wait_seconds)` | Durable per-intent lease recording owner token, host and pid: at most one worker inside an intent's state machine across processes; the same owner may re-acquire its own lease; a dead worker's lease is never taken over automatically (`IntentBusy`); `clear_stale_intent_lease` needs the exact owner token and refuses a live local owner unless forced; a busy datastore raises `StoreUnavailable`, never a bare driver error. | I-6, OPERATIONS §2 |
 
 ## 3. Budget and risk ledger
 
@@ -44,14 +44,14 @@ the single txn whose commit order decides a race.
 
 | Method | Guarantee | Notes |
 |---|---|---|
-| `provision_grant(grant, hash)` | Immutable per `(grant_id, version)`; a different hash or principal is `GrantConflict`; records `(epoch 1, fence 0)` to the anchor after commit. | I-16 |
+| `provision_grant(grant, hash)` | Immutable per `(grant_id, version)`; a different hash or principal is `GrantConflict`; records `(epoch 1, fence 0)` to the anchor inside the txn (rollback on anchor failure). | I-16 |
 | `verify_grant`, `get_grant_control` | Read-only; effective status folds in halt (`HALTED`), anchor regression (`REGRESSED`), missing anchor (`ANCHOR_REQUIRED`) and an unreadable anchor (`ANCHOR_UNAVAILABLE`). | I-32, I-33 |
-| `set_grant_status(...)` | One txn; every real lifecycle change advances `runtime_epoch`; serialized with `next_execution_fence` and `consume_execution_permit` by the per-grant execution guard plus the datastore txn. **LP** for revocation. | I-17 |
-| `next_execution_fence(grant)` | Allocates a strictly increasing fence under an ACTIVE, unhalted, unregressed grant; the fence counter also advances at consumption; both are pushed to the anchor after commit. | I-33 |
+| `set_grant_status(...)` | One txn; every real lifecycle change advances `runtime_epoch`; the anchor mark is raised inside the txn (re-activation rolls back on anchor failure; pause/revoke commit and report it); serialized with `next_execution_fence` and `consume_execution_permit` by the per-grant execution guard plus the datastore txn. **LP** for revocation. | I-17 |
+| `next_execution_fence(grant)` | Allocates a strictly increasing fence under an ACTIVE, unhalted, unregressed grant; the fence counter also advances at consumption; both are pushed to the anchor inside the txn (rollback on anchor failure). | I-33 |
 | `record_execution_permit(...)` | Records the permit and sets the intent's `ambiguity_until` to its expiry in the same txn; refuses a second live permit per intent (`PermitConflict`). | I-30 |
 | `consume_execution_permit(...)` | **LP** for execution authorization: ledger binding, not consumed, not voided, not superseded, grant ACTIVE with the same epoch, not halted, anchor consulted; marks consumed and advances the fence in the same txn. | I-19, I-30 |
 | `void_unconsumed_permits(id)` | Marks every unconsumed permit of the intent voided in one txn; consumption after that is `PERMIT_VOIDED` regardless of clocks. | I-30 |
-| `halt(scope)` / `resume(scope)` | One txn that records the control and advances every affected grant epoch; requires the anchor on an anchored datastore. | I-32 |
+| `halt(scope)` / `resume(scope)` | One txn that records the control and advances every affected grant epoch; requires the anchor on an anchored datastore; `halt` commits even when the anchor write fails and reports it. | I-32 |
 | `revoke_after_restore(grant, version)` | Advances the epoch past the anchored mark and revokes the version; resets the anchor. | I-33 |
 
 ## 5. Evidence

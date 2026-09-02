@@ -321,6 +321,72 @@ class MaliciousSettlementSourceTests(_Base):
             self.assertEqual(SettlementStatus.FINALIZED, record.status)
             self.assertIn("c", record.evidence["errors"])
 
+    def test_quorum_aggregate_never_fails_its_own_bounds(self):
+        # Every member is inside the evidence bound; their sum is not. An honest
+        # quorum must still produce a record (compact form with evidence hashes),
+        # or an existing effect could never be finalized.
+        request = ExecutionRequest.from_intent(intent())
+        big_a = {"fill": {"raw": "a" * 8000, **{f"k{n}": "b" * 8000 for n in range(4)}}}
+        big_b = {"fill": {"raw": "c" * 8000, **{f"k{n}": "d" * 8000 for n in range(4)}}}
+
+        def final(evidence):
+            def make(req):
+                return SettlementRecord(SettlementStatus.FINALIZED, "fx-1", Decimal("50"), evidence=evidence, authoritative=True, verified_request_hash=canonical_hash(req))
+            return make
+        record = QuorumSettlementVerifier([_src("a", final(big_a)), _src("b", final(big_b))], quorum=2).verify(request)
+        self.assertEqual(SettlementStatus.FINALIZED, record.status)
+        self.assertTrue(record.evidence.get("evidence_truncated"))
+        self.assertEqual({"a", "b"}, set(record.evidence["source_evidence_hashes"]))
+        identical = QuorumSettlementVerifier([_src("a", final(big_a)), _src("b", final(big_a))], quorum=2).verify(request)
+        self.assertEqual(SettlementStatus.FINALIZED, identical.status)
+        # End to end the intent finalizes.
+        adapter = ScriptedAdapter([ExecutionReceipt("fx-1", SettlementStatus.CONFIRMED, {}, Decimal("50"))], [])
+        runtime = self.runtime_for(adapter, verifier=QuorumSettlementVerifier([_src("a", final(big_a)), _src("b", final(big_b))], quorum=2))
+        i = intent(intent_id="intent_redteam_000000000210")
+        self.assertEqual(IntentState.FINALIZED, self.run_case(runtime, i).state)
+        self.assertEqual("COMMITTED", self.usage_status(i.intent_id))
+
+    def test_overlong_member_effect_id_cannot_wedge_the_quorum(self):
+        request = ExecutionRequest.from_intent(intent())
+        fin = _auth(SettlementStatus.FINALIZED, "fx-1", "50")
+        # Beyond the record bound: the member errors, the honest pair decides.
+        absurd = _auth(SettlementStatus.FINALIZED, "y" * 9000, "50")
+        record = QuorumSettlementVerifier([_src("a", fin), _src("b", fin), _src("c", absurd)], quorum=2).verify(request)
+        self.assertEqual(SettlementStatus.FINALIZED, record.status)
+        self.assertIn("c", record.evidence["errors"])
+        # Inside the record bound but not a valid effect id for the runtime: a real
+        # contest, recorded with the id truncated so the aggregate stays bounded.
+        odd = _auth(SettlementStatus.FINALIZED, "y" * 6000, "50")
+        contested = QuorumSettlementVerifier([_src("a", fin), _src("b", odd)], quorum=2).verify(request)
+        self.assertEqual(SettlementStatus.CONTRADICTORY, contested.status)
+        self.assertLessEqual(max(len(f[1] or "") for f in contested.evidence["facts"]), 512)
+        many = QuorumSettlementVerifier([_src(f"s{n}", odd) for n in range(12)], quorum=2).verify(request)
+        self.assertEqual(SettlementStatus.FINALIZED, many.status)
+
+    def test_decimal_subclass_never_survives_record_construction(self):
+        class Lying(Decimal):
+            def __gt__(self, other):
+                return False
+
+            def __format__(self, spec):
+                return "50"
+
+        record = SettlementRecord(SettlementStatus.FINALIZED, "fx-1", Lying("500"), authoritative=True, verified_request_hash="h")
+        self.assertIs(type(record.amount_usd), Decimal)
+        self.assertEqual(Decimal("500"), record.amount_usd)
+        receipt = ExecutionReceipt("fx-1", SettlementStatus.FINALIZED, {}, Lying("500"))
+        self.assertIs(type(receipt.amount_usd), Decimal)
+
+        def lying(req):
+            return SettlementRecord(SettlementStatus.FINALIZED, "fx-1", Lying("500"), authoritative=True, verified_request_hash=canonical_hash(req))
+        adapter = ScriptedAdapter([ExecutionReceipt("fx-1", SettlementStatus.CONFIRMED, {}, Decimal("50"))], [lying])
+        runtime = self.runtime_for(adapter)
+        i = intent(intent_id="intent_redteam_000000000211")
+        result = self.run_case(runtime, i)
+        self.assertEqual(IntentState.STOPPED, result.state)
+        self.assertEqual(("SETTLED_AMOUNT_EXCEEDS_AUTHORIZED",), result.reason_codes)
+        self.assertEqual("HELD", self.usage_status(i.intent_id))
+
     def test_outcome_verifier_follows_the_runtime_verdict(self):
         i = intent()
         request = ExecutionRequest.from_intent(i)

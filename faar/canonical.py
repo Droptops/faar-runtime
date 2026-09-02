@@ -63,7 +63,9 @@ def parse_bounded_decimal(raw: object) -> Decimal | None:
             return None
         value = Decimal(repr(raw))
     elif isinstance(raw, Decimal):
-        value = raw
+        # A plain copy: a Decimal subclass with overridden comparison or
+        # formatting must not survive into gates, ledgers or evidence.
+        value = Decimal(raw)
     else:
         return None
     if not value.is_finite():

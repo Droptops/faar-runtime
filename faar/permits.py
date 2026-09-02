@@ -14,6 +14,7 @@ from .canonical import canonical_hash, canonical_json, parse_bounded_decimal
 from .gates import evaluate_authority, evaluate_capability, evaluate_risk
 from .store import PermitConflict
 from .models import (
+    MAX_CLOCK_SKEW_SECONDS,
     Attestation,
     AttestationKind,
     AuthorityDecision,
@@ -412,7 +413,7 @@ class ExecutionPermitVerifier:
         signature: PermitVerifier | Mapping[str, PermitVerifier],
         control_store: PermitControlStore,
         *,
-        max_clock_skew_seconds: int = 2,
+        max_clock_skew_seconds: int = 5,
         allow_signing_backend_for_tests: bool = False,
         key_validity: Mapping[str, KeyValidity] | None = None,
         max_permit_lifetime_seconds: int = 60,
@@ -423,6 +424,8 @@ class ExecutionPermitVerifier:
             raise ValueError("at least one permit verifier is required")
         if max_permit_lifetime_seconds <= 0:
             raise ValueError("max_permit_lifetime_seconds must be positive")
+        if not isinstance(max_clock_skew_seconds, int) or isinstance(max_clock_skew_seconds, bool) or not 0 <= max_clock_skew_seconds <= MAX_CLOCK_SKEW_SECONDS:
+            raise ValueError("max_clock_skew_seconds must be an integer between 0 and MAX_CLOCK_SKEW_SECONDS")
         for signer_id, verifier in verifiers.items():
             if verifier.signer_id != signer_id:
                 raise ValueError(f"permit verifier registered under {signer_id!r} reports signer_id {verifier.signer_id!r}")

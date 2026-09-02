@@ -42,8 +42,8 @@ Current `make check` headline results:
 
 | Gate | Result |
 |---|---|
-| Unit/invariant tests | 289/289 pass |
-| Targeted red-team | 117 attack classes mapped to 157 named tests, 0 unmapped |
+| Unit/invariant tests | 310/310 pass |
+| Targeted red-team | 132 attack classes mapped to 178 named tests, 0 unmapped |
 | Adversarial denial cases | 160; 0 unauthorized economic effects; 0 adapter calls |
 | Same-intent replay attempts | 100; 1 effect, 1 adapter call, 1 permit issued and consumed |
 | Seeded fuzz scenarios | 96; 0 duplicate-effect violations; 0 aggregate-budget violations |

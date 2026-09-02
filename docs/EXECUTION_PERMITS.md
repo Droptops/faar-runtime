@@ -79,7 +79,10 @@ calls `store.consume_execution_permit`, one `BEGIN IMMEDIATE` transaction that:
    pushed to the authority anchor.
 
 The gateway's pre-check (`verify`) reports the same status-specific codes, so a
-venue operator can tell a halt or a restore apart from an ordinary pause. It also
+venue operator can tell a halt or a restore apart from an ordinary pause. Its
+`max_clock_skew_seconds` (default 5 s, the grant default) must be at least the
+largest grant skew the deployment issues, or a venue clock inside the grant's
+allowance rejects every permit as `PERMIT_FROM_FUTURE`. It also
 bounds the permit's own lifetime (`PERMIT_TTL_EXCEEDED`, 60 s by default) and,
 when the gateway knows which venue it serves (`ExecutionPermitVerifier(...,
 venue=...)` or `consume(..., venue=...)`), refuses a permit for a request

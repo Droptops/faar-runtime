@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 import threading
 from dataclasses import dataclass
 from decimal import Decimal
@@ -35,6 +36,7 @@ from .store import (
     GrantConflict,
     IntentBusy,
     SQLiteIntentStore,
+    StoreUnavailable,
     TERMINAL_STATES,
     UnknownGrant,
     UnknownIntent,
@@ -62,6 +64,10 @@ _SETTLEMENT_DERIVED_PREFIXES = ("SETTLED_", "SETTLEMENT_", "EFFECT_ID_", "PAYMEN
 
 def _valid_effect_id(value: object) -> bool:
     return isinstance(value, str) and 0 < len(value) <= MAX_EFFECT_ID_CHARS
+
+
+def _grant_bound(intent: Intent, grant: CapabilityGrant) -> bool:
+    return grant.grant_id == intent.grant_id and grant.version == intent.grant_version
 
 
 def _untrusted_repr(value: object) -> str | None:
@@ -212,7 +218,14 @@ class FAARRuntime:
         # may opt in explicitly; production/runtime callers get the trusted clock.
         if override is not None and self.allow_test_time_override:
             return override
-        return self.clock()
+        # The trusted clock must yield timezone-aware datetimes: every artifact
+        # timestamp is aware, and a naive clock (datetime.utcnow) would otherwise
+        # raise TypeError out of the first comparison. Checked before any state
+        # is registered so a misconfigured clock fails fast and mutates nothing.
+        now = self.clock()
+        if not isinstance(now, datetime) or now.tzinfo is None or now.utcoffset() is None:
+            raise ValueError("runtime clock must return timezone-aware datetimes")
+        return now
 
     def process(
         self,
@@ -225,6 +238,8 @@ class FAARRuntime:
         risk_attestation: Attestation,
         now: datetime | None = None,
     ) -> RuntimeResult:
+        # Read the security clock once, before anything is registered.
+        decision_now = self._decision_time(now)
         # Bind the canonical payload before waiting on the lease. A competing caller
         # cannot hide a changed payload behind an already-running intent id.
         stored = self.store.register(intent, canonical_hash(intent))
@@ -236,7 +251,7 @@ class FAARRuntime:
                 return self._process_unlocked(
                     intent, authority, grant, risk,
                     authority_attestation=authority_attestation,
-                    risk_attestation=risk_attestation, now=now,
+                    risk_attestation=risk_attestation, now=now, decision_now=decision_now,
                 )
         except IntentBusy:
             current = self.store.get(intent.intent_id)
@@ -247,6 +262,23 @@ class FAARRuntime:
             )
         except EvidenceIntegrityError:
             return self._integrity_failure(intent.intent_id)
+        except (StoreUnavailable, sqlite3.OperationalError) as exc:
+            return self._store_unavailable(intent.intent_id, exc)
+
+    def _store_unavailable(self, intent_id: str, exc: Exception) -> RuntimeResult:
+        """The datastore refused a write past its busy timeout.
+
+        Every store method is one transaction, so the durable state is whatever the
+        last successful call left; nothing is coerced. The caller gets a code and
+        retries later instead of a raw driver exception.
+        """
+        if isinstance(exc, sqlite3.OperationalError) and "locked" not in str(exc).lower() and "busy" not in str(exc).lower():
+            raise exc
+        current = self.store.get(intent_id)
+        return RuntimeResult(
+            intent_id=intent_id, state=current.state, effect_id=current.effect_id,
+            reason_codes=("STORE_UNAVAILABLE",), replayed=True, submission_count=current.submission_count,
+        )
 
     def _integrity_failure(self, intent_id: str) -> RuntimeResult:
         """The evidence chain refused an append: nothing advances, the caller gets a code.
@@ -295,16 +327,17 @@ class FAARRuntime:
         authority_attestation: Attestation,
         risk_attestation: Attestation,
         now: datetime | None = None,
+        decision_now: datetime | None = None,
     ) -> RuntimeResult:
         now_override = now if self.allow_test_time_override else None
-        decision_now = self._decision_time(now)
+        if decision_now is None:
+            decision_now = self._decision_time(now)
         intent_hash = canonical_hash(intent)
         existing = self.store.register(intent, intent_hash)
         if existing.state not in TERMINAL_STATES:
             # Every decision below records evidence. If the chain will refuse the
             # append, fail here, before any state is advanced.
             self.store.assert_evidence_appendable(intent.intent_id)
-
         # The complete grant envelope is provisioned by a separate principal.
         # Matching only grant_id/version is insufficient because a compromised
         # coordinator could otherwise substitute broader contents under the same ID.
@@ -314,6 +347,12 @@ class FAARRuntime:
             return self._stop_if_possible(existing, ("GRANT_NOT_PROVISIONED",))
         except GrantConflict:
             return self._stop_if_possible(existing, ("GRANT_ENVELOPE_MISMATCH",))
+        if existing.state not in TERMINAL_STATES and existing.state != IntentState.PROPOSED and not _grant_bound(intent, grant):
+            # An in-flight intent is reconciled only with its own grant: another
+            # provisioned grant's clock skew, status or expiry must not shorten the
+            # ambiguity window or terminalize the attempt. Fresh intents are denied
+            # by the capability gate instead (GRANT_ID_MISMATCH).
+            return self._stored_result(existing, replayed=True, reason_codes=("GRANT_NOT_BOUND_TO_INTENT",))
 
         if existing.state in TERMINAL_STATES:
             return self._stored_result(existing, replayed=True)
@@ -781,6 +820,8 @@ class FAARRuntime:
             )
         except EvidenceIntegrityError:
             return self._integrity_failure(intent.intent_id)
+        except (StoreUnavailable, sqlite3.OperationalError) as exc:
+            return self._store_unavailable(intent.intent_id, exc)
 
     def _reconcile_unlocked(
         self,
@@ -806,15 +847,18 @@ class FAARRuntime:
             return self._stored_result(stored, decisions=decisions, replayed=True)
         self.store.assert_evidence_appendable(intent.intent_id)
 
-        # The presented grant must be the provisioned envelope before any state
-        # mutation. A caller presenting the wrong grant is not evidence about the
-        # in-flight intent, so the result is machine-readable and non-mutating.
+        # The presented grant must be the provisioned envelope, and the intent's
+        # own, before any state mutation. A caller presenting the wrong grant is
+        # not evidence about the in-flight intent, so the result is
+        # machine-readable and non-mutating.
         try:
             self.store.verify_grant(grant, canonical_hash(grant))
         except UnknownGrant:
             return self._stored_result(stored, decisions=decisions, replayed=True, reason_codes=("GRANT_NOT_PROVISIONED",))
         except GrantConflict:
             return self._stored_result(stored, decisions=decisions, replayed=True, reason_codes=("GRANT_ENVELOPE_MISMATCH",))
+        if not _grant_bound(intent, grant):
+            return self._stored_result(stored, decisions=decisions, replayed=True, reason_codes=("GRANT_NOT_BOUND_TO_INTENT",))
 
         if intent.venue not in self.adapters:
             # PROPOSED/AUTHORIZED/RESERVED prove that begin_submission never ran, so
