@@ -26,7 +26,7 @@ Third adversarial pass over v0.3.1 plus the operator controls a first bounded de
 - Partial fills and cancellation are modelled (gates 4.4/6.7, R-14): `SettlementStatus.PARTIALLY_FILLED` confirms the intent with the order's effect id and is reconciled again later, never resubmitted; `CANCELLED` finalizes a partially filled order, fails safe an unfilled one (budget released, no resubmission under the intent) and stops when it contradicts a recorded fill. `MockMode.PARTIAL_FILL`, `MockVenue.complete_fill/cancel_order`. `PAY` cannot partially fill.
 - Scope exposure caps (gate 9): `set_exposure_cap('global' | 'principal:<id>', max_usd)` bounds trailing-window turnover across every grant and principal in the scope (`EXPOSURE_CAP_EXCEEDED` at reservation); CLI `set-exposure-cap`, `exposure-caps`.
 - `FAARRuntime(max_orphaned_adapter_calls=8)`: a worker with too many abandoned adapter calls stops submitting (`ADAPTER_ORPHAN_LIMIT_REACHED`, budget released) until they drain.
-- `evals/run_crash_injection.py` (`make crash`, part of `make check`) kills a worker before every store call across seven scenarios and recovers by the runbook; it found and closed RT-80 (finalize and commit were two statements). Invariants I-35..I-38.
+- `evals/run_crash_injection.py` (`make crash`, part of `make check`) kills a worker before every store call across nine scenarios and recovers by the runbook; it includes contradictory-settlement and cumulative-fill-regression STOP paths and found and closed RT-80 (finalize and commit were two statements). Invariants I-35..I-40.
 
 **Live-money red team (RT-81..RT-87)**
 
@@ -52,7 +52,7 @@ Third adversarial pass over v0.3.1 plus the operator controls a first bounded de
 - The unfilled-cancel identity check is atomic with the release (unique index, `EFFECT_ID_ALREADY_CLAIMED`); windows are keyed by principal and grant id; a limit price bounds only a declared limit order; **trade grants must set `max_slippage_bps`** (construction and schema).
 - Anchor: a stop that committed while the anchor write failed is repaired by re-running it and at every anchored open; `list-grants` reports `anchor_behind`; pause, revoke and `revoke_after_restore` commit under an unreadable anchor; the error type `AnchorUnavailableAfterCommit` and the CLI field `committed` tell a committed stop from a refused one.
 - Store: the lease owner token is the store instance and a failed release waits about five seconds at most; the born-with-head watermark is the first chain that starts at `intent_registered`; an up-to-date database opens without a write transaction (`schema_revision` stamp) and a busy datastore is a typed `StoreUnavailable` for the CLI.
-- Bounds: `AuthorityDecision` reason codes are bounded at construction; `verify_task_outcome` reports `OUTCOME_EVALUATION_UNBOUNDED` instead of raising. Crash injection gains `open_order_then_cancel` (224 kill points across 7 scenarios).
+- Bounds: `AuthorityDecision` reason codes are bounded at construction; `verify_task_outcome` reports `OUTCOME_EVALUATION_UNBOUNDED` instead of raising. Crash injection covers 309 kill points across 9 scenarios, including open-order cancellation, contradictory settlement, and cumulative-fill regression.
 
 **Trust boundaries**
 

@@ -14,7 +14,7 @@ the single txn whose commit order decides a race.
 
 | Property | Requirement | Exercised by |
 |---|---|---|
-| Atomicity per method | Every mutating method below is exactly one txn; it commits fully or not at all, whatever exception interrupts it. No method may leave a transaction open. Opening an up-to-date database takes no write transaction (schema revision stamp, index and settings probes), so read-only operator commands never wait on a writer. | `evals/run_crash_injection.py` (224 kill points), `test_store_hardening`, `test_selfreview_redteam.ReadOnlyOpenTests` |
+| Atomicity per method | Every mutating method below is exactly one txn; it commits fully or not at all, whatever exception interrupts it. No method may leave a transaction open. Opening an up-to-date database takes no write transaction (schema revision stamp, index and settings probes), so read-only operator commands never wait on a writer. | `evals/run_crash_injection.py` (309 kill points), `test_store_hardening`, `test_selfreview_redteam.ReadOnlyOpenTests` |
 | Cross-process isolation | Two processes on the same datastore observe the same linearization order for every method marked **LP**. | `test_multiprocess` |
 | Durability before return | A committed txn is durable before the method returns (permits, fences, consumption, evidence). | crash injection |
 | Fail closed on ambiguity | A datastore error surfaces as an exception; the runtime never converts one into success, release, or a retry. | `test_runtime_hardening`, `test_live_money_redteam` |

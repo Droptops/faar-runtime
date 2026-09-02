@@ -13,7 +13,8 @@ attestations, advancing the clock past the permit window, until the intent is
 terminal. For every crash point it asserts:
 
 - at most one successful economic effect and at most two adapter calls;
-- an effect exists  =>  FINALIZED with usage COMMITTED;
+- an uncontested effect exists  =>  FINALIZED with usage COMMITTED;
+- a contradictory or regressed effect stays STOPPED with usage HELD;
 - terminal without effect  =>  usage RELEASED (unless the stop is settlement-derived);
 - the recovery never raises and never ends non-terminal.
 
@@ -36,9 +37,9 @@ sys.path.insert(0, str(ROOT / "test"))
 
 from faar.adapters import DeterministicFailure, MockMode, MockVenue  # noqa: E402
 from faar.canonical import canonical_hash  # noqa: E402
-from faar.models import ExecutionReceipt, IntentState, SettlementStatus  # noqa: E402
+from faar.models import ExecutionReceipt, ExecutionRequest, IntentState, SettlementRecord, SettlementStatus  # noqa: E402
 from faar.runtime import FAARRuntime  # noqa: E402
-from faar.settlement import MockSettlementVerifier  # noqa: E402
+from faar.settlement import MockSettlementVerifier, REFERENCE_SETTLEMENT_PROFILE  # noqa: E402
 from faar.store import SQLiteIntentStore, TERMINAL_STATES  # noqa: E402
 from support import AUTH, NOW, attest_pair, grant, intent, permit_stack, risk, trust, verification_trust  # noqa: E402
 
@@ -56,6 +57,12 @@ SCENARIOS = (
     ("partial_fill_then_cancel", MockMode.PARTIAL_FILL, MockMode.PARTIAL_FILL, None),
     # The order is admitted and rests unfilled; recovery cancels it at the venue.
     ("open_order_then_cancel", MockMode.OPEN_ORDER, MockMode.OPEN_ORDER, None),
+    # The submitter's ledger has an effect while the independent read path reports
+    # a contest. The only safe terminal is STOPPED with the full budget held.
+    ("contradictory_settlement_stop", MockMode.SUCCESS, MockMode.SUCCESS, "contradict"),
+    # A first call records a partial fill; a second venue observation reports a
+    # smaller cumulative amount and must STOP instead of rewriting history.
+    ("fill_regression_stop", MockMode.PARTIAL_FILL, MockMode.PARTIAL_FILL, "fill_regression"),
 )
 
 # Per scenario: the largest legitimate number of venue calls, and the acceptable
@@ -77,7 +84,20 @@ EXPECTED = {
     "deterministic_rejection": (1, {("FINALIZED", "COMMITTED", 1), ("FAILED_SAFE", "RELEASED", 0)}),
     "partial_fill_then_cancel": (1, {("FINALIZED", "COMMITTED", 1)}),
     "open_order_then_cancel": (1, {("FAILED_SAFE", "RELEASED", 0)}),
+    # A crash may leave the intent reserved but not submitted; an authoritative
+    # contest still stops it before any venue call, with the reservation held for
+    # human resolution. Once submitted, the same stop may coexist with one effect.
+    "contradictory_settlement_stop": (1, {("STOPPED", "HELD", 0), ("STOPPED", "HELD", 1)}),
+    "fill_regression_stop": (1, {("STOPPED", "HELD", 1)}),
 }
+
+EXPECTED_STOP_REASONS = {
+    "ambiguous_admission_then_recovered": {("SETTLEMENT_NONE_AFTER_PERMIT_CONSUMED",)},
+    "contradictory_settlement_stop": {("SETTLEMENT_CONTRADICTORY",)},
+    "fill_regression_stop": {("SETTLEMENT_FILL_REGRESSED",)},
+}
+
+SETTLEMENT_STOP_WITH_EFFECT = frozenset({"contradictory_settlement_stop", "fill_regression_stop"})
 
 
 class PersistentMockVenue(MockVenue):
@@ -131,6 +151,27 @@ class PersistentMockVenue(MockVenue):
         self._save()
         return receipt
 
+    def regress_fill(self, request: ExecutionRequest) -> ExecutionReceipt | None:
+        """Inject an authoritative venue bug: cumulative filled notional shrinks."""
+        with self._lock:
+            key = self._key(request)
+            current = self._effects.get(key)
+            if current is None or current.status != SettlementStatus.PARTIALLY_FILLED:
+                return current
+            current_amount = current.amount_usd or Decimal("0")
+            regressed_amount = max(Decimal("0"), current_amount / 2)
+            if regressed_amount == current_amount:
+                return current
+            receipt = ExecutionReceipt(
+                effect_id=current.effect_id,
+                status=current.status,
+                evidence=current.evidence,
+                amount_usd=regressed_amount,
+            )
+            self._effects[key] = receipt
+            self._save()
+            return receipt
+
 
 class RejectingAdapter:
     """Transport that reports a deterministic rejection without consuming the permit."""
@@ -143,6 +184,21 @@ class RejectingAdapter:
 
     def execute(self, request, permit):
         raise DeterministicFailure("venue rejected the order (transport error)")
+
+
+class ContradictoryVerifier:
+    """Authoritative scripted contest used only by the crash-injection model."""
+
+    name = "crash-injection-contradictory-verifier"
+    security_profile = REFERENCE_SETTLEMENT_PROFILE
+
+    def verify(self, request: ExecutionRequest) -> SettlementRecord:
+        return SettlementRecord(
+            SettlementStatus.CONTRADICTORY,
+            evidence={"verifier": self.name, "reason": "scripted-authoritative-contest"},
+            authoritative=True,
+            verified_request_hash=canonical_hash(request),
+        )
 
 
 class CrashingStore:
@@ -173,9 +229,10 @@ def _build(store, venue_path: str, mode: MockMode, wrapper: str | None, clock):
     permit_authority, permit_verifier = permit_stack(store, t)
     venue = PersistentMockVenue(venue_path, permit_verifier=permit_verifier, name="mock-dex", mode=mode, clock=clock)
     adapter = RejectingAdapter(venue) if wrapper == "reject" else venue
+    settlement_verifier = ContradictoryVerifier() if wrapper == "contradict" else MockSettlementVerifier(venue)
     runtime = FAARRuntime(
         store, {"mock-dex": adapter}, verification_trust(t), permit_authority,
-        {"mock-dex": MockSettlementVerifier(venue)}, clock=clock, allow_test_time_override=True,
+        {"mock-dex": settlement_verifier}, clock=clock, allow_test_time_override=True,
     )
     return t, runtime, venue
 
@@ -189,6 +246,12 @@ def worker(db: str, venue_path: str, counter_path: str, result_path: str, scenar
     rs = risk()
     aa, ra = attest_pair(t, i, AUTH, rs, NOW)
     result = runtime.process(i, AUTH, grant(), rs, authority_attestation=aa, risk_attestation=ra, now=NOW)
+    if scenario == "fill_regression_stop" and result.state == IntentState.CONFIRMED:
+        venue = runtime.adapters["mock-dex"]
+        venue.regress_fill(ExecutionRequest.from_intent(i))
+        rs = risk(state_version=2)
+        aa, ra = attest_pair(t, i, AUTH, rs, NOW)
+        result = runtime.process(i, AUTH, grant(), rs, authority_attestation=aa, risk_attestation=ra, now=NOW)
     Path(result_path).write_text(json.dumps({"state": result.state.value, "reason_codes": list(result.reason_codes), "calls": store.calls}))
     inner.close()
 
@@ -214,7 +277,8 @@ def _recover(db: str, venue_path: str, scenario: str) -> dict:
     _, _, recovery_mode, wrapper = next(s for s in SCENARIOS if s[0] == scenario)
     store = SQLiteIntentStore(db, evidence_key=EVIDENCE_KEY)
     clock = {"now": NOW}
-    t, runtime, venue = _build(store, venue_path, recovery_mode, None if wrapper == "reject" else wrapper, lambda: clock["now"])
+    recovery_wrapper = None if wrapper in {"reject", "fill_regression"} else wrapper
+    t, runtime, venue = _build(store, venue_path, recovery_mode, recovery_wrapper, lambda: clock["now"])
     if wrapper == "reject":
         # The rejecting transport is replaced by the venue itself on recovery: a
         # persisted deterministic block must still prevent a second submission.
@@ -233,7 +297,9 @@ def _recover(db: str, venue_path: str, scenario: str) -> dict:
         result = runtime.process(i, AUTH, grant(), rs, authority_attestation=aa, risk_attestation=ra, now=clock["now"])
         results.append({"state": result.state.value, "reason_codes": list(result.reason_codes)})
         if scenario in ("partial_fill_then_cancel", "open_order_then_cancel") and result.state == IntentState.CONFIRMED:
-            venue.cancel_order(__import__("faar.models", fromlist=["ExecutionRequest"]).ExecutionRequest.from_intent(i))
+            venue.cancel_order(ExecutionRequest.from_intent(i))
+        if scenario == "fill_regression_stop" and result.state == IntentState.CONFIRMED:
+            venue.regress_fill(ExecutionRequest.from_intent(i))
         if result.state in TERMINAL_STATES:
             break
     stored = store.get(INTENT_ID)
@@ -268,18 +334,23 @@ def _violations(case: dict, scenario: str) -> list[str]:
         v.append("MULTIPLE_PERMITS_CONSUMED")
     if (state, case["usage"], case["effects"]) not in acceptable:
         v.append("UNEXPECTED_OUTCOME")
-    if state == "STOPPED" and case["final_reason_codes"] != ["SETTLEMENT_NONE_AFTER_PERMIT_CONSUMED"]:
+    allowed_stop_reasons = EXPECTED_STOP_REASONS.get(scenario, set())
+    if state == "STOPPED" and tuple(case["final_reason_codes"]) not in allowed_stop_reasons:
         v.append("UNEXPECTED_STOP_REASON")
     if state not in {s.value for s in TERMINAL_STATES}:
         v.append("NOT_TERMINAL_AFTER_RECOVERY")
-    if case["effects"] == 1 and (state != "FINALIZED" or case["usage"] != "COMMITTED"):
+    if (
+        case["effects"] == 1
+        and (state != "FINALIZED" or case["usage"] != "COMMITTED")
+        and scenario not in SETTLEMENT_STOP_WITH_EFFECT
+    ):
         v.append("EFFECT_NOT_FINALIZED_OR_NOT_COMMITTED")
     if state == "FINALIZED" and case["effects"] != 1:
         v.append("FINALIZED_WITHOUT_EFFECT")
     settlement_derived = any(r.startswith(SETTLEMENT_DERIVED) for r in case["final_reason_codes"])
     if state in {"STOPPED", "FAILED_SAFE", "DENIED", "DEFERRED"} and case["usage"] == "HELD" and not settlement_derived:
         v.append("HELD_BUDGET_ON_TERMINAL_INTENT")
-    if state in {"STOPPED", "FAILED_SAFE"} and case["effects"] != 0:
+    if state in {"STOPPED", "FAILED_SAFE"} and case["effects"] != 0 and scenario not in SETTLEMENT_STOP_WITH_EFFECT:
         v.append("EFFECT_ON_NON_FINALIZED_TERMINAL")
     if not case["evidence_valid"]:
         v.append("EVIDENCE_CHAIN_INVALID")
