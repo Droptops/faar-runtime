@@ -189,7 +189,14 @@ class SettlementStatus(StrEnum):
     NONE = "NONE"
     UNKNOWN = "UNKNOWN"
     CONFIRMED = "CONFIRMED"
+    # An order that exists at the venue, has filled for `amount_usd` so far and can
+    # still fill further. Non-terminal: the runtime reconciles again later and never
+    # submits a second attempt for the remainder.
+    PARTIALLY_FILLED = "PARTIALLY_FILLED"
     FINALIZED = "FINALIZED"
+    # Terminal at the venue: no further fill is possible. `amount_usd` is the amount
+    # filled before cancellation (0/None for an unfilled order).
+    CANCELLED = "CANCELLED"
     CONTRADICTORY = "CONTRADICTORY"
 
 

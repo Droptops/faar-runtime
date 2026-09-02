@@ -13,7 +13,8 @@ In scope:
 - canonical intent, capability/risk gating, and durable intent-state handling
 - Ed25519 attestations and execution permits with signer/verifier separation and key lifecycle
 - the permit-bounded ambiguity window and bounded adapter deadlines
-- emergency halt/resume, the external authority anchor, and the operator CLI
+- emergency halt/resume, scope exposure caps, the external authority anchor, and the operator CLI
+- partial-fill and cancellation semantics for order venues
 - replay, concurrency, revocation, restore and settlement-evidence checks in the reference model
 - the release gate (`make check`), including the mapped red-team matrix and the bounded permit protocol model
 
@@ -41,13 +42,14 @@ Current `make check` headline results:
 
 | Gate | Result |
 |---|---|
-| Unit/invariant tests | 261/261 pass |
-| Targeted red-team | 100 attack classes mapped to 131 named tests, 0 unmapped |
+| Unit/invariant tests | 279/279 pass |
+| Targeted red-team | 110 attack classes mapped to 147 named tests, 0 unmapped |
 | Adversarial denial cases | 160; 0 unauthorized economic effects; 0 adapter calls |
 | Same-intent replay attempts | 100; 1 effect, 1 adapter call, 1 permit issued and consumed |
 | Seeded fuzz scenarios | 96; 0 duplicate-effect violations; 0 aggregate-budget violations |
 | Bounded permit model | 1766 states, 4304 transitions, 0 violations; stale permit unconsumable after revoke and after halt/resume; 187 violations without the permit-window rule |
 | Demo | mock execution FINALIZED once; keyed evidence chain and head commitment valid |
+| Crash injection | 193 worker kills before every store call across 6 scenarios; 0 duplicate effects, 0 lost effects, 0 stranded budget, every recovery terminal |
 
 ## Claim boundary
 
@@ -58,11 +60,11 @@ Do **not** describe FAAR v0.4.0 as formally verified, independently audited, pro
 ## Explicitly not tested in-repo
 
 - datastore failover (the reference store is SQLite);
-- partial fill and cancellation races;
+- a real venue's cancel/fill ordering (the model relies on the venue reporting `CANCELLED` only once no further fill is possible);
 - venue-side permit verification against a real venue;
 - key custody in KMS/HSM;
 - authenticated ingress.
 
 ## Remaining blockers before live-money use
 
-[`GO_LIVE_CHECKLIST.md`](GO_LIVE_CHECKLIST.md) maps every gate in [`V0_2_RELEASE_GATES.md`](V0_2_RELEASE_GATES.md) and every residual risk to its status and evidence. The OPEN rows are partial-fill/cancel semantics, datastore failover, and the independent security review; the DEPLOYMENT rows are key custody, venue-side permit verification, credential scoping, authenticated ingress, anchor placement, and a capped first exposure. Do not add a real-money adapter, seed phrase, private key, or production credential to this repository until those are met.
+[`GO_LIVE_CHECKLIST.md`](GO_LIVE_CHECKLIST.md) maps every gate in [`V0_2_RELEASE_GATES.md`](V0_2_RELEASE_GATES.md) and every residual risk to its status and evidence. The OPEN rows are datastore failover beyond SQLite and the independent security review; the DEPLOYMENT rows are key custody, venue-side permit verification, credential scoping, authenticated ingress, anchor placement, the funded balance at the venue, and each venue's cancel terminality. Do not add a real-money adapter, seed phrase, private key, or production credential to this repository until those are met.

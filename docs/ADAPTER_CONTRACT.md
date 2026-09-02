@@ -162,18 +162,44 @@ remain evaluable.
 
 ## Part C — Partial fills and cancellation
 
-Order adapters must document:
+The runtime models two further authoritative settlement statuses. Both require
+the order's effect id; `amount_usd` is the **cumulative** filled amount.
 
-- how partial fills map to `effect_id` and settlement evidence;
-- whether cancel is idempotent;
-- late-fill-after-cancel behaviour;
-- when held usage may be committed/released;
-- how the risk engine receives partial-fill reservations/effects.
+| Verifier reports | Meaning at the venue | Runtime |
+|---|---|---|
+| `PARTIALLY_FILLED` | the order exists, has filled for `amount_usd` so far, and may fill further | `CONFIRMED` with that effect id (`SETTLEMENT_PARTIAL_FILL_OPEN`); reconciled again later; **never resubmitted**; usage HELD |
+| `CANCELLED`, filled amount > 0 | terminal; the fill so far is the intent's one effect | `FINALIZED` (`SETTLEMENT_CANCELLED_AFTER_PARTIAL_FILL`); the authorized notional is committed |
+| `CANCELLED`, nothing filled, no fill recorded | terminal; no economic effect | `FAILED_SAFE` (`SETTLEMENT_CANCELLED_UNFILLED`); usage RELEASED; never resubmitted under this intent (a new intent is the caller's decision) |
+| `CANCELLED`, nothing filled, a fill was recorded earlier | contradictory history | `STOPPED` (`SETTLEMENT_CANCEL_CONTRADICTS_RECORDED_EFFECT`); usage HELD |
+| either, not authoritative | no weight | `UNKNOWN` (`SETTLEMENT_POSITIVE_NOT_AUTHORITATIVE` / `SETTLEMENT_CANCEL_NOT_AUTHORITATIVE`); usage HELD |
 
-The reference runtime has no partial-fill state: any authoritative FINALIZED
-amount at or below the authorized notional finalizes the intent and the ledger
-commits the **authorized** notional, never less (conservative for turnover). Cancel
-and late-fill linkage is out of scope for v0.4 and is an open go-live item.
+Integrity rules: the filled amount must be finite, bounded by the authorized
+notional (`SETTLED_AMOUNT_EXCEEDS_AUTHORIZED`) and, for an open partial fill,
+positive; `PAY` cannot partially fill (`PAYMENT_PARTIAL_NOT_ALLOWED`); a missing
+effect id is `SETTLED_EFFECT_ID_REQUIRED`; a later authoritative `NONE` for a
+recorded partial fill is `SETTLEMENT_LOST_PREVIOUS_EFFECT`; a quorum votes on
+`(status, effect id, amount)`, so sources disagreeing about the filled amount or
+about cancelled-versus-open are `CONTRADICTORY`.
+
+Venue obligations an adapter's review document must confirm:
+
+- `CANCELLED` is reported only once the venue guarantees no further fill (after
+  the cancel is acknowledged, never while a cancel request is merely pending). A
+  fill after `CANCELLED` is a venue contract violation outside the model.
+- the effect id is the order identity and stays stable across partial fills;
+- cancel is idempotent and a cancel of a fully filled order is a no-op;
+- `amount_usd` is the cumulative fill in the intent's amount unit.
+
+Ledger: the authorized notional stays committed for the trailing window even when
+less filled (conservative for turnover). Committing only the filled amount would
+need a per-intent ledger split and is deliberately not done in 0.4.
+
+Definition of done: a cancelled order never satisfies a task contract, even when
+the intent is `FINALIZED`, because the settlement status is not `FINALIZED`.
+
+The reference `MockVenue` implements this with `MockMode.PARTIAL_FILL`,
+`complete_fill()` and `cancel_order()`; `test/test_partial_fills.py` and the
+`partial_fill_then_cancel` scenario of `evals/run_crash_injection.py` exercise it.
 
 ## Required review document
 

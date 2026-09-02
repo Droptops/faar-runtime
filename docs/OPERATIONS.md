@@ -30,6 +30,15 @@ faar resume --scope global --db faar.sqlite
   ends the intent `FAILED_SAFE` instead.
 - `halt` and `resume` are authority changes: on a database bound to an anchor
   they require `--anchor` (see §5).
+- A first funded deployment also sets a fleet-wide ceiling that no grant can
+  exceed. `EXPOSURE_CAP_EXCEEDED` defers the intent at reservation time:
+
+```bash
+faar set-exposure-cap --scope global --max-usd 500 --db faar.sqlite --anchor faar.anchor.json
+faar set-exposure-cap --scope principal:principal:demo --max-usd 100 --db faar.sqlite --anchor faar.anchor.json
+faar exposure-caps --db faar.sqlite
+faar set-exposure-cap --scope global --clear --db faar.sqlite --anchor faar.anchor.json
+```
 - While halted, `list-grants` shows `effective_status: HALTED`; new intents end
   `STOPPED` with `GRANT_RUNTIME_HALTED`.
 - Per-grant `set-grant-status ... --status PAUSED|REVOKED` remains the
@@ -52,6 +61,10 @@ faar clear-lease --intent-id <id> --owner-token <token> --db faar.sqlite
 Never clear a lease whose owner may still be running: two workers inside one
 intent's state machine is exactly the duplicate-execution race the lease prevents.
 
+This procedure is exercised by `make crash` (`evals/run_crash_injection.py`),
+which kills a worker before every store call and recovers with exactly these
+steps.
+
 ## 3. Intents parked in UNKNOWN with budget HELD
 
 ```bash
@@ -68,7 +81,9 @@ Read `reason_codes` and `ambiguity_until`:
 | `SETTLEMENT_UNKNOWN`, `RECONCILIATION_EXCEPTION` | verifier unavailable | same |
 | `EXECUTION_DETERMINISTIC_FAILURE` (with one of the above; `_UNVERIFIED` only before the first reconciliation) | adapter rejected the request; block on resubmission is durable | once an authoritative NONE arrives after the permit window the intent ends `FAILED_SAFE`; a new intent is required |
 | `EXECUTION_PERMIT_REJECTED`, `PERMIT_PREVIOUS_ATTEMPT_LIVE` | the store refused a second live permit for this intent | wait for the recorded window; budget stays held |
-| `EVIDENCE_INTEGRITY_FAILURE` | the evidence chain refused an append (legacy chain without a head, or a tail that no longer matches its signed head) | state was not advanced; see §6 and §9 |
+| `EVIDENCE_INTEGRITY_FAILURE` | the evidence chain refused an append (legacy chain without a head, or a tail that no longer matches its signed head) | state was not advanced; see §6 and §8 |
+| `SETTLEMENT_PARTIAL_FILL_OPEN` (state `CONFIRMED`) | the order rests partially filled at the venue | reconcile again later; cancel at the venue to finish; the remainder is never a second order |
+| `ADAPTER_ORPHAN_LIMIT_REACHED` (state `STOPPED`, budget released) | this worker has too many abandoned adapter calls | let them drain or restart the worker; investigate the venue latency |
 
 Budget held by an UNKNOWN intent is never released by hand through the CLI. It is
 released when the verifier proves absence after the permit window, or committed
@@ -77,7 +92,8 @@ when settlement is finalized.
 ## 4. Intents STOPPED with budget HELD
 
 `SETTLEMENT_CONTRADICTORY`, `SETTLEMENT_EFFECT_ID_MISMATCH`,
-`SETTLEMENT_LOST_PREVIOUS_EFFECT`, `SETTLED_AMOUNT_*`, `PAYMENT_AMOUNT_MISMATCH`,
+`SETTLEMENT_LOST_PREVIOUS_EFFECT`, `SETTLEMENT_CANCEL_CONTRADICTS_RECORDED_EFFECT`,
+`SETTLED_AMOUNT_*`, `PAYMENT_AMOUNT_MISMATCH`, `PAYMENT_PARTIAL_NOT_ALLOWED`,
 `EFFECT_ID_ALREADY_CLAIMED`, `SETTLED_EFFECT_ID_INVALID` and
 `SETTLEMENT_REQUEST_BINDING_MISMATCH` are terminal and keep the reservation HELD
 because an effect may exist that FAAR cannot attribute safely. These need a human:

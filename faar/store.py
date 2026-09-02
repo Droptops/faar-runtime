@@ -298,6 +298,11 @@ class SQLiteIntentStore:
                 value TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS exposure_caps (
+                scope TEXT PRIMARY KEY,
+                max_turnover_usd TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
             """
         )
         self._migrate_columns()
@@ -431,12 +436,15 @@ class SQLiteIntentStore:
             self._conn.execute(
                 "UPDATE usage_reservations SET velocity_ts=? WHERE intent_id=?", (int(created.timestamp()), row["intent_id"])
             )
-        # An in-flight attempt written without a permit expiry (pre-0.4 worker, or a
-        # crash between begin_submission and the permit record) gets a conservative
-        # window so a new worker cannot trust absence and resubmit immediately.
+        # An in-flight attempt that holds a permit whose expiry was never recorded
+        # (a pre-0.4 worker) gets a conservative window so a new worker cannot trust
+        # absence and resubmit while the venue may still honour that permit. Rows
+        # without such a permit (including a 0.4 crash between begin_submission
+        # and the permit record) transported nothing and need no window.
         for row in self._conn.execute(
-            "SELECT intent_id,updated_at FROM intents WHERE ambiguity_until IS NULL AND submission_count > 0 "
-            "AND state IN ('SUBMITTED','UNKNOWN','RECONCILING')"
+            "SELECT i.intent_id,i.updated_at FROM intents i WHERE i.ambiguity_until IS NULL AND i.submission_count > 0 "
+            "AND i.state IN ('SUBMITTED','UNKNOWN','RECONCILING') "
+            "AND EXISTS (SELECT 1 FROM execution_permits p WHERE p.intent_id=i.intent_id AND p.expires_at IS NULL AND p.consumed_at IS NULL)"
         ).fetchall():
             updated = self._parse_timestamp(row["updated_at"])
             if updated is None:
@@ -457,6 +465,10 @@ class SQLiteIntentStore:
                 self._conn.execute(
                     "CREATE INDEX IF NOT EXISTS ix_usage_grant_velocity_ts "
                     "ON usage_reservations(grant_id, grant_version, velocity_ts, status)"
+                )
+                self._conn.execute(
+                    "CREATE INDEX IF NOT EXISTS ix_usage_principal_velocity_ts "
+                    "ON usage_reservations(principal_id, velocity_ts, status)"
                 )
                 # Effect identity is a per-venue namespace (ADAPTER_CONTRACT §3):
                 # exchange fill/order identifiers legitimately collide across venues.
@@ -770,6 +782,65 @@ class SQLiteIntentStore:
         with self._lock:
             rows = self._conn.execute("SELECT * FROM runtime_controls ORDER BY scope").fetchall()
         return [dict(r) for r in rows]
+
+    # ---- exposure caps ---------------------------------------------------------------
+
+    def set_exposure_cap(self, scope: str, max_turnover_usd: Decimal | None) -> None:
+        """Operator ceiling on trailing-window turnover for a scope, independent of grants.
+
+        `scope` is 'global' or 'principal:<id>'. The cap counts every HELD and
+        COMMITTED reservation in the scope inside the trailing turnover window, so
+        it bounds what the whole fleet can move through FAAR even if every grant
+        is generous. `None` clears the cap. Tightening and loosening are both
+        authority changes and require the anchor on an anchored database.
+        """
+        self._validate_control_scope(scope)
+        self._require_anchor()
+        if max_turnover_usd is not None:
+            parsed = parse_bounded_decimal(max_turnover_usd)
+            if parsed is None or parsed <= 0:
+                raise ValueError("max_turnover_usd must be a positive bounded amount")
+            max_turnover_usd = parsed
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                if max_turnover_usd is None:
+                    self._conn.execute("DELETE FROM exposure_caps WHERE scope=?", (scope,))
+                else:
+                    self._conn.execute(
+                        "INSERT INTO exposure_caps(scope,max_turnover_usd,updated_at) VALUES(?,?,?) "
+                        "ON CONFLICT(scope) DO UPDATE SET max_turnover_usd=excluded.max_turnover_usd, updated_at=excluded.updated_at",
+                        (scope, format(max_turnover_usd, "f"), self._now()),
+                    )
+                self._conn.execute("COMMIT")
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
+
+    def exposure_caps(self) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute("SELECT * FROM exposure_caps ORDER BY scope").fetchall()
+        return [dict(r) for r in rows]
+
+    def _exposure_caps_locked(self, principal_id: str) -> list[tuple[str, Decimal]]:
+        rows = self._conn.execute(
+            "SELECT scope,max_turnover_usd FROM exposure_caps WHERE scope=? OR scope=?",
+            (GLOBAL_CONTROL_SCOPE, PRINCIPAL_CONTROL_PREFIX + principal_id),
+        ).fetchall()
+        return [(str(r["scope"]), Decimal(str(r["max_turnover_usd"]))) for r in rows]
+
+    def _scope_turnover_locked(self, scope: str, principal_id: str, since_ts: int) -> Decimal:
+        if scope == GLOBAL_CONTROL_SCOPE:
+            rows = self._conn.execute(
+                "SELECT amount_usd FROM usage_reservations WHERE status IN ('HELD','COMMITTED') AND velocity_ts > ?",
+                (since_ts,),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT amount_usd FROM usage_reservations WHERE principal_id=? AND status IN ('HELD','COMMITTED') AND velocity_ts > ?",
+                (principal_id, since_ts),
+            ).fetchall()
+        return sum((Decimal(r["amount_usd"]) for r in rows), Decimal("0"))
 
     def is_halted(self, principal_id: str) -> str | None:
         with self._lock:
@@ -1299,6 +1370,13 @@ class SQLiteIntentStore:
                     if current + amount > grant.limits.max_daily_turnover_usd:
                         reasons.append("ATOMIC_DAILY_TURNOVER_EXCEEDED")
 
+                # Scope exposure caps (operator control, independent of any grant).
+                for scope, cap in self._exposure_caps_locked(intent.principal_id):
+                    current = self._scope_turnover_locked(scope, intent.principal_id, velocity_ts - TURNOVER_WINDOW_SECONDS)
+                    if current + amount > cap:
+                        reasons.append("EXPOSURE_CAP_EXCEEDED")
+                        break
+
                 if grant.limits.max_actions_per_window is not None and window:
                     # Sliding window over the trailing `window` seconds. A fixed
                     # tumbling bucket (timestamp // window) would let up to 2x the
@@ -1416,6 +1494,7 @@ class SQLiteIntentStore:
         reason_codes: Iterable[str] = (),
         effect_id: str | None = None,
         release_usage: bool = False,
+        commit_usage: bool = False,
         ambiguity_until: datetime | None = None,
     ) -> bool:
         """Compare-and-set the intent state.
@@ -1423,7 +1502,8 @@ class SQLiteIntentStore:
         `release_usage=True` releases the intent's HELD reservation in the same
         transaction. Terminalizing and releasing as two autocommit statements leaves
         a crash window in which a provably never-submitted intent keeps consuming the
-        grant's turnover and velocity budget forever.
+        grant's turnover and velocity budget forever. `commit_usage=True` commits it
+        in the same transaction for the same reason on the FINALIZED path.
 
         `ambiguity_until` records the instant after which an in-flight submission can
         no longer be acted on by the venue (its permit expiry). Reconciliation must
@@ -1432,6 +1512,8 @@ class SQLiteIntentStore:
         expected_set = {expected} if isinstance(expected, IntentState) else set(expected)
         if effect_id is not None and not isinstance(effect_id, str):
             raise ValueError("effect_id must be a string")
+        if release_usage and commit_usage:
+            raise ValueError("a transition cannot both release and commit usage")
         if ambiguity_until is not None and (ambiguity_until.tzinfo is None or ambiguity_until.utcoffset() is None):
             raise ValueError("ambiguity_until must be timezone-aware")
         with self._lock:
@@ -1460,6 +1542,11 @@ class SQLiteIntentStore:
                 if release_usage:
                     self._conn.execute(
                         "UPDATE usage_reservations SET status='RELEASED', updated_at=? WHERE intent_id=? AND status='HELD'",
+                        (ts, intent_id),
+                    )
+                if commit_usage:
+                    self._conn.execute(
+                        "UPDATE usage_reservations SET status='COMMITTED', updated_at=? WHERE intent_id=? AND status='HELD'",
                         (ts, intent_id),
                     )
                 self._conn.execute("COMMIT")

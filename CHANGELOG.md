@@ -21,6 +21,13 @@ Third adversarial pass over v0.3.1 plus the operator controls a first bounded de
 - `KeyValidity(not_before, not_after, revoked)` for attestation keys and permit signers; the permit gateway accepts several signer ids for overlap-window rotation and rejects unknown, revoked, or out-of-window signers (RT-64); verifiers bound artifact lifetime (`ATTESTATION_TTL_EXCEEDED`, `PERMIT_TTL_EXCEEDED`; RT-76). The gateway reports `PERMIT_HALTED` / `PERMIT_AUTHORITY_REGRESSED`; the permit authority refuses symmetric signers (RT-78).
 - Operator CLI: `halt`, `resume`, `controls`, `list-grants`, `list-intents`, `held-usage`, `list-leases`, `clear-lease`, `rebuild-evidence-head [--all] [--adopt-empty]`, `revoke-after-restore`, `checkpoint`; `verify-evidence` takes the MAC key from an environment variable and reports a `status`; `--anchor` opens the store with a file anchor; typed refusals exit 2 as JSON. Runbook in `docs/OPERATIONS.md`, including the 0.3.x upgrade procedure.
 
+**Order semantics, exposure, crash safety**
+
+- Partial fills and cancellation are modelled (gates 4.4/6.7, R-14): `SettlementStatus.PARTIALLY_FILLED` confirms the intent with the order's effect id and is reconciled again later, never resubmitted; `CANCELLED` finalizes a partially filled order, fails safe an unfilled one (budget released, no resubmission under the intent) and stops when it contradicts a recorded fill. `MockMode.PARTIAL_FILL`, `MockVenue.complete_fill/cancel_order`. `PAY` cannot partially fill.
+- Scope exposure caps (gate 9): `set_exposure_cap('global' | 'principal:<id>', max_usd)` bounds trailing-window turnover across every grant and principal in the scope (`EXPOSURE_CAP_EXCEEDED` at reservation); CLI `set-exposure-cap`, `exposure-caps`.
+- `FAARRuntime(max_orphaned_adapter_calls=8)`: a worker with too many abandoned adapter calls stops submitting (`ADAPTER_ORPHAN_LIMIT_REACHED`, budget released) until they drain.
+- `evals/run_crash_injection.py` (`make crash`, part of `make check`) kills a worker before every store call across six scenarios and recovers by the runbook; it found and closed RT-80 (finalize and commit were two statements). Invariants I-35..I-38.
+
 **Trust boundaries**
 
 - One bounded amount parser (plain ASCII decimal grammar, canonical precision/exponent bounds) shared by gates, usage reservation, permit signer, settlement integrity and reference venues; `1e-999999999` could previously make the store allocate gigabytes (RT-50).
@@ -39,8 +46,8 @@ Third adversarial pass over v0.3.1 plus the operator controls a first bounded de
 
 **Evidence and packaging**
 
-- `evals/run_redteam.py` maps every attack class to named unit tests, loads the suite in-process, and fails on unmapped tests (100 classes, 131 tests). `run_adversarial.py` measures adapter calls and permits issued/consumed. `run_state_fuzz.py` advances a shared clock. The model checker models two permits, in-flight submission, expiry, halt and resume, and reports the without-rule counterexample.
-- New test modules: `test_store_hardening` (including real 0.3-shape databases and legacy chains), `test_runtime_hardening`, `test_boundary_hardening`, `test_mutation_gaps` (kills the 17 mutants that previously survived), `test_controls` (including a cross-process anchor test), `test_key_lifecycle`, `test_schemas`, plus a cross-process revocation test. 261 unit tests; the suite no longer leaks temporary files (RT-79).
+- `evals/run_redteam.py` maps every attack class to named unit tests, loads the suite in-process, and fails on unmapped tests (110 classes, 147 tests). `run_adversarial.py` measures adapter calls and permits issued/consumed. `run_state_fuzz.py` advances a shared clock. The model checker models two permits, in-flight submission, expiry, halt and resume, and reports the without-rule counterexample.
+- New test modules: `test_store_hardening` (including real 0.3-shape databases and legacy chains), `test_runtime_hardening`, `test_boundary_hardening`, `test_mutation_gaps` (kills the 17 mutants that previously survived), `test_controls` (including a cross-process anchor test), `test_key_lifecycle`, `test_schemas`, plus a cross-process revocation test. 279 unit tests; the suite no longer leaks temporary files (RT-79).
 - Schemas describe 0.3 documents (`principal_id`, `algorithm`+`signature`); examples validate in the unit suite when `jsonschema` is installed (`pip install -e ".[dev]"`). CI job timeout; Python 3.12/3.13 classifiers; full Apache-2.0 license text.
 - Documentation rewritten to match the code: architecture, trust and threat models, adapter/verifier contract, recovery table, invariants I-1..I-34, execution permits, operations runbook, go-live checklist; stale v0.2/HMAC statements removed.
 

@@ -1,4 +1,4 @@
-.PHONY: compile test adversarial redteam fuzz demo modelcheck check clean
+.PHONY: compile test adversarial redteam fuzz demo modelcheck crash check clean
 
 compile:
 	python -m compileall -q faar test evals
@@ -24,7 +24,10 @@ demo: compile
 modelcheck: compile
 	PYTHONPATH=. python evals/model_check_permit_protocol.py
 
-check: test adversarial redteam fuzz demo modelcheck
+crash: compile
+	PYTHONPATH=. python evals/run_crash_injection.py
+
+check: test adversarial redteam fuzz demo modelcheck crash
 
 clean:
 	rm -rf __pycache__ faar/__pycache__ test/__pycache__ evals/__pycache__ *.sqlite *.db build dist *.egg-info

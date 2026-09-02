@@ -200,6 +200,31 @@ ATTACK_CLASSES: dict[str, tuple[str, ...]] = {
         "test_store_hardening.LegacyChainTests.test_tampered_chain_is_not_adopted_by_the_bulk_rebuild",
         "test_cli.OperatorCliTests.test_rebuild_evidence_heads_for_a_legacy_database",
     ),
+    # --- live-money pass: order semantics, exposure, crash safety ----------------------
+    "partial fill remainder resubmitted as a second order": (
+        "test_partial_fills.PartialFillTests.test_partial_fill_confirms_with_its_effect_and_never_resubmits",
+        "test_partial_fills.PartialFillTests.test_mock_venue_partial_fill_completes_or_cancels_without_a_second_order",
+    ),
+    "cancellation contradicting or releasing a recorded fill": (
+        "test_partial_fills.PartialFillTests.test_cancel_after_partial_fill_finalizes_the_filled_effect",
+        "test_partial_fills.PartialFillTests.test_cancel_reporting_no_fill_after_a_recorded_fill_stops",
+        "test_partial_fills.PartialFillTests.test_recorded_partial_fill_then_authoritative_none_stops",
+    ),
+    "unfilled cancellation resubmitted under the same intent": ("test_partial_fills.PartialFillTests.test_cancel_without_fill_fails_safe_releases_and_never_resubmits",),
+    "partial fill beyond the authorized notional or on PAY": (
+        "test_partial_fills.PartialFillTests.test_partial_fill_integrity_checks",
+        "test_partial_fills.PartialFillTests.test_pay_cannot_partially_fill",
+    ),
+    "weak partial-fill or cancel observation acted on": ("test_partial_fills.PartialFillTests.test_weak_partial_or_cancel_observations_carry_no_weight",),
+    "quorum split on the filled amount": ("test_partial_fills.PartialFillTests.test_quorum_agrees_on_partial_fills_and_contests_differing_fills",),
+    "fleet exposure beyond the funded cap": (
+        "test_exposure_cap.ExposureCapTests.test_global_cap_bounds_the_whole_fleet_across_grants_and_principals",
+        "test_exposure_cap.ExposureCapTests.test_principal_cap_isolates_principals_and_can_be_cleared",
+        "test_exposure_cap.ExposureCapTests.test_runtime_defers_an_intent_over_the_cap_before_any_permit",
+    ),
+    "exposure cap changed without the anchor": ("test_exposure_cap.ExposureCapTests.test_caps_are_authority_changes_on_an_anchored_database",),
+    "unbounded abandoned adapter calls": ("test_orphan_cap.OrphanedAdapterCallCapTests.test_process_stops_submitting_while_too_many_abandoned_calls_are_running",),
+    "crash between finalize and commit stranding budget": ("test_runtime_hardening.RuntimeHardeningTests.test_finalize_and_commit_are_one_transaction_and_replay_repairs_older_rows",),
 }
 
 

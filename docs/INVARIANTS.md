@@ -155,3 +155,19 @@ With an authority anchor kept outside the backup set, a grant version whose `(ru
 ## I-34 — Key lifecycle is enforced at verification
 
 Attestation keys and permit signers carry optional validity windows and a revocation flag; artifacts issued outside a window or under a revoked key are rejected, unknown key ids are always rejected, and an artifact issued inside a window remains verifiable for its own lifetime after the window closes. Because `issued_at` is signer-controlled, verifiers also bound each artifact's lifetime (`ATTESTATION_TTL_EXCEEDED`, `PERMIT_TTL_EXCEEDED`), capping a retired key's exposure to `not_after + lifetime`; revocation remains the hard control.
+
+## I-35 — Partial fills and cancellations never create a second attempt
+
+An authoritative `PARTIALLY_FILLED` record confirms the intent with the order's effect id and is reconciled again later; the unfilled remainder is never resubmitted. `CANCELLED` is terminal: with a fill it finalizes the intent, without one it fails safe and releases the budget, and it never contradicts a recorded fill silently (`test_partial_fills`).
+
+## I-36 — Abandoned adapter calls are bounded
+
+A call abandoned at the adapter deadline keeps running; the runtime counts them and refuses to submit (`ADAPTER_ORPHAN_LIMIT_REACHED`, budget released, no permit minted) while more than `max_orphaned_adapter_calls` are outstanding in the process (`test_orphan_cap`).
+
+## I-37 — Fleet exposure is capped independently of grants
+
+An operator cap on trailing-window turnover per scope (`global`, `principal:<id>`) is enforced atomically inside `reserve_usage` across every grant and principal in the scope (`EXPOSURE_CAP_EXCEEDED`); tightening or loosening it is an authority change and requires the anchor on an anchored database (`test_exposure_cap`).
+
+## I-38 — Every persistence boundary is crash-safe
+
+Finalize-and-commit and terminalize-and-release are single store transactions, and a worker killed before any store call can be recovered by the documented runbook without a duplicate effect, a lost effect, or stranded budget (`evals/run_crash_injection.py`).

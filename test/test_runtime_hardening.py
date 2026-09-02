@@ -269,6 +269,35 @@ class RuntimeHardeningTests(unittest.TestCase):
         self.store.record_execution_permit("permit_c", i, g, 1, 3, "h3", expires_at=NOW + timedelta(seconds=20), now=NOW + timedelta(seconds=8))
         self.assertEqual((NOW + timedelta(seconds=20)).isoformat(), self.store.get(i.intent_id).ambiguity_until)
 
+    # --- finalize and commit are one transaction --------------------------------------
+
+    def test_finalize_and_commit_are_one_transaction_and_replay_repairs_older_rows(self):
+        i = intent(intent_id="intent_hard_000000000040")
+        self.store.register(i, canonical_hash(i))
+        self.assertTrue(self.store.reserve_usage(i, grant(), risk(), NOW)[0])
+        for a, b in ((IntentState.PROPOSED, IntentState.AUTHORIZED), (IntentState.AUTHORIZED, IntentState.RESERVED),
+                     (IntentState.RESERVED, IntentState.RECONCILING)):
+            self.assertTrue(self.store.transition(i.intent_id, a, b))
+        with self.assertRaises(ValueError):
+            self.store.transition(i.intent_id, IntentState.RECONCILING, IntentState.FINALIZED, effect_id="fx-a", release_usage=True, commit_usage=True)
+        self.assertTrue(self.store.transition(i.intent_id, IntentState.RECONCILING, IntentState.FINALIZED, effect_id="fx-a", commit_usage=True))
+        self.assertEqual("COMMITTED", self.usage_status(i.intent_id))
+        # A FINALIZED row whose commit never happened (older version, crash between
+        # the two statements) is repaired by the first replay.
+        j = intent(intent_id="intent_hard_000000000041")
+        self.store.register(j, canonical_hash(j))
+        self.assertTrue(self.store.reserve_usage(j, grant(), risk(state_version=2), NOW)[0])
+        for a, b in ((IntentState.PROPOSED, IntentState.AUTHORIZED), (IntentState.AUTHORIZED, IntentState.RESERVED),
+                     (IntentState.RESERVED, IntentState.RECONCILING)):
+            self.assertTrue(self.store.transition(j.intent_id, a, b))
+        self.assertTrue(self.store.transition(j.intent_id, IntentState.RECONCILING, IntentState.FINALIZED, effect_id="fx-b"))
+        self.assertEqual("HELD", self.usage_status(j.intent_id))
+        runtime = self.runtime_for(ScriptedAdapter([], [_auth(SettlementStatus.NONE)]))
+        replay = self.run_case(runtime, j)
+        self.assertEqual(IntentState.FINALIZED, replay.state)
+        self.assertTrue(replay.replayed)
+        self.assertEqual("COMMITTED", self.usage_status(j.intent_id))
+
     # --- a settlement-derived stop is not an orphaned hold ------------------------
 
     def test_replay_keeps_the_hold_of_a_never_submitted_intent_stopped_on_settlement_evidence(self):

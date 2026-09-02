@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from decimal import Decimal
+
 import hashlib
 from dataclasses import dataclass
 from enum import StrEnum
@@ -66,6 +68,9 @@ class MockMode(StrEnum):
     TIMEOUT_BEFORE_EFFECT = "TIMEOUT_BEFORE_EFFECT"
     TIMEOUT_AFTER_EFFECT = "TIMEOUT_AFTER_EFFECT"
     AMBIGUOUS = "AMBIGUOUS"
+    # The order rests on the book half filled; `complete_fill` / `cancel_order`
+    # move it to its terminal state.
+    PARTIAL_FILL = "PARTIAL_FILL"
 
 
 class ExecutionAdapter(Protocol):
@@ -100,13 +105,20 @@ class MockVenue:
     def _key(request: ExecutionRequest) -> str:
         return f"{request.principal_id}\x1f{request.intent_id}"
 
-    def _receipt(self, request: ExecutionRequest) -> ExecutionReceipt:
+    def _receipt(
+        self,
+        request: ExecutionRequest,
+        *,
+        status: SettlementStatus = SettlementStatus.FINALIZED,
+        amount: Decimal | None = None,
+    ) -> ExecutionReceipt:
         seed = request.principal_id + "\x1f" + request.intent_id + canonical_json(request.payload)
         effect_id = "fx_" + hashlib.sha256(seed.encode()).hexdigest()[:24]
-        amount = parse_bounded_decimal(request.payload.get("amount_usd", request.payload.get("notional_usd")))
+        if amount is None:
+            amount = parse_bounded_decimal(request.payload.get("amount_usd", request.payload.get("notional_usd")))
         return ExecutionReceipt(
             effect_id=effect_id,
-            status=SettlementStatus.FINALIZED,
+            status=status,
             evidence={
                 "venue": self.name,
                 "principal_id": request.principal_id,
@@ -116,6 +128,10 @@ class MockVenue:
             },
             amount_usd=amount,
         )
+
+    @staticmethod
+    def _authorized_amount(request: ExecutionRequest) -> Decimal | None:
+        return parse_bounded_decimal(request.payload.get("amount_usd", request.payload.get("notional_usd")))
 
     def execute(self, request: ExecutionRequest, permit: SignedExecutionPermit) -> ExecutionReceipt:
         with self._lock:
@@ -132,10 +148,45 @@ class MockVenue:
                 raise AmbiguousExecution("timeout before venue effect; caller must reconcile before retry")
             if self.mode == MockMode.AMBIGUOUS:
                 raise AmbiguousExecution("venue remains ambiguous")
-            receipt = self._receipt(request)
+            if self.mode == MockMode.PARTIAL_FILL:
+                full = self._authorized_amount(request)
+                half = (full / 2).quantize(Decimal("0.00000001")) if full is not None else None
+                receipt = self._receipt(request, status=SettlementStatus.PARTIALLY_FILLED, amount=half)
+            else:
+                receipt = self._receipt(request)
             self._effects[key] = receipt
             if self.mode == MockMode.TIMEOUT_AFTER_EFFECT:
                 raise AmbiguousExecution("timeout after venue effect; caller must reconcile")
+            return receipt
+
+    def complete_fill(self, request: ExecutionRequest) -> ExecutionReceipt | None:
+        """Venue-side: the resting remainder of a partially filled order fills."""
+        with self._lock:
+            key = self._key(request)
+            current = self._effects.get(key)
+            if current is None:
+                return None
+            receipt = self._receipt(request, status=SettlementStatus.FINALIZED)
+            self._effects[key] = receipt
+            return receipt
+
+    def cancel_order(self, request: ExecutionRequest) -> ExecutionReceipt | None:
+        """Venue-side: cancel a resting order; the filled amount so far stays settled.
+
+        Terminal by contract: after this the venue never fills the remainder.
+        """
+        with self._lock:
+            key = self._key(request)
+            current = self._effects.get(key)
+            if current is None:
+                return None
+            filled = current.amount_usd if current.status == SettlementStatus.PARTIALLY_FILLED else (
+                current.amount_usd if current.status == SettlementStatus.CANCELLED else None
+            )
+            if current.status == SettlementStatus.FINALIZED:
+                return current  # nothing left to cancel
+            receipt = self._receipt(request, status=SettlementStatus.CANCELLED, amount=filled)
+            self._effects[key] = receipt
             return receipt
 
     def lookup_effect(self, request: ExecutionRequest) -> ExecutionReceipt | None:

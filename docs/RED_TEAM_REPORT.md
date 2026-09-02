@@ -113,6 +113,8 @@ Before release, five independent reviewers (fail-closed regressions, new-code co
 | RT-78 | The gateway never emitted `PERMIT_HALTED` / `PERMIT_AUTHORITY_REGRESSED` (documented codes); `ConstrainedPermitAuthority` accepted the symmetric `HMACPermitSignature` although the trust model said otherwise | Info | Status-specific codes at `verify`; symmetric signers refused without the test override |
 | RT-79 | Test-quality defects: the restore test snapshotted before issuance; the canonical-encoding test exercised its check in ~25 % of runs; the signer-relabel test could not distinguish a payload binding from a different key; a deadline test synchronised on `sleep`; the suite leaked 157 temp files per run; a CLI test destroyed a caller's environment variable | Assurance | All rewritten (deterministic aliases, same key under two ids, events, per-test temp directories, `patch.dict`) |
 
+| RT-80 | `FINALIZED` and the usage commit were two autocommit statements; a worker killed between them left budget HELD on a FINALIZED intent forever (found by the new crash-injection eval, which kills a worker before every store call) | Low | `transition(..., commit_usage=True)` finalizes and commits in one transaction; a replay repairs rows written by older versions; `make crash` runs 193 crash points in `make check` |
+
 Documentation corrections from the same pass: halt semantics for in-flight intents, the persisted deterministic-failure code, the residual-risk table (partial fills OPEN, orphan threads under R-09), adapter-contract references, HMAC statements, the lifecycle diagram (`RECONCILING -> FAILED_SAFE`, retry edge), and the invariants header.
 
 ## Executable regression matrix
@@ -120,8 +122,8 @@ Documentation corrections from the same pass: halt semantics for in-flight inten
 Current `make check` result for v0.4.0:
 
 ```text
-261 unit/invariant tests -> PASS
-100 targeted red-team attack classes, each mapped to named tests (131 tests) -> PASS, 0 unmapped
+279 unit/invariant tests -> PASS
+110 targeted red-team attack classes, each mapped to named tests (147 tests) -> PASS, 0 unmapped
 160 deterministic denial mutations -> 0 unauthorized economic effects, 0 adapter calls
 100 retries of one logical intent -> 1 successful effect, 1 adapter call, 1 permit issued and consumed
 ambiguous timeout-after-effect recovery -> 1 successful effect, 1 adapter call

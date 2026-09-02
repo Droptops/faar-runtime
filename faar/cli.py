@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from .adapters import MockMode, MockVenue
@@ -167,6 +168,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     with_db(sub.add_parser("controls", help="show emergency control records"), anchor=False)
 
+    p_cap = with_db(sub.add_parser("set-exposure-cap", help="OPERATOR: cap trailing-window turnover for a scope, independent of grants"))
+    p_cap.add_argument("--scope", required=True, help="'global' or 'principal:<principal_id>'")
+    group = p_cap.add_mutually_exclusive_group(required=True)
+    group.add_argument("--max-usd", help="positive amount (plain decimal string)")
+    group.add_argument("--clear", action="store_true", help="remove the cap for the scope")
+
+    with_db(sub.add_parser("exposure-caps", help="show scope exposure caps"), anchor=False)
+
     p_rar = with_db(sub.add_parser("revoke-after-restore", help="OPERATOR: close a grant version whose authority state regressed behind its anchor"))
     p_rar.add_argument("--grant-id", required=True)
     p_rar.add_argument("--grant-version", required=True, type=int)
@@ -179,7 +188,7 @@ def build_parser() -> argparse.ArgumentParser:
 # printed as JSON and exit 2 so scripts can branch on them.
 _OPERATOR_ERRORS = (
     AuthorityAnchorRequired, AuthorityRegression, AnchorUnavailable, EvidenceIntegrityError,
-    GrantConflict, MigrationError, UnknownGrant,
+    GrantConflict, MigrationError, UnknownGrant, InvalidOperation, ValueError,
 )
 
 
@@ -283,6 +292,17 @@ def _main(argv=None) -> None:
 
     if command == "controls":
         _emit(SQLiteIntentStore(args.db).controls())
+        return
+
+    if command == "set-exposure-cap":
+        store = _open_store(args)
+        cap = None if args.clear else Decimal(str(args.max_usd))
+        store.set_exposure_cap(args.scope, cap)
+        _emit({"scope": args.scope, "max_turnover_usd": None if cap is None else format(cap, "f")})
+        return
+
+    if command == "exposure-caps":
+        _emit(SQLiteIntentStore(args.db).exposure_caps())
         return
 
     if command == "revoke-after-restore":
