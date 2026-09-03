@@ -38,10 +38,10 @@ independently operated settlement source.
 
 ## stable intent identity
 
-`client_order_id` is `pco_` plus the first 128 bits of SHA-256 over a canonical,
-domain-separated object containing `principal_id` and `intent_id`. It is stable,
-does not expose either identifier, and cannot alias delimiter-containing identity
-pairs. The venue treats it as both idempotency and lookup key.
+`client_order_id` is `pco_` plus SHA-256 over a canonical, domain-separated object
+containing `principal_id` and `intent_id`. It is stable, does not expose either
+identifier, and delimiter-containing identity pairs have distinct preimages. The
+venue treats it as both idempotency and lookup key.
 
 ## supported order semantics
 
@@ -96,8 +96,9 @@ independent-source evidence.
 
 ## settlement/effect identity
 
-A fill's `effect_id` is the order identity assigned at admission
-(`pg_` + SHA-256(`venue`, `client_order_id`, `"order"`)[:24]). A later fill
+A fill's `effect_id` is the order identity assigned at admission (`pg_` plus
+SHA-256 over a canonical domain-separated tuple of venue, client order id and
+`"order"`). A later fill
 does not mint a second id. Quantities and price evidence are computed atomically
 from the executable quote at actual fill time, not cached when a GTC order is
 admitted. A cancel is a separate intent with its own `effect_id` and

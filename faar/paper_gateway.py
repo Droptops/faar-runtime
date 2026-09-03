@@ -153,7 +153,7 @@ def client_order_id(request: ExecutionRequest) -> str:
         "principal_id": request.principal_id,
         "intent_id": request.intent_id,
     })
-    return "pco_" + hashlib.sha256(seed.encode("utf-8")).hexdigest()[:32]
+    return "pco_" + hashlib.sha256(seed.encode("utf-8")).hexdigest()
 
 
 def request_to_wire(request: ExecutionRequest) -> dict[str, Any]:
@@ -255,7 +255,8 @@ class _OrderPlan:
 
 
 def _stable_id(*parts: str) -> str:
-    return "pg_" + hashlib.sha256("\x1f".join(parts).encode()).hexdigest()[:24]
+    seed = canonical_json({"domain": "faar:paper-gateway:effect-id:v1", "parts": list(parts)})
+    return "pg_" + hashlib.sha256(seed.encode("utf-8")).hexdigest()
 
 
 class PaperVenueBook:

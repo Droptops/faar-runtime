@@ -204,7 +204,7 @@ deployment row or constitute an independent review.
 | RT-140 | Admit-then-reject left authoritative `NONE` after a consumed permit | High | Rejected and cancelled originals reconcile as `CANCELLED` amount 0; effect id is stable from admission |
 | RT-141 | A principal with cancel authority could cancel another principal's order by venue order id | High | Orders carry an owner; `ORDER_NOT_OWNED` is returned before permit consumption |
 | RT-142 | One service accepted permits for any principal while mutating a shared account balance | High | Every service is pinned to one principal and checks submit and lookup requests before consumption |
-| RT-143 | `principal_id + ":" + intent_id` aliased identity pairs containing delimiters | Medium | Canonical domain-separated 128-bit client-order hash |
+| RT-143 | `principal_id + ":" + intent_id` aliased identity pairs containing delimiters | Medium | Canonical domain-separated SHA-256 client-order and effect identities |
 | RT-144 | Side-less `PLACE_ORDER` was silently interpreted as BUY | High | Only explicit BUY/SELL accepted; unsupported primitives fail before consumption |
 | RT-145 | Market/FOK aliases, a second ignored slippage bound, non-USDC quote or unpinned target changed order meaning | High | Exact limit IOC/GTC, USDC quote, absolute-limit-only and pinned-target checks before consumption |
 | RT-146 | A resting GTC reported admission-time price and quantities after filling at a later quote | High | Fill evidence and both balance legs are calculated from the executable quote at actual fill time |
