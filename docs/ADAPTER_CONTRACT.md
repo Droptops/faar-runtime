@@ -54,7 +54,8 @@ payment-intent ID, contract intent hash/nonce.
 A gateway has an identity. It refuses a permit presented for a request addressed
 to another venue (`PERMIT_VENUE_MISMATCH`): construct the gateway with
 `ExecutionPermitVerifier(..., venue=<its name>)` or pass `venue=` on every
-`consume()`, as `MockVenue` and `PaperTradingVenue` do. Without this, a
+`consume()`, as `MockVenue`, `PaperTradingVenue`, `PaperVenueService` and
+the Hyperliquid testnet candidate do. Without this, a
 compromised adapter for venue A could move the money at venue B with A's permit.
 
 The venue, or a capability gateway in front of it, calls

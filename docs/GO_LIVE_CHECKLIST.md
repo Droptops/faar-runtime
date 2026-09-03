@@ -13,8 +13,10 @@ DEPLOYMENT and OPEN row is closed and the result has been independently reviewed
 
 `faar/hyperliquid.py` and
 [`HYPERLIQUID_TESTNET_ADAPTER_REVIEW.md`](HYPERLIQUID_TESTNET_ADAPTER_REVIEW.md)
-now make one narrow venue contract executable against deterministic fakes. They
-do not change any OPEN or DEPLOYMENT status: no credentialed testnet run,
+now make one narrow venue contract executable against deterministic fakes.
+`faar/paper_gateway.py` and [`adapters/PAPER_GATEWAY.md`](adapters/PAPER_GATEWAY.md)
+add a paper / loopback venue whose submit and query credentials are distinct.
+Neither changes any OPEN or DEPLOYMENT status: no credentialed testnet run,
 constrained signer deployment, durable nonce allocator, independently operated
 settlement source, or venue-side fault campaign is present.
 
@@ -34,7 +36,7 @@ settlement source, or venue-side fault campaign is present.
 | 3.2 | authoritative portfolio / market semantics | DEPLOYMENT | `RISK_ENGINE_CONTRACT.md` (external risk signer) |
 | 3.3 | no aggregate oversubscription under concurrency | DONE-IN-REPO | `test_runtime`, `test_multiprocess`, `evals/run_state_fuzz.py`, `test_store_hardening.TurnoverWindowTests` |
 | 4.1 | bounded adapter deadlines | DONE-IN-REPO | `adapter_deadline_seconds`; `test_runtime_hardening` deadline tests |
-| 4.2 | stable external intent identity | DEPLOYMENT (per venue; the contract is documented, no in-repo test can prove it for a real venue) | `ADAPTER_CONTRACT.md` A2; Hyperliquid candidate derives/queries a 128-bit `cloid`, `test_hyperliquid` checks the mapping against fakes; venue proof remains open |
+| 4.2 | stable external intent identity | DEPLOYMENT (per venue; the contract is documented, no in-repo test can prove it for a real venue) | `ADAPTER_CONTRACT.md` A2; paper-gateway `client_order_id` and Hyperliquid `cloid` are tested against in-repo books/fakes; venue proof remains open |
 | 4.3 | authoritative reconciliation by identity | DONE-IN-REPO (contract) / DEPLOYMENT | `test_runtime` settlement tests, `test_settlement`; Hyperliquid candidate order/fill rebinding in `test_hyperliquid` |
 | 4.4 | partial-fill / cancel semantics | DONE-IN-REPO (modelled: `PARTIALLY_FILLED` including open orders, `CANCELLED`, monotone cumulative fills) / DEPLOYMENT (venue guarantees cancel terminality) | `ADAPTER_CONTRACT.md` Part C; `test_partial_fills`; `test_economic_redteam`; `evals/run_crash_injection.py` `partial_fill_then_cancel`; Hyperliquid IOC mapping review |
 | 4.5 | effect ID definition | DONE-IN-REPO (contract, per venue) | `INVARIANTS.md` I-10/I-11 |
@@ -79,7 +81,7 @@ settlement source, or venue-side fault campaign is present.
 | R-09 hung adapter delays revocation; orphaned adapter threads | DONE-IN-REPO | deadline + kill switch + `max_orphaned_adapter_calls`; a cancelled Python call cannot be killed, the venue refuses its expired or superseded permit |
 | R-10 intent namespace squatting | DEPLOYMENT | ingress authentication |
 | R-11 trusted clock | DEPLOYMENT | |
-| R-12 mock verifier shares ground truth with mock venue | DEPLOYMENT | Hyperliquid candidate separates `/exchange` and `/info`, but live use still needs an independently operated node or quorum/archival source |
+| R-12 mock verifier shares ground truth with mock venue | DEPLOYMENT | paper-gateway splits submit/query credentials and loopback HTTP paths (DONE-IN-REPO for that venue only); Hyperliquid candidate separates `/exchange` and `/info`; live use still needs an independently operated node or quorum/archival source |
 | R-13 anchor placement | DEPLOYMENT | anchor restored with the DB detects nothing |
 | R-14 partial fills and cancellation | DONE-IN-REPO / DEPLOYMENT (venue cancel terminality) | gates 4.4 and 6.7; `ADAPTER_CONTRACT.md` Part C |
 
