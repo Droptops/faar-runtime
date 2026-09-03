@@ -6,6 +6,7 @@ import time
 import unittest
 import uuid
 from dataclasses import replace
+from datetime import timedelta
 from decimal import Decimal
 
 from faar.adapters import REFERENCE_SAFE_PROFILE, MockVenue
@@ -225,16 +226,21 @@ class PostgresStoreContractTests(unittest.TestCase):
         self.assertTrue(self.store.verify_evidence_chain(value.intent_id))
 
     def test_intent_cas_and_effect_identity_are_atomic(self):
+        allowed = grant()
+        self.store.provision_grant(allowed, canonical_hash(allowed))
         values = (
             intent(intent_id="pg_effect_000000000000001"),
             intent(intent_id="pg_effect_000000000000002"),
         )
-        for value in values:
+        for number, value in enumerate(values, start=1):
             self.store.register(value, canonical_hash(value))
+            self.assertTrue(self.store.reserve_usage(
+                value, allowed, risk(state_version=number), NOW,
+            )[0])
             self.assertTrue(self.store.transition(value.intent_id, IntentState.PROPOSED, IntentState.AUTHORIZED))
             self.assertTrue(self.store.transition(value.intent_id, IntentState.AUTHORIZED, IntentState.RESERVED))
-            self.assertEqual((True, False, 1), self.store.begin_submission(
-                value.intent_id, [IntentState.RESERVED], max_attempts=2,
+            self.assertEqual((True, False, False, 1), self.store.begin_submission(
+                value.intent_id, [IntentState.RESERVED], max_attempts=2, now=NOW,
             ))
         self.assertTrue(self.store.transition(
             values[0].intent_id,
@@ -284,6 +290,44 @@ class PostgresStoreContractTests(unittest.TestCase):
         self.assertEqual(1, sum(1 for accepted, _ in results if accepted))
         refusal = next(reasons for accepted, reasons in results if not accepted)
         self.assertIn("ATOMIC_DAILY_TURNOVER_EXCEEDED", refusal)
+
+    def test_each_retry_consumes_a_distinct_action_velocity_slot(self):
+        limited = grant(
+            grant_id="grant:pg-attempt-velocity",
+            limits=replace(
+                grant().limits,
+                max_actions_per_window=1,
+                action_window_seconds=60,
+                max_submission_attempts=2,
+            ),
+        )
+        self.store.provision_grant(limited, canonical_hash(limited))
+        value = intent(
+            intent_id="pg_attempt_velocity_000001",
+            grant_id=limited.grant_id,
+        )
+        self.store.register(value, canonical_hash(value))
+        self.assertTrue(self.store.reserve_usage(value, limited, risk(), NOW)[0])
+        self.assertTrue(self.store.transition(value.intent_id, IntentState.PROPOSED, IntentState.AUTHORIZED))
+        self.assertTrue(self.store.transition(value.intent_id, IntentState.AUTHORIZED, IntentState.RESERVED))
+        self.assertEqual(
+            (True, False, False, 1),
+            self.store.begin_submission(
+                value.intent_id, [IntentState.RESERVED], max_attempts=2, now=NOW,
+            ),
+        )
+        self.assertTrue(self.store.transition(value.intent_id, IntentState.SUBMITTED, IntentState.UNKNOWN))
+        self.assertTrue(self.store.transition(value.intent_id, IntentState.UNKNOWN, IntentState.RECONCILING))
+        self.assertEqual(
+            (False, False, True, 1),
+            self.store.begin_submission(
+                value.intent_id,
+                [IntentState.RECONCILING],
+                max_attempts=2,
+                now=NOW + timedelta(seconds=10),
+            ),
+        )
+        self.assertEqual(1, len(self.store.submission_attempts(value.intent_id)))
 
     def test_durable_lease_blocks_another_store_instance(self):
         value = intent(intent_id="pg_lease_0000000000000001")
@@ -355,7 +399,13 @@ class PostgresStoreContractTests(unittest.TestCase):
     def test_monotonic_and_epoch_second_columns_are_64_bit(self):
         names = {
             "grants": {"runtime_epoch", "fence_counter"},
-            "usage_reservations": {"velocity_bucket", "velocity_ts"},
+            "usage_reservations": {
+                "velocity_bucket", "velocity_ts",
+                "max_actions_per_window", "action_window_seconds",
+            },
+            "submission_attempts": {
+                "attempt_number", "grant_version", "attempted_at", "action_count",
+            },
             "risk_claims": {"state_version"},
             "permit_risk_claims": {"state_version"},
             "execution_permits": {"grant_epoch", "fence_token", "issuance_seq"},

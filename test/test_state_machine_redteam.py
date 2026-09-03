@@ -254,6 +254,14 @@ class IndexCoverageTests(unittest.TestCase):
                 "ix_usage_velocity_status",
                 plan("SELECT amount_usd FROM usage_reservations WHERE status IN ('HELD','COMMITTED') AND velocity_ts >= ?", 0),
             )
+            self.assertIn(
+                "ix_submission_attempts_grant_time",
+                plan(
+                    "SELECT COALESCE(SUM(action_count),0) FROM submission_attempts "
+                    "WHERE grant_id=? AND principal_id=? AND attempted_at>=?",
+                    "grant:test", "principal:test", 0,
+                ),
+            )
         finally:
             store.close()
 

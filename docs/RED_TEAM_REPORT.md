@@ -138,7 +138,7 @@ Before release, five independent reviewers (fail-closed regressions, new-code co
 | RT-98 | Deleting the head row together with the tail made a truncated 0.4 chain look like a pre-head legacy chain (`head_missing`), and the documented `rebuild-evidence-head` laundered the truncation | Medium | Chains that start at `intent_registered` were born with a head: their missing head is `head_deleted` and the rebuild refuses them |
 | RT-99 | `halt` and `set-exposure-cap` accepted any `principal:<text>` and reported success while fencing or capping nothing; a mistyped principal left the fleet unprotected with exit 0 | Low | Scopes with whitespace are rejected; a principal without a provisioned grant is `UnknownPrincipal` unless `--allow-unprovisioned-principal`; the cap command reports the grant versions in scope |
 | RT-100 | Exposure caps were not anchored: a restore silently reinstated the pre-incident (looser) cap once the grants were recovered | Low | The cap table version is anchored; a regressed datastore refuses reservations with `EXPOSURE_CAPS_REGRESSED` until caps are re-applied |
-| RT-101 | Action velocity counted effects, not venue actions: every released reservation (cancelled unfilled, deterministic rejection, retry-predicate stop) gave its slot back at once, so a compromised model could place an unbounded number of admit-and-cancel orders inside one window | Medium | The reservation is marked `submitted` in the `begin_submission` transaction and keeps counting against `max_actions_per_window` for the window whatever happens to its budget; legacy rows derive the flag from the attempt count. A retry of the same intent is the same row, so venue attempts per window are bounded by `max_actions_per_window x max_submission_attempts` (I-13) |
+| RT-101 | Action velocity counted effects, not venue actions: every released reservation (cancelled unfilled, deterministic rejection, retry-predicate stop) gave its slot back at once, so a compromised model could place an unbounded number of admit-and-cancel orders inside one window | Medium | A pending reservation occupies a provisional slot; `begin_submission` atomically replaces it with an immutable attempt row that keeps counting after any budget release (I-13) |
 | RT-102 | Provisioning a new grant version restarted the trailing turnover and velocity windows (2x the daily cap for one grant id) | Medium | Both windows are summed over every version of the grant id; the current version's limits apply to the total |
 | RT-103 | `max_slippage_bps` constrained only a risk-signer claim; neither the sanitized request nor the permit carried an executor-side bound, so a swap venue could return any output for the authorized input | Medium | A grant that caps slippage requires `max_slippage_bps` in every SWAP/BUY/SELL/PLACE_ORDER payload (`PAYLOAD_FIELD_REQUIRED:max_slippage_bps`, orders may carry `limit_price` instead), no looser than the cap (`SLIPPAGE_BOUND_EXCEEDS_GRANT`), typed (`SLIPPAGE_BOUND_INVALID`, `LIMIT_PRICE_INVALID`); the bound travels in the hash-bound request the adapter must enforce |
 | RT-104 | `reserve_usage` checked exact-version ownership only in the initial risk ledger; a version a retry bound in the permit ledger reserved budget for another intent and burned a submission attempt | Low | Reservation consults both ledgers for the exact version (`RISK_STATE_VERSION_ALREADY_CLAIMED`) |
@@ -217,13 +217,19 @@ deployment row or constitute an independent review.
 | RT-153 | A resting GTC that failed when it became marketable remained open indefinitely | High | Failed matches become authoritative unfilled `CANCELLED` records and are never retried as fills |
 | RT-154 | A datastore-level execution guard held across the external adapter call could let a hung venue block cross-host pause/revoke | High | PostgreSQL uses transaction-scoped writer locks only at datastore linearization points; the durable epoch rejects the in-flight permit after a winning revoke |
 
+## Finding closed in Gate 8 preparation
+
+| ID | Finding | Severity | Response |
+|---|---|---:|---|
+| RT-155 | Action velocity recorded only one `submitted` bit per intent, so retries multiplied the nominal `max_actions_per_window` ceiling by `max_submission_attempts` | Medium | `submission_attempts` is an immutable per-attempt ledger; reservation and submission checks share the datastore's global linearization order, every retry consumes a distinct slot, and legacy counts migrate conservatively. SQLite end-to-end and PostgreSQL contract tests remove the multiplier. |
+
 ## Executable regression matrix
 
 Current `make check` result for v0.4.0:
 
 ```text
-425 unit/invariant tests discovered -> reference PASS; 8 PostgreSQL integration tests are conditional on the PostgreSQL service job
-185 targeted red-team attack classes, each mapped to named tests (264 tests) -> PASS, 0 unmapped; conditional mappings are reported explicitly
+428 unit/invariant tests discovered -> reference PASS; 9 PostgreSQL integration tests are conditional on the PostgreSQL service job
+186 targeted red-team attack classes, each mapped to named tests (267 tests) -> PASS, 0 unmapped; conditional mappings are reported explicitly
 29 Hyperliquid testnet contract tests with deterministic fakes -> PASS; no live venue or credential claim
 31 paper-gateway tests (in-process + loopback HTTP) -> PASS; not a live venue or credential claim
 160 deterministic denial mutations -> 0 unauthorized economic effects, 0 adapter calls

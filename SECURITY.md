@@ -6,6 +6,10 @@ FAAR is pre-alpha security-sensitive financial infrastructure. v0.4.0 is a harde
 
 This repository contains an executable reference security kernel plus self-red-team regression evidence (`docs/RED_TEAM_REPORT.md`). It is **not independently audited**, **not formally verified**, and **not approved for real funds**. `docs/GO_LIVE_CHECKLIST.md` records exactly which live-money gates are closed in-repo and which remain open or belong to a deployment.
 
+The reviewer scope, independence criteria, reproducibility commands and required
+report format for Gate 8 are in `docs/INDEPENDENT_SECURITY_REVIEW.md`. That packet
+prepares the review; it does not substitute for a human reviewer.
+
 ## Reporting a vulnerability
 
 Report privately through GitHub's private vulnerability reporting on this repository ("Security" tab → "Report a vulnerability"). If that is unavailable to you, open an issue titled "security contact request" containing **no** technical detail and a maintainer will provide a private channel.

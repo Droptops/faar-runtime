@@ -12,7 +12,7 @@ from dataclasses import replace
 from datetime import timedelta
 from decimal import Decimal
 
-from faar.adapters import MockMode
+from faar.adapters import AmbiguousExecution, MockMode
 from faar.canonical import canonical_hash, parse_bounded_decimal
 from faar.gates import evaluate_capability
 from faar.models import EconomicPrimitive, ExecutionReceipt, ExecutionRequest, IntentState, SettlementRecord, SettlementStatus, Verdict
@@ -49,10 +49,10 @@ class _RuntimeCase(unittest.TestCase):
             {"mock-dex": ScriptedVerifier(adapter)}, clock=lambda: NOW, allow_test_time_override=True,
         )
 
-    def run_case(self, runtime, i, g=None, now=NOW):
+    def run_case(self, runtime, i, g=None, now=NOW, *, actions_in_window=1):
         g = g or grant()
         self.n += 1
-        rs = risk(state_version=self.n, observed_at=now)
+        rs = risk(state_version=self.n, observed_at=now, actions_in_window=actions_in_window)
         aa, ra = attest_pair(self.trust, i, AUTH, rs, now)
         return runtime.process(i, AUTH, g, rs, authority_attestation=aa, risk_attestation=ra, now=now)
 
@@ -65,6 +65,43 @@ class _RuntimeCase(unittest.TestCase):
 
 
 class VelocityBoundsVenueAttemptsTests(_RuntimeCase):
+    def test_retry_consumes_another_velocity_slot_and_cannot_multiply_the_cap(self):
+        tight = grant(
+            grant_id="grant:attempt-velocity",
+            limits=replace(
+                grant().limits,
+                max_actions_per_window=1,
+                action_window_seconds=60,
+                max_submission_attempts=2,
+            ),
+        )
+        self.store.provision_grant(tight, canonical_hash(tight))
+        adapter = ScriptedAdapter(
+            [AmbiguousExecution("request was never admitted"), RECEIPT],
+            [_auth(SettlementStatus.NONE, amount=None)],
+        )
+        runtime = self.runtime_for(adapter)
+        value = intent(
+            intent_id="intent_retry_velocity_000001",
+            grant_id=tight.grant_id,
+        )
+
+        first = self.run_case(runtime, value, g=tight, actions_in_window=0)
+        self.assertEqual(IntentState.UNKNOWN, first.state)
+        self.assertEqual(1, adapter.calls)
+        self.assertEqual(1, len(self.store.submission_attempts(value.intent_id)))
+
+        # The first permit window is closed but the 60-second action window is not.
+        # A retry is independently authorized, yet the venue-attempt ceiling wins.
+        second = self.run_case(
+            runtime, value, g=tight, now=NOW + timedelta(seconds=10), actions_in_window=0,
+        )
+        self.assertEqual(IntentState.STOPPED, second.state)
+        self.assertEqual(("ATOMIC_ACTION_VELOCITY_EXCEEDED",), second.reason_codes)
+        self.assertEqual(1, adapter.calls, "the cap itself, not cap x retries, is the venue-call ceiling")
+        self.assertEqual(1, self.store.get(value.intent_id).submission_count)
+        self.assertEqual("RELEASED", self.usage_status(value.intent_id, tight.grant_id))
+
     def test_cancelled_unfilled_attempts_keep_their_velocity_slot(self):
         tight = grant(grant_id="grant:velocity", limits=replace(grant().limits, max_actions_per_window=2))
         self.store.provision_grant(tight, canonical_hash(tight))
@@ -116,7 +153,9 @@ class VelocityBoundsVenueAttemptsTests(_RuntimeCase):
         self.assertTrue(reserve(b, "intent_velb_00000000000001", 1)[0])
         self.store.transition("intent_velb_00000000000001", IntentState.PROPOSED, IntentState.AUTHORIZED)
         self.store.transition("intent_velb_00000000000001", IntentState.AUTHORIZED, IntentState.RESERVED)
-        started, _, _ = self.store.begin_submission("intent_velb_00000000000001", [IntentState.RESERVED], max_attempts=2)
+        started, _, _, _ = self.store.begin_submission(
+            "intent_velb_00000000000001", [IntentState.RESERVED], max_attempts=2, now=NOW,
+        )
         self.assertTrue(started)
         self.store.release_usage("intent_velb_00000000000001")
         row = next(r for r in self.store.usage("grant:vel-b", 1) if r["intent_id"] == "intent_velb_00000000000001")

@@ -59,6 +59,8 @@ CREATE TABLE IF NOT EXISTS usage_reservations (
     day_key TEXT NOT NULL,
     velocity_bucket BIGINT,
     velocity_ts BIGINT,
+    max_actions_per_window BIGINT,
+    action_window_seconds BIGINT,
     amount_usd TEXT NOT NULL,
     status TEXT NOT NULL CHECK(status IN ('HELD','COMMITTED','RELEASED')),
     submitted INTEGER NOT NULL DEFAULT 0,
@@ -69,6 +71,17 @@ CREATE INDEX IF NOT EXISTS ix_usage_grant_day
   ON usage_reservations(grant_id, grant_version, day_key, status);
 CREATE INDEX IF NOT EXISTS ix_usage_grant_bucket
   ON usage_reservations(grant_id, grant_version, velocity_bucket, status);
+CREATE TABLE IF NOT EXISTS submission_attempts (
+    intent_id TEXT NOT NULL,
+    attempt_number BIGINT NOT NULL,
+    principal_id TEXT NOT NULL,
+    grant_id TEXT NOT NULL,
+    grant_version BIGINT NOT NULL,
+    attempted_at BIGINT NOT NULL,
+    action_count BIGINT NOT NULL DEFAULT 1 CHECK(action_count > 0),
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(intent_id, attempt_number)
+);
 CREATE TABLE IF NOT EXISTS risk_claims (
     principal_id TEXT NOT NULL,
     grant_id TEXT NOT NULL,
@@ -290,7 +303,11 @@ class PostgresIntentStore(SQLiteIntentStore):
     )
     _POSTGRES_BIGINT_COLUMNS = {
         "grants": {"version", "runtime_epoch", "fence_counter"},
-        "usage_reservations": {"grant_version", "velocity_bucket", "velocity_ts"},
+        "usage_reservations": {
+            "grant_version", "velocity_bucket", "velocity_ts",
+            "max_actions_per_window", "action_window_seconds",
+        },
+        "submission_attempts": {"attempt_number", "grant_version", "attempted_at", "action_count"},
         "risk_claims": {"grant_version", "state_version"},
         "permit_risk_claims": {"grant_version", "state_version"},
         "intents": {"submission_count"},
@@ -466,6 +483,7 @@ class PostgresIntentStore(SQLiteIntentStore):
             "ix_evidence_intent_id",
             "ix_permits_intent",
             "ix_usage_velocity_status",
+            "ix_submission_attempts_grant_time",
             "ux_effect_id_per_venue",
             "ux_execution_permits_issuance_seq",
         }

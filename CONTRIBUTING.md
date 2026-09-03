@@ -19,3 +19,5 @@ Do not weaken a fail-closed behavior merely to improve availability. Do not add 
 ## Live adapters
 
 Do not add a live-money adapter without satisfying `docs/ADAPTER_CONTRACT.md`, closing the rows in `docs/GO_LIVE_CHECKLIST.md`, and obtaining the independent review required by `docs/V0_2_RELEASE_GATES.md`.
+Use `docs/INDEPENDENT_SECURITY_REVIEW.md` and the Gate 8 issue template to pin
+the reviewed commit and keep a self-review from being presented as independence.

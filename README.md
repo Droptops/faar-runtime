@@ -165,7 +165,8 @@ docs/
   INVARIANTS.md           THREAT_MODEL.md          TRUST_MODEL.md
   RISK_ENGINE_CONTRACT.md ADAPTER_CONTRACT.md      RECOVERY.md
   GRANT_PROVISIONING.md   DEFINITION_OF_DONE.md    UNPLUG_TEST.md
-  RED_TEAM_REPORT.md      GO_LIVE_CHECKLIST.md     V0_4_RELEASE.md
+  RED_TEAM_REPORT.md      GO_LIVE_CHECKLIST.md     INDEPENDENT_SECURITY_REVIEW.md
+  V0_4_RELEASE.md
   HYPERLIQUID_TESTNET_ADAPTER_REVIEW.md
   V0_2_RELEASE_GATES.md   V0_3_RELEASE.md (historical)
 
@@ -199,9 +200,9 @@ It is not a live-money adapter approval. See
 
 See [`docs/V0_4_RELEASE.md`](docs/V0_4_RELEASE.md). The deterministic release gate (`make check`) includes unit tests, adversarial denial/replay checks with adapter-call and permit-consumption metrics, a red-team matrix in which every attack class is mapped to named tests, seeded state-machine fuzz with an advancing clock, the demo CLI path with keyed evidence verification, and the bounded permit protocol model checker. Headline results:
 
-- 425 unit/invariant tests discovered; 8 require the PostgreSQL 16 service job
+- 428 unit/invariant tests discovered; 9 require the PostgreSQL 16 service job
   (the reference job reports them as conditional skips)
-- 185 targeted red-team attack classes mapped to 264 named tests, 0 unmapped
+- 186 targeted red-team attack classes mapped to 267 named tests, 0 unmapped
 - 160 adversarial denial cases with 0 unauthorized economic effects and 0 adapter calls
 - 100 same-intent replay attempts with 1 economic effect, 1 adapter call, 1 permit issued and consumed
 - 96 seeded fuzz scenarios with 0 duplicate-effect and 0 aggregate-budget violations
@@ -210,4 +211,4 @@ See [`docs/V0_4_RELEASE.md`](docs/V0_4_RELEASE.md). The deterministic release ga
 
 These are deterministic regression, adversarial, fuzz, mutation-derived, and bounded-model results. They are not formal verification, an independent security audit, or a production-safety claim.
 
-Before any live-money adapter, the repository still requires the gates in [`docs/V0_2_RELEASE_GATES.md`](docs/V0_2_RELEASE_GATES.md); [`docs/GO_LIVE_CHECKLIST.md`](docs/GO_LIVE_CHECKLIST.md) records which are closed in-repo (key rotation, cross-process fencing, restore safety, kill switch, exposure caps, velocity that counts venue actions, executor-side slippage bounds, bounded deadlines and abandoned-call cap, ambiguity window, partial fills, open orders and cancellation, crash recovery), which belong to a deployment (key custody, venue-side permit verification, credential scoping, authenticated ingress, anchor placement, capped exposure), and which remain open (datastore failover beyond SQLite, independent security review). Do not add a real-money adapter until every row is closed and independently reviewed.
+Before any live-money adapter, the repository still requires the gates in [`docs/V0_2_RELEASE_GATES.md`](docs/V0_2_RELEASE_GATES.md); [`docs/GO_LIVE_CHECKLIST.md`](docs/GO_LIVE_CHECKLIST.md) records which are closed in-repo (key rotation, cross-process fencing, restore safety, kill switch, exposure caps, per-attempt velocity, executor-side slippage bounds, bounded deadlines and abandoned-call cap, ambiguity window, partial fills, open orders and cancellation, crash recovery), which belong to a deployment (key custody, venue-side permit verification, credential scoping, authenticated ingress, anchor placement, capped exposure), and which remain open (managed datastore failover, independent security review). [`docs/INDEPENDENT_SECURITY_REVIEW.md`](docs/INDEPENDENT_SECURITY_REVIEW.md) is the human-review handoff packet. Do not add a real-money adapter until every row is closed and independently reviewed.

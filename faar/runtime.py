@@ -633,15 +633,23 @@ class FAARRuntime:
             if grant.valid_until is not None and submit_now > grant.valid_until:
                 return self._stop_execution_state(intent.intent_id, ("GRANT_EXPIRED_BEFORE_SUBMIT",), decisions, release_usage=True)
 
-            started, limit_reached, attempt = self.store.begin_submission(
+            started, attempt_limit_reached, velocity_limit_reached, attempt = self.store.begin_submission(
                 intent.intent_id,
                 [IntentState.RESERVED, IntentState.RECONCILING],
                 max_attempts=grant.limits.max_submission_attempts,
+                now=submit_now,
             )
-            if limit_reached:
+            if attempt_limit_reached:
                 return self._stop_execution_state(
                     intent.intent_id,
                     ("MAX_SUBMISSION_ATTEMPTS_REACHED",),
+                    decisions,
+                    release_usage=True,
+                )
+            if velocity_limit_reached:
+                return self._stop_execution_state(
+                    intent.intent_id,
+                    ("ATOMIC_ACTION_VELOCITY_EXCEEDED",),
                     decisions,
                     release_usage=True,
                 )

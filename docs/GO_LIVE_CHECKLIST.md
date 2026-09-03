@@ -63,8 +63,8 @@ settlement source, or venue-side fault campaign is present.
 | 7.4 | principal-bound or server-minted ids | DONE-IN-REPO (principal namespace, first-writer) / DEPLOYMENT (server minting) | `test_mutation_gaps.ConstructionGateTests` |
 | 7.5 | unauthenticated caller cannot squat another principal's id | DEPLOYMENT (ingress authentication) | R-10 |
 | 7.6 | collision never creates a replacement intent | DONE-IN-REPO | `IntentConflict` tests |
-| 8 | independent security review | OPEN | none |
-| 9 | capped first exposure and kill switch | DONE-IN-REPO (halt; scope exposure caps enforced at reservation; velocity bounds venue actions across grant versions) / DEPLOYMENT (funded balance at the venue) | `test_controls.KillSwitchTests`; `test_exposure_cap`; `test_economic_redteam.VelocityBoundsVenueAttemptsTests`; `OPERATIONS.md` §1 |
+| 8 | independent security review | OPEN (review packet ready; no qualifying human report yet) | `INDEPENDENT_SECURITY_REVIEW.md`; GitHub Gate 8 issue template |
+| 9 | capped first exposure and kill switch | DONE-IN-REPO (halt; scope exposure caps enforced at reservation; every retry consumes a distinct velocity slot across grant versions) / DEPLOYMENT (funded balance at the venue) | `test_controls.KillSwitchTests`; `test_exposure_cap`; `test_economic_redteam.VelocityBoundsVenueAttemptsTests`; PostgreSQL attempt-velocity contract test; `OPERATIONS.md` §1 |
 
 ## Residual risks
 
@@ -89,7 +89,8 @@ settlement source, or venue-side fault campaign is present.
 
 1. Close every OPEN row (6.4 datastore failover, 8 independent review) or record why it does not apply to the chosen venue.
 2. Close every DEPLOYMENT row with written evidence in the deployment repository.
-3. Obtain the independent review (gate 8) covering core plus the specific adapter.
+3. Obtain the independent review (gate 8) covering core plus the specific adapter,
+   following [`INDEPENDENT_SECURITY_REVIEW.md`](INDEPENDENT_SECURITY_REVIEW.md).
 4. Cap the funded balance at the venue and with `set-exposure-cap`, configure the
    authority anchor outside the backup set, bind every gateway to its venue,
    rehearse `halt`/`resume`, a restore and a worker crash (`make crash`), and keep

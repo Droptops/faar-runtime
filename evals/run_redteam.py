@@ -283,6 +283,11 @@ ATTACK_CLASSES: dict[str, tuple[str, ...]] = {
         "test_economic_redteam.VelocityBoundsVenueAttemptsTests.test_cancelled_unfilled_attempts_keep_their_velocity_slot",
         "test_economic_redteam.VelocityBoundsVenueAttemptsTests.test_store_counts_submitted_rows_after_release_but_not_unsubmitted_ones",
     ),
+    "retry multiplying the configured action-velocity ceiling": (
+        "test_economic_redteam.VelocityBoundsVenueAttemptsTests.test_retry_consumes_another_velocity_slot_and_cannot_multiply_the_cap",
+        "test_store_hardening.SchemaMigrationTests.test_legacy_submission_count_becomes_weighted_attempt_history",
+        "test_postgres_store.PostgresStoreContractTests.test_each_retry_consumes_a_distinct_action_velocity_slot",
+    ),
     "grant re-provisioning restarting the trailing windows": (
         "test_economic_redteam.WindowsSpanGrantVersionsTests.test_new_grant_version_does_not_restart_turnover_or_velocity_windows",
     ),

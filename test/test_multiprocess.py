@@ -52,7 +52,7 @@ def _submit_worker(path, intent_id, barrier, queue):
     store = SQLiteIntentStore(path)
     try:
         barrier.wait()
-        queue.put(store.begin_submission(intent_id, [IntentState.RESERVED], max_attempts=2))
+        queue.put(store.begin_submission(intent_id, [IntentState.RESERVED], max_attempts=2, now=NOW))
     finally:
         store.close()
 
@@ -134,8 +134,11 @@ class MultiProcessStoreTests(unittest.TestCase):
     def test_distinct_processes_cannot_both_begin_same_submission(self):
         f = temp_file(self)
         parent = SQLiteIntentStore(f.name)
+        g = grant()
+        parent.provision_grant(g, canonical_hash(g))
         i = intent(intent_id="mp_submit_0000000000001")
         parent.register(i, canonical_hash(i))
+        self.assertTrue(parent.reserve_usage(i, g, risk(), NOW)[0])
         parent.transition(i.intent_id, IntentState.PROPOSED, IntentState.AUTHORIZED)
         parent.transition(i.intent_id, IntentState.AUTHORIZED, IntentState.RESERVED)
         parent.close()
@@ -148,7 +151,7 @@ class MultiProcessStoreTests(unittest.TestCase):
         p1.start(); p2.start(); p1.join(10); p2.join(10)
         self.assertEqual(0, p1.exitcode); self.assertEqual(0, p2.exitcode)
         results = [queue.get(timeout=2), queue.get(timeout=2)]
-        self.assertEqual(1, sum(1 for started, _, _ in results if started))
+        self.assertEqual(1, sum(1 for started, _, _, _ in results if started))
         store = SQLiteIntentStore(f.name)
         try:
             self.assertEqual(IntentState.SUBMITTED, store.get(i.intent_id).state)

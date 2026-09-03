@@ -49,6 +49,9 @@ failure, not something the runtime overwrites.
   introduce a 2038 boundary or narrow SQLite's integer range.
 - Permit insertion order uses an explicit identity column instead of SQLite's
   implicit `rowid`.
+- Each submission attempt is an immutable `submission_attempts` row written in
+  the same transaction as the state CAS; retries consume distinct action-window
+  slots and cannot multiply `max_actions_per_window`.
 - Durable intent leases remain fail-stuck. No clock-based lease takeover was
   introduced.
 - `execution_guard` remains process-local. Holding a database/session lock over
@@ -70,6 +73,7 @@ cover:
 - end-to-end execution, replay, usage commit and evidence verification;
 - atomic intent CAS and per-venue effect identity;
 - multiprocess aggregate-turnover contention;
+- per-attempt action velocity, including retry refusal at the configured cap;
 - durable lease contention;
 - a cross-process revoke while an adapter call is blocked;
 - evidence-tail tampering;

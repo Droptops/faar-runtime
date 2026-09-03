@@ -25,17 +25,26 @@ remain OPEN.
   balance legs validate before mutation; failed GTC matches become terminal
   unfilled cancellations; HTTP clients cannot send bearer tokens or permits off
   numeric loopback.
-- Red-team classes RT-135..RT-154 (185 classes, 264 mapped tests). The combined
-  suite discovers 425 tests; 8 require the PostgreSQL service job. Does not
+- Red-team classes through RT-155 (186 classes, 267 mapped tests). The combined
+  suite discovers 428 tests; 9 require the PostgreSQL service job. Does not
   close gate 6.4, gate 8, key custody,
   authenticated ingress, or any live-venue row.
 - PostgreSQL 16 store port candidate: schema/migrations, transaction-scoped
   cross-host writer serialization, durable leases, permit issuance ordering,
-  evidence heads and all inherited store operations. Eight live-PostgreSQL
+  evidence heads and all inherited store operations. Nine live-PostgreSQL
   contract tests cover runtime replay, atomic effect identity, multiprocess
-  turnover, leases, cross-process revocation and evidence integrity. RT-154
+  turnover, per-attempt velocity, leases, cross-process revocation and evidence integrity. RT-154
   prevents a hung adapter from holding a database/session lock across the
   external call. Failover evidence is still required before gate 6.4 closes.
+- RT-155 removes the retry multiplier from action velocity. A pending
+  reservation holds one provisional slot; `begin_submission` atomically writes
+  an immutable attempt row, and every retry consumes another slot. Legacy
+  submission counts migrate conservatively. `max_actions_per_window` is now the
+  venue-attempt ceiling itself.
+- Gate 8 handoff: `docs/INDEPENDENT_SECURITY_REVIEW.md` defines reviewer
+  independence, pinned-SHA scope, attack questions, reproduction commands,
+  required report contents and acceptance criteria; the GitHub issue template
+  tracks the review without treating the request as approval.
 
 ## 0.4.0 — 2026-09-02
 
@@ -78,7 +87,7 @@ Third adversarial pass over v0.3.1 plus the operator controls a first bounded de
 
 **Live-money red team, economic-logic, state-machine and resource personas (RT-101..RT-116)**
 
-- Aggregate limits: action velocity counts every attempt that reached a venue for the whole window, even after its budget was released (cancelled unfilled, deterministic rejection), so admit-and-cancel order spam is bounded by `max_actions_per_window`; trailing turnover and velocity windows span every version of a grant id, so re-provisioning never restarts a budget; reservation refuses a risk-state version a retry already bound in the permit ledger.
+- Aggregate limits: action velocity counts every attempt that reached a venue for the whole window, even after its budget was released (cancelled unfilled, deterministic rejection); every retry consumes a separate immutable attempt slot, so the ceiling is `max_actions_per_window` rather than that cap multiplied by the retry budget. Trailing turnover and velocity windows span every version of a grant id, so re-provisioning never restarts a budget; reservation refuses a risk-state version a retry already bound in the permit ledger.
 - Executor-side price bounds: a grant that sets `max_slippage_bps` requires the payload to carry `max_slippage_bps` (SWAP, BUY, SELL, PLACE_ORDER; orders may carry `limit_price` instead), typed and no looser than the cap; the bound is inside the permit's request hash and the adapter must enforce it at the venue. **Breaking for integrators whose grants cap slippage: add `max_slippage_bps` to trade payloads** (`examples/intent.json` updated).
 - Order semantics: `PARTIALLY_FILLED` with a zero cumulative amount is an open, admitted order (`SETTLEMENT_ORDER_OPEN`); the last accepted cumulative fill is persisted and a later authoritative amount below it is `SETTLEMENT_FILL_REGRESSED`; an unfilled cancel carrying another intent's order identity is `EFFECT_ID_ALREADY_CLAIMED` instead of a release; `MockMode.OPEN_ORDER`; the mock venue never fills after a cancel.
 - State machine: the durable deterministic-failure block binds `reconcile()` as well as `process()` and travels through `RECONCILING`; every terminal stop (including `SETTLEMENT_CONTRADICTORY`) voids the attempt's unconsumed permits first; `reconcile()` before submission reports `RECONCILE_NOT_APPLICABLE_BEFORE_SUBMISSION`.

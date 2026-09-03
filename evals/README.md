@@ -32,7 +32,7 @@ timeout_after_effect_successful_effects = 1
 
 ## Targeted red team
 
-`run_redteam.py` maps named attack classes to concrete unit tests, loads the suite in-process, asserts that every mapped test exists and passes, and reports any `unmapped_tests`. The headline count therefore cannot drift from real coverage: deleting a mapped test fails the gate. Environment-gated PostgreSQL tests are reported separately as `conditional_mapped_tests_not_exercised`; the PostgreSQL CI job must reduce that list to zero. RT-128..RT-134 cover the fixed-origin Hyperliquid testnet candidate (fakes only). RT-135..RT-153 cover the paper gateway and its post-merge hardening (not live-money); RT-154 covers PostgreSQL revocation availability.
+`run_redteam.py` maps named attack classes to concrete unit tests, loads the suite in-process, asserts that every mapped test exists and passes, and reports any `unmapped_tests`. The headline count therefore cannot drift from real coverage: deleting a mapped test fails the gate. Environment-gated PostgreSQL tests are reported separately as `conditional_mapped_tests_not_exercised`; the PostgreSQL CI job must reduce that list to zero. RT-128..RT-134 cover the fixed-origin Hyperliquid testnet candidate (fakes only). RT-135..RT-153 cover the paper gateway and its post-merge hardening (not live-money); RT-154 covers PostgreSQL revocation availability; RT-155 removes the retry multiplier from action velocity.
 
 ## Crash injection
 

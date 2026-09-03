@@ -616,7 +616,7 @@ class RuntimeHardeningTests(unittest.TestCase):
         self.assertTrue(self.store.reserve_usage(i, grant(), risk(), NOW)[0])
         self.store.transition(i.intent_id, IntentState.PROPOSED, IntentState.AUTHORIZED)
         self.store.transition(i.intent_id, IntentState.AUTHORIZED, IntentState.RESERVED)
-        self.store.begin_submission(i.intent_id, [IntentState.RESERVED], max_attempts=2)
+        self.store.begin_submission(i.intent_id, [IntentState.RESERVED], max_attempts=2, now=NOW)
         result = runtime.reconcile(i, grant=grant(grant_id="grant:unprovisioned"))
         self.assertEqual(("GRANT_NOT_PROVISIONED",), result.reason_codes)
         self.assertEqual(IntentState.SUBMITTED, result.state)

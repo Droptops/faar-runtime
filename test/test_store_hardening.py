@@ -55,8 +55,11 @@ class SchemaMigrationTests(unittest.TestCase):
         conn.execute("DROP INDEX IF EXISTS ix_evidence_intent_id")
         conn.execute("DROP INDEX IF EXISTS ix_permits_intent")
         conn.execute("DROP INDEX IF EXISTS ux_effect_id_per_venue")
+        conn.execute("DROP TABLE IF EXISTS submission_attempts")
         conn.execute("DROP TABLE IF EXISTS exposure_caps")
         conn.execute("ALTER TABLE usage_reservations DROP COLUMN velocity_ts")
+        conn.execute("ALTER TABLE usage_reservations DROP COLUMN max_actions_per_window")
+        conn.execute("ALTER TABLE usage_reservations DROP COLUMN action_window_seconds")
         conn.execute("ALTER TABLE usage_reservations DROP COLUMN submitted")
         conn.execute("ALTER TABLE execution_permits DROP COLUMN consumed_at")
         conn.execute("ALTER TABLE execution_permits DROP COLUMN expires_at")
@@ -151,6 +154,24 @@ class SchemaMigrationTests(unittest.TestCase):
         finally:
             store.close()
 
+    def test_legacy_submission_count_becomes_weighted_attempt_history(self):
+        path = temp_path(self)
+        self._make_legacy(path)
+        conn = sqlite3.connect(path)
+        conn.execute(
+            "UPDATE intents SET submission_count=3 WHERE intent_id=?",
+            (self.LEGACY_FINAL,),
+        )
+        conn.commit()
+        conn.close()
+        store = SQLiteIntentStore(path)
+        try:
+            rows = store.submission_attempts(self.LEGACY_FINAL)
+            self.assertEqual(1, len(rows))
+            self.assertEqual((0, 3), (rows[0]["attempt_number"], rows[0]["action_count"]))
+        finally:
+            store.close()
+
     def test_legacy_in_flight_intent_gets_a_conservative_ambiguity_window(self):
         path = temp_path(self)
         self._make_legacy(path)
@@ -166,9 +187,13 @@ class SchemaMigrationTests(unittest.TestCase):
             # retried as soon as absence is authoritative.
             i = intent(intent_id="post_upgrade_00000000009")
             store.register(i, canonical_hash(i))
+            self.assertTrue(store.reserve_usage(i, grant(), risk(state_version=9), NOW)[0])
             self.assertTrue(store.transition(i.intent_id, IntentState.PROPOSED, IntentState.AUTHORIZED))
             self.assertTrue(store.transition(i.intent_id, IntentState.AUTHORIZED, IntentState.RESERVED))
-            self.assertEqual((True, False, 1), store.begin_submission(i.intent_id, {IntentState.RESERVED}, max_attempts=2))
+            self.assertEqual(
+                (True, False, False, 1),
+                store.begin_submission(i.intent_id, {IntentState.RESERVED}, max_attempts=2, now=NOW),
+            )
         finally:
             store.close()
         reopened = SQLiteIntentStore(path)

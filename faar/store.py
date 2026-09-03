@@ -37,7 +37,7 @@ BUSY_TIMEOUT_MS = 30_000
 LEGACY_PRINCIPAL_ID = "legacy:unknown"
 # Bumped whenever `_COLUMN_MIGRATIONS`, the dependent indexes or the legacy
 # backfill change; an up-to-date database is opened without a write transaction.
-STORE_SCHEMA_REVISION = "0.4.0-r3"
+STORE_SCHEMA_REVISION = "0.4.0-r4"
 # One evidence row may carry a bounded settlement/receipt evidence mapping plus
 # the runtime's own fields; anything larger is a bug upstream, never persisted.
 MAX_EVIDENCE_ROW_CHARS = 4 * MAX_EVIDENCE_BYTES
@@ -243,6 +243,8 @@ class SQLiteIntentStore:
                 day_key TEXT NOT NULL,
                 velocity_bucket INTEGER,
                 velocity_ts INTEGER,
+                max_actions_per_window INTEGER,
+                action_window_seconds INTEGER,
                 amount_usd TEXT NOT NULL,
                 status TEXT NOT NULL CHECK(status IN ('HELD','COMMITTED','RELEASED')),
                 submitted INTEGER NOT NULL DEFAULT 0,
@@ -536,6 +538,8 @@ class SQLiteIntentStore:
         ("grants", "fence_counter", "INTEGER NOT NULL DEFAULT 0"),
         ("usage_reservations", "principal_id", "TEXT NOT NULL DEFAULT 'legacy:unknown'"),
         ("usage_reservations", "velocity_ts", "INTEGER"),
+        ("usage_reservations", "max_actions_per_window", "INTEGER"),
+        ("usage_reservations", "action_window_seconds", "INTEGER"),
         ("usage_reservations", "submitted", "INTEGER NOT NULL DEFAULT 0"),
         ("risk_claims", "principal_id", "TEXT NOT NULL DEFAULT 'legacy:unknown'"),
         ("execution_permits", "consumed_at", "TEXT"),
@@ -559,6 +563,13 @@ class SQLiteIntentStore:
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
+                self._conn.execute(
+                    "CREATE TABLE IF NOT EXISTS submission_attempts ("
+                    "intent_id TEXT NOT NULL, attempt_number INTEGER NOT NULL, "
+                    "principal_id TEXT NOT NULL, grant_id TEXT NOT NULL, grant_version INTEGER NOT NULL, "
+                    "attempted_at INTEGER NOT NULL, action_count INTEGER NOT NULL DEFAULT 1 CHECK(action_count > 0), "
+                    "created_at TEXT NOT NULL, PRIMARY KEY(intent_id, attempt_number))"
+                )
                 for table, column, definition in self._COLUMN_MIGRATIONS:
                     cols = {row["name"] for row in self._conn.execute(f"PRAGMA table_info({table})").fetchall()}
                     if column not in cols:
@@ -633,6 +644,68 @@ class SQLiteIntentStore:
             "UPDATE usage_reservations SET submitted=1 WHERE submitted=0 "
             "AND intent_id IN (SELECT intent_id FROM intents WHERE submission_count>0)"
         )
+        # Snapshot each reservation's immutable action-velocity limit. Retries must
+        # be governed by the exact grant version that originally reserved usage,
+        # not by caller-supplied values at retry time.
+        for row in self._conn.execute(
+            "SELECT u.intent_id,u.max_actions_per_window,u.action_window_seconds,g.grant_json "
+            "FROM usage_reservations u LEFT JOIN grants g "
+            "ON g.grant_id=u.grant_id AND g.version=u.grant_version"
+        ).fetchall():
+            stored_cap = row["max_actions_per_window"]
+            stored_window = row["action_window_seconds"]
+            if stored_cap is not None or stored_window is not None:
+                try:
+                    parsed_cap = None if stored_cap is None else int(stored_cap)
+                    parsed_window = None if stored_window is None else int(stored_window)
+                except (TypeError, ValueError) as exc:
+                    raise MigrationError(f"usage reservation for {row['intent_id']} has an invalid action window") from exc
+                if parsed_cap is not None and parsed_cap < 0:
+                    raise MigrationError(f"usage reservation for {row['intent_id']} has an invalid action cap")
+                if parsed_cap is not None and (parsed_window is None or parsed_window < 1):
+                    raise MigrationError(f"usage reservation for {row['intent_id']} has an incomplete action window")
+                continue
+            if row["grant_json"] is None:
+                raise MigrationError(f"usage reservation for {row['intent_id']} has no immutable grant")
+            try:
+                limits = json.loads(row["grant_json"]).get("limits", {})
+                cap = limits.get("max_actions_per_window")
+                window = limits.get("action_window_seconds")
+            except (ValueError, AttributeError) as exc:
+                raise MigrationError(f"usage reservation for {row['intent_id']} has an unreadable grant") from exc
+            if isinstance(cap, bool) or (cap is not None and (not isinstance(cap, int) or cap < 0)):
+                raise MigrationError(f"usage reservation for {row['intent_id']} has an invalid action cap")
+            if cap is not None and (isinstance(window, bool) or not isinstance(window, int) or window < 1):
+                raise MigrationError(f"usage reservation for {row['intent_id']} has an incomplete action window")
+            self._conn.execute(
+                "UPDATE usage_reservations SET max_actions_per_window=?,action_window_seconds=? WHERE intent_id=?",
+                (cap, window, row["intent_id"]),
+            )
+
+        # Older schemas recorded only the cumulative submission count. Preserve it
+        # conservatively as one weighted row at the intent's last durable update;
+        # no historical venue action disappears merely because its exact attempt
+        # timestamps predate this table.
+        for row in self._conn.execute(
+            "SELECT intent_id,principal_id,intent_json,submission_count,updated_at FROM intents i "
+            "WHERE submission_count>0 AND NOT EXISTS "
+            "(SELECT 1 FROM submission_attempts a WHERE a.intent_id=i.intent_id)"
+        ).fetchall():
+            updated = self._parse_timestamp(row["updated_at"])
+            try:
+                document = json.loads(row["intent_json"])
+                grant_id = document["grant_id"]
+                grant_version = document["grant_version"]
+                count = int(row["submission_count"])
+            except (ValueError, TypeError, KeyError) as exc:
+                raise MigrationError(f"submitted intent {row['intent_id']} cannot be mapped to its grant") from exc
+            if updated is None or not isinstance(grant_id, str) or not grant_id or isinstance(grant_version, bool) or not isinstance(grant_version, int) or grant_version < 1 or count < 1:
+                raise MigrationError(f"submitted intent {row['intent_id']} has invalid attempt history")
+            self._conn.execute(
+                "INSERT INTO submission_attempts(intent_id,attempt_number,principal_id,grant_id,grant_version,attempted_at,action_count,created_at) "
+                "VALUES(?,?,?,?,?,?,?,?)",
+                (row["intent_id"], 0, row["principal_id"], grant_id, grant_version, int(updated.timestamp()), count, row["updated_at"]),
+            )
 
     def _create_dependent_indexes(self) -> None:
         """Indexes over columns that may only exist after `_migrate_columns`.
@@ -646,10 +719,16 @@ class SQLiteIntentStore:
                 str(r["name"]) for r in self._conn.execute(
                     "SELECT name FROM sqlite_master WHERE type='index' AND name IN "
                     "('ix_usage_grant_velocity_ts','ix_usage_principal_velocity_ts','ix_evidence_intent_id',"
-                    "'ix_permits_intent','ix_usage_velocity_status','ux_effect_id_per_venue','ux_effect_id_nonnull')"
+                    "'ix_permits_intent','ix_usage_velocity_status','ix_submission_attempts_grant_time',"
+                    "'ux_effect_id_per_venue','ux_effect_id_nonnull')"
                 ).fetchall()
             }
-        if len(names) == 6 and "ux_effect_id_nonnull" not in names:
+        expected = {
+            "ix_usage_grant_velocity_ts", "ix_usage_principal_velocity_ts",
+            "ix_evidence_intent_id", "ix_permits_intent", "ix_usage_velocity_status",
+            "ix_submission_attempts_grant_time", "ux_effect_id_per_venue",
+        }
+        if expected.issubset(names) and "ux_effect_id_nonnull" not in names:
             return
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
@@ -678,6 +757,10 @@ class SQLiteIntentStore:
                 self._conn.execute("CREATE INDEX IF NOT EXISTS ix_permits_intent ON execution_permits(intent_id)")
                 self._conn.execute(
                     "CREATE INDEX IF NOT EXISTS ix_usage_velocity_status ON usage_reservations(velocity_ts, status)"
+                )
+                self._conn.execute(
+                    "CREATE INDEX IF NOT EXISTS ix_submission_attempts_grant_time "
+                    "ON submission_attempts(grant_id, principal_id, attempted_at)"
                 )
                 # Effect identity is a per-venue namespace (ADAPTER_CONTRACT §3):
                 # exchange fill/order identifiers legitimately collide across venues.
@@ -1217,6 +1300,39 @@ class SQLiteIntentStore:
                 (principal_id, since_ts),
             ).fetchall()
         return sum((Decimal(r["amount_usd"]) for r in rows), Decimal("0"))
+
+    def _action_velocity_count_locked(
+        self,
+        grant_id: str,
+        principal_id: str,
+        since_ts: int,
+        *,
+        exclude_pending_intent: str | None = None,
+    ) -> int:
+        """Count durable venue-attempt slots inside a trailing window.
+
+        An unsubmitted reservation occupies one pending slot so concurrent intents
+        cannot all pass admission and oversubscribe later. ``begin_submission``
+        atomically replaces that pending slot with an immutable attempt row. Every
+        retry adds another row; releasing budget never erases an action that may
+        already have reached the venue.
+        """
+        attempted = self._conn.execute(
+            "SELECT COALESCE(SUM(action_count),0) AS n FROM submission_attempts "
+            "WHERE grant_id=? AND principal_id IN (?,?) AND attempted_at>=?",
+            (grant_id, principal_id, LEGACY_PRINCIPAL_ID, since_ts),
+        ).fetchone()["n"]
+        pending_sql = (
+            "SELECT COUNT(*) AS n FROM usage_reservations "
+            "WHERE grant_id=? AND principal_id IN (?,?) AND velocity_ts>=? "
+            "AND submitted=0 AND status IN ('HELD','COMMITTED')"
+        )
+        params: tuple[object, ...] = (grant_id, principal_id, LEGACY_PRINCIPAL_ID, since_ts)
+        if exclude_pending_intent is not None:
+            pending_sql += " AND intent_id<>?"
+            params += (exclude_pending_intent,)
+        pending = self._conn.execute(pending_sql, params).fetchone()["n"]
+        return int(attempted or 0) + int(pending or 0)
 
     def effect_owner(self, venue: str, effect_id: str) -> str | None:
         """Intent that owns `effect_id` in this venue's namespace, if any (I-11)."""
@@ -1868,15 +1984,14 @@ class SQLiteIntentStore:
                     # Sliding window over the trailing `window` seconds. A fixed
                     # tumbling bucket (timestamp // window) would let up to 2x the
                     # limit fire across a bucket boundary.
-                    # Velocity bounds venue actions, not effects: an attempt that
-                    # reached a venue (`submitted`) keeps its slot for the window
-                    # even after its budget was released (cancelled unfilled,
-                    # deterministic rejection). The count spans grant versions.
-                    count = self._conn.execute(
-                        "SELECT COUNT(*) AS n FROM usage_reservations WHERE grant_id=? AND principal_id IN (?,?) AND velocity_ts >= ? "
-                        "AND (status IN ('HELD','COMMITTED') OR submitted=1)",
-                        (grant.grant_id, grant.principal_id, LEGACY_PRINCIPAL_ID, velocity_ts - window),
-                    ).fetchone()["n"]
+                    # Pending reservations consume one provisional slot. Once an
+                    # attempt starts, `begin_submission` replaces it with an
+                    # immutable per-attempt row, so retries count independently.
+                    count = self._action_velocity_count_locked(
+                        grant.grant_id,
+                        grant.principal_id,
+                        velocity_ts - window,
+                    )
                     if count + 1 > grant.limits.max_actions_per_window:
                         reasons.append("ATOMIC_ACTION_VELOCITY_EXCEEDED")
 
@@ -1890,8 +2005,15 @@ class SQLiteIntentStore:
                     (intent.principal_id, grant.grant_id, grant.version, risk.scope, risk.state_version, intent.intent_id, ts),
                 )
                 self._conn.execute(
-                    "INSERT INTO usage_reservations(intent_id,principal_id,grant_id,grant_version,day_key,velocity_bucket,velocity_ts,amount_usd,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                    (intent.intent_id, intent.principal_id, grant.grant_id, grant.version, day_key, bucket, velocity_ts, format(amount, "f"), "HELD", ts, ts),
+                    "INSERT INTO usage_reservations(intent_id,principal_id,grant_id,grant_version,day_key,velocity_bucket,velocity_ts,max_actions_per_window,action_window_seconds,amount_usd,status,created_at,updated_at) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        intent.intent_id, intent.principal_id, grant.grant_id,
+                        grant.version, day_key, bucket, velocity_ts,
+                        grant.limits.max_actions_per_window,
+                        grant.limits.action_window_seconds,
+                        format(amount, "f"), "HELD", ts, ts,
+                    ),
                 )
                 self._conn.execute("COMMIT")
                 return True, ()
@@ -1919,6 +2041,20 @@ class SQLiteIntentStore:
                 "SELECT * FROM usage_reservations WHERE grant_id=? AND grant_version=? ORDER BY created_at,intent_id",
                 (grant_id, version),
             ).fetchall()
+        return [dict(r) for r in rows]
+
+    def submission_attempts(self, intent_id: str | None = None) -> list[dict]:
+        """Return the immutable venue-attempt ledger for diagnostics and review."""
+        with self._lock:
+            if intent_id is None:
+                rows = self._conn.execute(
+                    "SELECT * FROM submission_attempts ORDER BY attempted_at,intent_id,attempt_number"
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT * FROM submission_attempts WHERE intent_id=? ORDER BY attempt_number",
+                    (intent_id,),
+                ).fetchall()
         return [dict(r) for r in rows]
 
     def risk_claims(self, grant_id: str, version: int, scope: str = "portfolio") -> list[dict]:
@@ -2072,12 +2208,18 @@ class SQLiteIntentStore:
         expected: Iterable[IntentState],
         *,
         max_attempts: int,
-    ) -> tuple[bool, bool, int]:
-        """CAS into SUBMITTED and atomically increment the durable attempt count.
+        now: datetime,
+    ) -> tuple[bool, bool, bool, int]:
+        """CAS into SUBMITTED and atomically reserve one venue-attempt slot.
 
-        Returns (started, limit_reached, resulting_count).
+        Returns ``(started, attempt_limit_reached, velocity_limit_reached,
+        resulting_count)``. The velocity decision, attempt record and state CAS
+        share one transaction.
         """
         expected_set = set(expected)
+        if now.tzinfo is None:
+            raise ValueError("submission time must be timezone-aware")
+        attempted_at = int(now.timestamp())
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
@@ -2091,25 +2233,61 @@ class SQLiteIntentStore:
                 count = int(row["submission_count"])
                 if current not in expected_set:
                     self._conn.execute("COMMIT")
-                    return False, False, count
+                    return False, False, False, count
                 if count >= max_attempts:
                     self._conn.execute("COMMIT")
-                    return False, True, count
+                    return False, True, False, count
+                reservation = self._conn.execute(
+                    "SELECT principal_id,grant_id,grant_version,max_actions_per_window,action_window_seconds "
+                    "FROM usage_reservations WHERE intent_id=?",
+                    (intent_id,),
+                ).fetchone()
+                if reservation is None:
+                    raise MigrationError(f"intent {intent_id} has no usage reservation")
+                action_cap = reservation["max_actions_per_window"]
+                action_window = reservation["action_window_seconds"]
+                if action_cap is not None:
+                    try:
+                        parsed_cap = int(action_cap)
+                        parsed_window = int(action_window)
+                    except (TypeError, ValueError) as exc:
+                        raise MigrationError(f"intent {intent_id} has an invalid action-velocity snapshot") from exc
+                    if parsed_window < 1 or parsed_cap < 0:
+                        raise MigrationError(f"intent {intent_id} has an invalid action-velocity snapshot")
+                    actions = self._action_velocity_count_locked(
+                        str(reservation["grant_id"]),
+                        str(reservation["principal_id"]),
+                        attempted_at - parsed_window,
+                        exclude_pending_intent=intent_id,
+                    )
+                    if actions + 1 > parsed_cap:
+                        self._conn.execute("COMMIT")
+                        return False, False, True, count
                 if IntentState.SUBMITTED not in _ALLOWED_TRANSITIONS[current]:
                     raise InvalidTransition(f"{current.value} -> SUBMITTED is not allowed")
                 count += 1
+                ts = self._now()
+                self._conn.execute(
+                    "INSERT INTO submission_attempts(intent_id,attempt_number,principal_id,grant_id,grant_version,attempted_at,action_count,created_at) "
+                    "VALUES(?,?,?,?,?,?,1,?)",
+                    (
+                        intent_id, count, reservation["principal_id"],
+                        reservation["grant_id"], reservation["grant_version"],
+                        attempted_at, ts,
+                    ),
+                )
                 # A new attempt begins only after any previous attempt's ambiguity
                 # window has closed, so the window is reset for this attempt.
                 self._conn.execute(
                     "UPDATE intents SET state=?, submission_count=?, reason_codes='[]', ambiguity_until=NULL, updated_at=? WHERE intent_id=?",
-                    (IntentState.SUBMITTED.value, count, self._now(), intent_id),
+                    (IntentState.SUBMITTED.value, count, ts, intent_id),
                 )
                 # The reservation now backs an attempt that may reach the venue:
                 # it keeps counting against action velocity whatever happens to
                 # its budget later.
                 self._conn.execute("UPDATE usage_reservations SET submitted=1 WHERE intent_id=?", (intent_id,))
                 self._conn.execute("COMMIT")
-                return True, False, count
+                return True, False, False, count
             except Exception:
                 self._conn.execute("ROLLBACK")
                 raise

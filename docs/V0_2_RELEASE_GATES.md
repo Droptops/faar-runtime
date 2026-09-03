@@ -72,6 +72,10 @@ Test at minimum:
 - explicit unresolved findings;
 - no production-safety claim based solely on the repository's own tests.
 
+The handoff scope, reviewer-independence rule, reproduction commands and report
+acceptance criteria are in [`INDEPENDENT_SECURITY_REVIEW.md`](INDEPENDENT_SECURITY_REVIEW.md).
+Preparing or running that packet inside the authoring session does not close this gate.
+
 ### 9. Bounded first exposure
 
 Even after the above, the first deployment should use an explicitly capped funded balance and kill switch. Passing the release gates does not justify unbounded authority.

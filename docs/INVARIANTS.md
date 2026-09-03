@@ -66,7 +66,7 @@ Before resubmission, FAAR rechecks intent expiry, grant expiry/status, signed au
 
 ## I-13 — Aggregate usage is atomic
 
-Turnover and velocity constraints are reserved transactionally across distinct intents. Both are trailing windows (24 h and `action_window_seconds`), never calendar buckets, and both span every version of a grant id for the principal that owns it (a new version never restarts a budget; rows migrated without a principal count for every principal of the grant id). Velocity bounds venue actions, not effects: a reservation that began an attempt keeps its slot for the window even after its budget was released. A retry of the same intent is the same row, so venue attempts per window are bounded by `max_actions_per_window x max_submission_attempts`. A money-moving intent whose amount cannot be parsed as a bounded decimal cannot reserve.
+Turnover and velocity constraints are reserved transactionally across distinct intents. Both are trailing windows (24 h and `action_window_seconds`), never calendar buckets, and both span every version of a grant id for the principal that owns it (a new version never restarts a budget; rows migrated without a principal count for every principal of the grant id). Velocity bounds venue actions, not effects: an unsubmitted reservation occupies a provisional slot, and `begin_submission` atomically replaces it with an immutable attempt row. Every retry consumes another slot; releasing budget never erases an attempt. Therefore `max_actions_per_window` itself, not that value multiplied by `max_submission_attempts`, is the venue-attempt ceiling. A money-moving intent whose amount cannot be parsed as a bounded decimal cannot reserve.
 
 ## I-14 — Risk state is single-consumption and monotonic
 

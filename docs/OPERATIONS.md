@@ -131,9 +131,10 @@ Retention: nothing is purged automatically, and every per-intent lookup is
 indexed, so a large history is a disk-space matter rather than a latency one.
 When archiving, keep every intent whose usage row is inside the trailing
 turnover window (24 h) or whose grant's `action_window_seconds` has not passed,
-every non-terminal intent, and every row the evidence chain of a retained intent
-references; archive terminal intents older than that together with their
-evidence and permits, never by deleting rows from a live database.
+every `submission_attempts` row inside an action window, every non-terminal
+intent, and every row the evidence chain of a retained intent references;
+archive terminal intents older than that together with their evidence, permits
+and attempt rows, never by deleting rows from a live database.
 
 Anchor behind the datastore: a stop (`set-grant-status PAUSED|REVOKED`, `halt`,
 `set-exposure-cap` tightening, `revoke-after-restore`) that could not raise the
@@ -266,8 +267,9 @@ rotation convenience.**
 3. Open the database once with 0.4 (any command). The migration runs in one
    transaction and backfills what the new invariants rely on: each intent's
    venue from its canonical payload (per-venue effect identity), each legacy
-   reservation's window timestamp (velocity), and a 60 s ambiguity window for
-   in-flight legacy attempts. A row that cannot be brought into the model makes
+   reservation's window timestamp and immutable velocity limits, a conservative
+   weighted `submission_attempts` row for legacy submission counts, and a 60 s
+   ambiguity window for in-flight legacy attempts. A row that cannot be brought into the model makes
    the open fail with `MigrationError`; fix the row, do not skip it.
 4. If the runtime uses an evidence key, run
    `rebuild-evidence-head --all --evidence-key-env ...` and re-run

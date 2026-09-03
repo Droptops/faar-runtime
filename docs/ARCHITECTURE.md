@@ -116,7 +116,7 @@ Per-order checks are not enough. Two different intents can each look safe agains
 
 Every trusted risk snapshot therefore carries `scope`, `state_version` and `observed_at`. FAAR atomically claims one state version for one new intent, and a retry that presents a fresher version claims that version too. A version older than any claimed version is refused in both ledgers. The risk engine is responsible for advancing versions only after incorporating prior reservations/effects; see `RISK_ENGINE_CONTRACT.md`.
 
-Aggregate usage (turnover, velocity) is reserved atomically in the store over trailing windows, independently of the risk signer's own accounting.
+Aggregate usage (turnover, velocity) is reserved atomically in the store over trailing windows, independently of the risk signer's own accounting. A pending intent reserves one velocity slot; the first submission atomically converts it into an immutable attempt row and every retry adds another, so `max_actions_per_window` bounds venue attempts directly.
 
 ## Execution permits
 
