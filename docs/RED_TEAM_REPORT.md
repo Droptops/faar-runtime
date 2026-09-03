@@ -214,16 +214,17 @@ deployment row or constitute an independent review.
 | RT-150 | Request and permit wire decoders coerced scalar types before signature verification | Medium | Exact field sets and scalar types; canonical timestamp spelling; no `str()`/`int()` aliases |
 | RT-151 | Non-finite or negative operator book state could crash or corrupt matching | Medium | Bounded finite prices and non-negative balances at construction and quote update |
 | RT-152 | A failed fill could apply its debit before detecting an invalid credit leg | High | Both balance legs validate before either mutation; admitted failure remains authoritative `CANCELLED` |
+| RT-153 | A resting GTC that failed when it became marketable remained open indefinitely | High | Failed matches become authoritative unfilled `CANCELLED` records and are never retried as fills |
 
 ## Executable regression matrix
 
 Current `make check` result for v0.4.0:
 
 ```text
-412 unit/invariant tests -> PASS (1 optional-dependency skip)
-183 targeted red-team attack classes, each mapped to named tests (261 tests) -> PASS, 0 unmapped
+413 unit/invariant tests -> PASS (1 optional-dependency skip)
+184 targeted red-team attack classes, each mapped to named tests (262 tests) -> PASS, 0 unmapped
 29 Hyperliquid testnet contract tests with deterministic fakes -> PASS; no live venue or credential claim
-30 paper-gateway tests (in-process + loopback HTTP) -> PASS; not a live venue or credential claim
+31 paper-gateway tests (in-process + loopback HTTP) -> PASS; not a live venue or credential claim
 160 deterministic denial mutations -> 0 unauthorized economic effects, 0 adapter calls
 100 retries of one logical intent -> 1 successful effect, 1 adapter call, 1 permit issued and consumed
 ambiguous timeout-after-effect recovery -> 1 successful effect, 1 adapter call

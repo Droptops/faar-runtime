@@ -469,6 +469,9 @@ ATTACK_CLASSES: dict[str, tuple[str, ...]] = {
     "paper-gateway failed fill applying only one balance leg": (
         "test_paper_gateway.PaperGatewayTests.test_invalid_credit_balance_cancels_without_a_partial_balance_leg",
     ),
+    "paper-gateway failed GTC match stranded as an open order": (
+        "test_paper_gateway.PaperGatewayTests.test_gtc_failed_match_becomes_authoritative_unfilled_cancel",
+    ),
 }
 
 

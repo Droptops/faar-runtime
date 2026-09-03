@@ -422,8 +422,15 @@ class PaperVenueService:
             if order.state is not PaperOrderState.PENDING:
                 continue
             if self._marketable(order):
-                self._fill(order)
-                filled.append(order.key)
+                try:
+                    self._fill(order)
+                except DeterministicFailure as exc:
+                    # A GTC was already admitted with a consumed permit. If it
+                    # cannot fill when matched, leave terminal venue evidence;
+                    # never strand it open or pair the permit with absence.
+                    self._mark_unfilled_cancel(order, str(exc))
+                else:
+                    filled.append(order.key)
         return filled
 
     def set_quote(self, asset: str, price: Decimal, *, fill_price: Decimal | None = None, match: bool = True) -> list[str]:

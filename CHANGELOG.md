@@ -22,10 +22,11 @@ remain OPEN.
   cross-principal cancels are refused; client-order ids use a domain-separated
   hash; `PLACE_ORDER` is no longer silently treated as BUY; order/TIF/quote
   semantics and wire types are exact; GTC evidence is built at fill time;
-  balance legs validate before mutation; HTTP clients cannot send bearer tokens
-  or permits off numeric loopback.
-- Red-team classes RT-135..RT-152 (183 classes, 261 mapped tests). Unit suite
-  is 412 tests (1 skipped). Does not close gate 6.4, gate 8, key custody,
+  balance legs validate before mutation; failed GTC matches become terminal
+  unfilled cancellations; HTTP clients cannot send bearer tokens or permits off
+  numeric loopback.
+- Red-team classes RT-135..RT-153 (184 classes, 262 mapped tests). Unit suite
+  is 413 tests (1 skipped). Does not close gate 6.4, gate 8, key custody,
   authenticated ingress, or any live-venue row.
 
 ## 0.4.0 — 2026-09-02

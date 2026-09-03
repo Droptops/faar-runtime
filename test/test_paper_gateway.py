@@ -397,6 +397,27 @@ class PaperGatewayTests(unittest.TestCase):
         self.assertEqual("125", record.evidence["fill"]["base_quantity"])
         self.assertEqual("50", record.evidence["fill"]["quote_quantity"])
 
+    def test_gtc_failed_match_becomes_authoritative_unfilled_cancel(self):
+        self.book.balances["USDC"] = Decimal("0")
+        place = _order_intent(
+            intent_id="paper_gw_gtc_match_fail_01",
+            limit_price="0.40",
+            time_in_force="GTC",
+        )
+        request, permit, *_ = self.issue(place)
+        receipt = self.adapter.execute(request, permit)
+        self.assertEqual(SettlementStatus.PARTIALLY_FILLED, receipt.status)
+
+        self.assertEqual([], self.service.set_quote("MEME", Decimal("0.40")))
+        record = self.verifier.verify(request)
+        self.assertEqual(SettlementStatus.CANCELLED, record.status)
+        self.assertEqual(Decimal("0"), record.amount_usd)
+        self.assertTrue(record.authoritative)
+        self.assertIn("INSUFFICIENT_BALANCE:USDC", record.evidence["reasons"])
+        self.assertEqual(Decimal("0"), self.book.balances["USDC"])
+        self.assertEqual(Decimal("200"), self.book.balances["MEME"])
+        self.assertEqual((1, 1), self.store.permit_counts(place.intent_id))
+
     def test_sell_limit_uses_the_signed_side_and_fill_time_quote(self):
         sell = _order_intent(
             intent_id="paper_gw_sell_order_00001",

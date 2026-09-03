@@ -198,8 +198,8 @@ It is not a live-money adapter approval. See
 
 See [`docs/V0_4_RELEASE.md`](docs/V0_4_RELEASE.md). The deterministic release gate (`make check`) includes unit tests, adversarial denial/replay checks with adapter-call and permit-consumption metrics, a red-team matrix in which every attack class is mapped to named tests, seeded state-machine fuzz with an advancing clock, the demo CLI path with keyed evidence verification, and the bounded permit protocol model checker. Headline results:
 
-- 412 unit/invariant tests run (411 pass, 1 optional-dependency skip)
-- 183 targeted red-team attack classes mapped to 261 named tests, 0 unmapped
+- 413 unit/invariant tests run (412 pass, 1 optional-dependency skip)
+- 184 targeted red-team attack classes mapped to 262 named tests, 0 unmapped
 - 160 adversarial denial cases with 0 unauthorized economic effects and 0 adapter calls
 - 100 same-intent replay attempts with 1 economic effect, 1 adapter call, 1 permit issued and consumed
 - 96 seeded fuzz scenarios with 0 duplicate-effect and 0 aggregate-budget violations

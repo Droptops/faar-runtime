@@ -115,8 +115,9 @@ authoritative `CANCELLED` with amount 0. Gate 4.9 for this venue.
 A marketable order fills completely at the book's fill price or not at all.
 An unmarketable IOC is admitted then `CANCELLED` (`LIMIT_PRICE_EXCEEDED`).
 A resting GTC is an open order (`PARTIALLY_FILLED` / amount 0) until a later
-match or cancel. This exercises the runtime open-order path; it does not
-model a partial economic fill.
+match or cancel. If that later match cannot apply both balance legs, it becomes
+an authoritative unfilled `CANCELLED` record rather than remaining open. This
+exercises the runtime open-order path; it does not model a partial economic fill.
 
 ## cancellation
 
