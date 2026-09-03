@@ -412,6 +412,27 @@ ATTACK_CLASSES: dict[str, tuple[str, ...]] = {
         "test_hyperliquid.HyperliquidHTTPBoundaryTests.test_malformed_or_mutating_signer_never_reaches_the_network",
         "test_hyperliquid.HyperliquidHTTPBoundaryTests.test_invalid_nonce_or_expiry_never_reaches_the_signer",
     ),
+    # --- paper gateway (not live-money) ---------------------------------------------
+    "paper-gateway query credential creating an effect": (
+        "test_paper_gateway.PaperGatewayTests.test_query_credential_cannot_submit",
+        "test_paper_gateway.PaperGatewayHttpTests.test_http_query_token_cannot_create_an_order",
+    ),
+    "paper-gateway fill worse than the request limit_price": (
+        "test_paper_gateway.PaperGatewayTests.test_fill_worse_than_limit_price_is_rejected_and_creates_no_effect",
+        "test_paper_gateway.LimitPriceGateTests.test_invalid_limit_price_is_denied_before_any_adapter",
+    ),
+    "paper-gateway cancelled order filling after a later match": (
+        "test_paper_gateway.PaperGatewayTests.test_cancelled_gtc_order_never_fills_after_the_book_moves",
+    ),
+    "paper-gateway rebound request reconciling as the original fill": (
+        "test_paper_gateway.PaperGatewayTests.test_lookup_of_a_rebound_request_is_contradictory",
+    ),
+    "paper-gateway permit consumed at another venue": (
+        "test_paper_gateway.PaperGatewayTests.test_permit_for_another_venue_is_refused_before_any_book_change",
+    ),
+    "paper-gateway consumed permit paired with absence": (
+        "test_paper_gateway.PaperGatewayTests.test_fill_worse_than_limit_price_is_rejected_and_creates_no_effect",
+    ),
 }
 
 

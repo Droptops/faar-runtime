@@ -14,6 +14,11 @@ The v0.4.0 deterministic suite (382 unit/invariant tests) covers capability/risk
 fake transports and a fake venue ledger. It never opens a network connection and
 does not certify Hyperliquid testnet behavior.
 
+`test_paper_gateway.py` exercises the paper / loopback venue: venue-bound
+permit consume, the request `limit_price` envelope, submit/query credential
+split (in-process and loopback HTTP), open-order confirmation, and the
+guarantee that a cancelled GTC never fills later. It is not a live venue.
+
 The unit suite is complemented by:
 
 ```bash

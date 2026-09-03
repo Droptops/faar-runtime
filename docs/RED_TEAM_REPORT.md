@@ -189,6 +189,20 @@ holder hanging every worker); their reproductions were re-run against the fixes.
 
 Documentation corrections from the same pass: halt semantics for in-flight intents, the persisted deterministic-failure code, the residual-risk table (partial fills OPEN, orphan threads under R-09), adapter-contract references, HMAC statements, the lifecycle diagram (`RECONCILING -> FAILED_SAFE`, retry edge), and the invariants header.
 
+## Findings closed in the paper gateway (not live-money)
+
+These findings cover only `faar/paper_gateway.py`. They do not close a
+deployment row or constitute an independent review.
+
+| ID | Finding | Severity in candidate | Response |
+|---|---|---:|---|
+| RT-135 | Query credential or verifier client could submit and create an effect | High | Distinct submit/query tokens; query client has no submit path; HTTP `/v1/orders` refuses the query token |
+| RT-136 | Book could fill worse than the request `limit_price` | High | Venue-side envelope; unmarketable IOC is admitted then `CANCELLED` with amount 0 (`SETTLEMENT_CANCELLED_UNFILLED`); invalid `limit_price` is `LIMIT_PRICE_INVALID` at the gate |
+| RT-137 | A cancelled GTC could still fill on a later match | High | Cancelled rows are skipped by `match_pending`; `_fill` refuses `CANCELLED` |
+| RT-138 | A rebound payload could reconcile as the original fill | High | Lookup binds `request_hash`; mismatch is authoritative `CONTRADICTORY` |
+| RT-139 | A permit minted for another venue could be consumed here | High | `consume(..., venue=self.name)`; mismatch creates no order |
+| RT-140 | Admit-then-reject left authoritative `NONE` after a consumed permit | High | Rejected and cancelled originals reconcile as `CANCELLED` amount 0; effect id is stable from admission |
+
 ## Executable regression matrix
 
 Current `make check` result for v0.4.0:
@@ -258,7 +272,7 @@ Caller-provided time cannot roll the security clock backwards, but a compromised
 
 ### R-12 — Reference settlement verifier shares ground truth with the mock venue
 
-The runtime enforces a distinct, trusted verifier per adapter, but `MockSettlementVerifier` reads the same in-memory ledger as `MockVenue`; independence in the reference is structural, not evidential. Live venues need an independently authenticated read path or a quorum.
+The runtime enforces a distinct, trusted verifier per adapter. `MockSettlementVerifier` still reads the same in-memory ledger as `MockVenue`. The paper gateway splits submit and query credentials (and loopback HTTP paths) so the verifier cannot create an order; that is DONE-IN-REPO for `paper-gateway` only. Live venues need an independently authenticated read path or a quorum.
 
 ### R-13 — Anchor placement
 

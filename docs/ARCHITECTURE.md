@@ -126,7 +126,7 @@ See [`EXECUTION_PERMITS.md`](EXECUTION_PERMITS.md). The permit authority indepen
 
 The adapter is not a generic tool pass-through. FAAR converts the authorized `Intent` into a minimized `ExecutionRequest` and a permit; the adapter never receives model metadata, the capability grant, or the authority/risk decision objects. Agent-supplied calldata, raw transactions, signing payloads, key material, delegatecall, unlimited approvals, unknown execution fields, dual amount fields and non-canonical amount strings are rejected before this boundary.
 
-Whatever the adapter returns is untrusted telemetry. Positive and negative settlement come only from the independent settlement verifier, which must be a distinct component with a trusted profile. Positive reconciliation must be authoritative and bound to the exact request hash; for money-moving effects FAAR also checks that a settled amount exists and does not exceed the authorized notional (`PAY` requires exact equality).
+Whatever the adapter returns is untrusted telemetry. Positive and negative settlement come only from the independent settlement verifier, which must be a distinct component with a trusted profile. The paper gateway (`faar/paper_gateway.py`) is the in-repo example of that split: submit and query are different credentials, and the verifier cannot create an order. Positive reconciliation must be authoritative and bound to the exact request hash; for money-moving effects FAAR also checks that a settled amount exists and does not exceed the authorized notional (`PAY` requires exact equality).
 
 ## Evidence
 

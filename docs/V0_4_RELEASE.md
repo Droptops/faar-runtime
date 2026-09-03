@@ -18,6 +18,8 @@ In scope:
 - replay, concurrency, revocation, restore and settlement-evidence checks in the reference model
 - a fixed-origin Hyperliquid testnet candidate for USDC spot BUY limit-IOC orders,
   tested with deterministic fakes and accompanied by a venue review
+- a paper / loopback gateway with split submit/query credentials, venue-bound
+  permit consume, and an independent query verifier (`docs/adapters/PAPER_GATEWAY.md`)
 - the release gate (`make check`), including the mapped red-team matrix and the bounded permit protocol model
 
 Out of scope:

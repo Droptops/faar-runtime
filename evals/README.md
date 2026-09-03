@@ -32,7 +32,7 @@ timeout_after_effect_successful_effects = 1
 
 ## Targeted red team
 
-`run_redteam.py` maps 165 named attack classes to 242 concrete unit tests, loads the suite in-process, asserts that every mapped test exists and passes, and reports any `unmapped_tests`. The headline count therefore cannot drift from real coverage: deleting a mapped test fails the gate. RT-128..RT-134 cover the fixed-origin Hyperliquid testnet candidate; those tests use deterministic fakes and are not venue certification.
+`run_redteam.py` maps named attack classes to concrete unit tests, loads the suite in-process, asserts that every mapped test exists and passes, and reports any `unmapped_tests`. The headline count therefore cannot drift from real coverage: deleting a mapped test fails the gate. RT-128..RT-134 cover the fixed-origin Hyperliquid testnet candidate (fakes only). RT-135..RT-140 cover the paper gateway (not live-money).
 
 ## Crash injection
 

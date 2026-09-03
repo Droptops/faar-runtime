@@ -153,6 +153,7 @@ faar/
   adapters.py         # execution adapter contract and deterministic mock venue
   settlement.py       # independent settlement verifiers (mock, quorum)
   paper.py            # safe paper-trading adapter
+  paper_gateway.py    # paper / loopback venue with split submit/query credentials
   hyperliquid.py      # fixed-origin, limit-IOC Hyperliquid testnet candidate + verifier
   outcomes.py         # definition-of-done verification
   cli.py              # demo, provisioning, and operator commands

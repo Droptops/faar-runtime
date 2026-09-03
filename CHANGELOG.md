@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+Paper gateway rebase onto current `main` (Hyperliquid candidate, live-money
+pass). Still **pre-alpha and not approved for live funds or production
+credentials**. Gate 6.4 (datastore failover) and gate 8 (independent review)
+remain OPEN.
+
+- `faar/paper_gateway.py`: paper / loopback venue whose submit and query
+  credentials are distinct; the query path cannot create an order. Review
+  record: `docs/adapters/PAPER_GATEWAY.md`.
+- Venue-bound permit consume (`PERMIT_VENUE_MISMATCH`); consume before any
+  book mutation; cancel of a filled or missing order is refused before consume.
+- Admit-then-reject (worse than `limit_price`, insufficient balance) leaves
+  authoritative `CANCELLED` with amount 0 so a consumed permit is never paired
+  with absence (`SETTLEMENT_CANCELLED_UNFILLED`).
+- Resting GTC is authoritative `PARTIALLY_FILLED` amount 0 (`SETTLEMENT_ORDER_OPEN`);
+  effect id is the order identity from admission and does not change on fill.
+- Red-team classes RT-135..RT-140. Does not close gate 6.4, gate 8, key
+  custody, authenticated ingress, or any live-venue row.
+
 ## 0.4.0 — 2026-09-02
 
 Third adversarial pass over v0.3.1 plus the operator controls a first bounded deployment needs, followed by an independent five-lens review of the change set itself. Still **pre-alpha and not approved for live funds or production credentials**. See [`docs/RED_TEAM_REPORT.md`](docs/RED_TEAM_REPORT.md) findings RT-42..RT-79 and [`docs/GO_LIVE_CHECKLIST.md`](docs/GO_LIVE_CHECKLIST.md).
