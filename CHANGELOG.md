@@ -17,8 +17,9 @@ remain OPEN.
   with absence (`SETTLEMENT_CANCELLED_UNFILLED`).
 - Resting GTC is authoritative `PARTIALLY_FILLED` amount 0 (`SETTLEMENT_ORDER_OPEN`);
   effect id is the order identity from admission and does not change on fill.
-- Red-team classes RT-135..RT-140. Does not close gate 6.4, gate 8, key
-  custody, authenticated ingress, or any live-venue row.
+- Red-team classes RT-135..RT-140 (171 classes, 249 mapped tests). Unit suite
+  is 401 tests (1 skipped). Does not close gate 6.4, gate 8, key custody,
+  authenticated ingress, or any live-venue row.
 
 ## 0.4.0 — 2026-09-02
 
