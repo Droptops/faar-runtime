@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import unittest
+from copy import deepcopy
+from dataclasses import replace
 from datetime import timedelta
 from decimal import Decimal
+from unittest.mock import patch
 
-from faar.adapters import DeterministicFailure
+from faar.adapters import AmbiguousExecution, DeterministicFailure
 from faar.canonical import canonical_hash
 from faar.gates import evaluate_capability
 from faar.models import (
@@ -22,13 +25,18 @@ from faar.models import (
 from faar.paper_gateway import (
     PaperHttpQueryClient,
     PaperHttpSubmitClient,
+    PaperOrderState,
     PaperVenueBook,
     PaperVenueService,
     VenueCredential,
     VenueRole,
     client_order_id,
+    permit_from_wire,
+    permit_to_wire,
     paper_gateway_pair,
     paper_http_pair,
+    request_from_wire,
+    request_to_wire,
 )
 from faar.runtime import FAARRuntime
 from faar.store import SQLiteIntentStore
@@ -37,6 +45,7 @@ from support import AUTH, NOW, PRINCIPAL, attest_pair, grant, permit_stack, temp
 
 
 VENUE = "paper-gateway"
+TARGET = "router:approved"
 
 
 def _order_grant(**changes) -> CapabilityGrant:
@@ -48,18 +57,19 @@ def _order_grant(**changes) -> CapabilityGrant:
         }),
         allowed_venues=frozenset({VENUE}),
         allowed_assets=frozenset({"USDC", "MEME"}),
+        allowed_targets=frozenset({TARGET, "router:other"}),
         **changes,
     )
 
 
-def _order_intent(*, intent_id: str, primitive=EconomicPrimitive.PLACE_ORDER, **payload_extra) -> Intent:
+def _order_intent(*, intent_id: str, primitive=EconomicPrimitive.BUY, **payload_extra) -> Intent:
     payload = {
         "base_asset": "MEME",
         "quote_asset": "USDC",
         "amount_usd": "50",
         "order_type": "limit",
         "limit_price": "0.55",
-        "target": "router:approved",
+        "target": TARGET,
     }
     payload.update(payload_extra)
     return Intent(
@@ -89,6 +99,8 @@ class PaperGatewayTests(unittest.TestCase):
         )
         self.service = PaperVenueService(
             VENUE, self.permit_verifier, self.book,
+            principal_id=PRINCIPAL,
+            target=TARGET,
             submit_token="submit-token-not-a-secret",
             query_token="query-token-not-a-secret",
             clock=lambda: NOW,
@@ -109,14 +121,15 @@ class PaperGatewayTests(unittest.TestCase):
         self._risk_version += 1
         return risk(state_version=self._risk_version, **changes)
 
-    def issue(self, i: Intent, rs=None):
+    def issue(self, i: Intent, rs=None, *, capability: CapabilityGrant | None = None):
+        capability = capability or self.g
         rs = rs or self._risk()
         aa, ra = attest_pair(self.trust, i, AUTH, rs)
         self.store.register(i, canonical_hash(i))
-        self.assertTrue(self.store.reserve_usage(i, self.g, rs, NOW)[0])
+        self.assertTrue(self.store.reserve_usage(i, capability, rs, NOW)[0])
         request = ExecutionRequest.from_intent(i)
         permit = self.permit_authority.issue(
-            request, intent=i, authority=AUTH, grant=self.g, risk=rs,
+            request, intent=i, authority=AUTH, grant=capability, risk=rs,
             authority_attestation=aa, risk_attestation=ra, now=NOW,
         )
         return request, permit, rs, aa, ra
@@ -179,14 +192,129 @@ class PaperGatewayTests(unittest.TestCase):
         self.assertIsNot(self.adapter, self.verifier)
         self.assertNotEqual(type(self.adapter.client), type(self.verifier.client))
 
-    def test_stable_client_order_id_is_principal_and_intent(self):
+    def test_stable_client_order_id_is_hashed_and_namespace_unambiguous(self):
         i = _order_intent(intent_id="paper_gw_intent_00000005")
         request, permit, *_ = self.issue(i)
         receipt = self.adapter.execute(request, permit)
-        self.assertEqual(f"{PRINCIPAL}:{i.intent_id}", client_order_id(request))
+        self.assertRegex(client_order_id(request), r"\Apco_[0-9a-f]{32}\Z")
         self.assertEqual(client_order_id(request), receipt.evidence["client_order_id"])
         again = self.adapter.execute(request, permit)
         self.assertEqual(receipt.effect_id, again.effect_id)
+
+        # Delimiter concatenation aliases these two identity pairs. The gateway
+        # hashes a canonical, domain-separated structure instead.
+        first = ExecutionRequest(
+            "principal:a:b", "intent_collision_0001", EconomicPrimitive.BUY, VENUE, request.payload,
+        )
+        second = ExecutionRequest(
+            "principal:a", "b:intent_collision_0001", EconomicPrimitive.BUY, VENUE, request.payload,
+        )
+        self.assertEqual(
+            f"{first.principal_id}:{first.intent_id}",
+            f"{second.principal_id}:{second.intent_id}",
+        )
+        self.assertNotEqual(client_order_id(first), client_order_id(second))
+
+    def test_place_order_without_a_signed_side_is_rejected_before_consume(self):
+        i = _order_intent(
+            intent_id="paper_gw_place_order_000001",
+            primitive=EconomicPrimitive.PLACE_ORDER,
+        )
+        request, permit, *_ = self.issue(i)
+        with self.assertRaisesRegex(DeterministicFailure, "UNSUPPORTED_PRIMITIVE:PLACE_ORDER"):
+            self.adapter.execute(request, permit)
+        self.assertEqual((1, 0), self.store.permit_counts(i.intent_id))
+        self.assertFalse(self.book.orders)
+
+    def test_order_semantics_are_exact_and_rejected_before_consume(self):
+        cases = (
+            ("paper_gw_bad_order_type_01", {"order_type": "market", "max_slippage_bps": 1}, "LIMIT_ORDER_REQUIRED"),
+            ("paper_gw_bad_tif_0000001", {"time_in_force": "FOK"}, "TIME_IN_FORCE_UNSUPPORTED"),
+            ("paper_gw_bad_tif_type_01", {"time_in_force": 1}, "TIME_IN_FORCE_UNSUPPORTED"),
+            ("paper_gw_second_bound_001", {"max_slippage_bps": 1}, "ABSOLUTE_LIMIT_ONLY"),
+            ("paper_gw_bad_quote_00001", {"quote_asset": "MEME", "base_asset": "USDC"}, "USDC_QUOTE_REQUIRED"),
+            ("paper_gw_bad_target_0001", {"target": "router:other"}, "TARGET_MISMATCH"),
+        )
+        for intent_id, changes, reason in cases:
+            with self.subTest(reason=reason):
+                i = _order_intent(intent_id=intent_id, **changes)
+                request, permit, *_ = self.issue(i)
+                with self.assertRaisesRegex(DeterministicFailure, reason):
+                    self.adapter.execute(request, permit)
+                self.assertEqual((1, 0), self.store.permit_counts(i.intent_id))
+        self.assertFalse(self.book.orders)
+
+    def test_service_is_bound_to_one_principal_before_permit_consume(self):
+        attacker = "principal:attacker"
+        attacker_grant = replace(
+            self.g,
+            principal_id=attacker,
+            grant_id="g-paper-gw-attacker",
+        )
+        self.store.provision_grant(attacker_grant, canonical_hash(attacker_grant))
+        attack = replace(
+            _order_intent(intent_id="paper_gw_attacker_buy_001"),
+            principal_id=attacker,
+            grant_id=attacker_grant.grant_id,
+        )
+        request, permit, *_ = self.issue(attack, capability=attacker_grant)
+        with self.assertRaisesRegex(DeterministicFailure, "PRINCIPAL_MISMATCH"):
+            self.adapter.execute(request, permit)
+        with self.assertRaisesRegex(DeterministicFailure, "PRINCIPAL_MISMATCH"):
+            self.service.lookup(
+                request,
+                VenueCredential(VenueRole.QUERY, self.service.query_token),
+            )
+        self.assertEqual((1, 0), self.store.permit_counts(attack.intent_id))
+        self.assertFalse(self.book.orders)
+
+    def test_other_principal_cannot_cancel_an_order_in_a_shared_book(self):
+        place = _order_intent(
+            intent_id="paper_gw_owner_order_0001",
+            limit_price="0.40",
+            time_in_force="GTC",
+        )
+        place_request, place_permit, *_ = self.issue(place)
+        receipt = self.adapter.execute(place_request, place_permit)
+
+        attacker = "principal:attacker"
+        attacker_grant = replace(
+            self.g,
+            principal_id=attacker,
+            grant_id="g-paper-gw-attacker-cancel",
+        )
+        self.store.provision_grant(attacker_grant, canonical_hash(attacker_grant))
+        cancel = Intent(
+            principal_id=attacker,
+            intent_id="paper_gw_attacker_cancel_01",
+            actor_id="agent:quant",
+            grant_id=attacker_grant.grant_id,
+            grant_version=1,
+            primitive=EconomicPrimitive.CANCEL_ORDER,
+            venue=VENUE,
+            created_at=NOW,
+            expires_at=NOW + timedelta(seconds=15),
+            payload={"order_id": receipt.evidence["order_id"], "target": TARGET},
+        )
+        cancel_request, cancel_permit, *_ = self.issue(cancel, capability=attacker_grant)
+        attacker_service = PaperVenueService(
+            VENUE,
+            self.permit_verifier,
+            self.book,
+            principal_id=attacker,
+            target=TARGET,
+            submit_token="attacker-submit-token",
+            query_token="attacker-query-token",
+            clock=lambda: NOW,
+        )
+        with self.assertRaisesRegex(DeterministicFailure, "ORDER_NOT_OWNED"):
+            attacker_service.submit(
+                cancel_request,
+                cancel_permit,
+                VenueCredential(VenueRole.SUBMIT, "attacker-submit-token"),
+            )
+        self.assertEqual((1, 0), self.store.permit_counts(cancel.intent_id))
+        self.assertEqual(PaperOrderState.PENDING, self.book.orders[client_order_id(place_request)].state)
 
     def test_lookup_of_a_rebound_request_is_contradictory(self):
         i = _order_intent(intent_id="paper_gw_intent_00000006")
@@ -194,7 +322,13 @@ class PaperGatewayTests(unittest.TestCase):
         self.adapter.execute(request, permit)
         forged = ExecutionRequest(
             i.principal_id, i.intent_id, i.primitive, i.venue,
-            {"base_asset": "MEME", "quote_asset": "USDC", "amount_usd": "5000", "limit_price": "0.55"},
+            {
+                "base_asset": "MEME",
+                "quote_asset": "USDC",
+                "amount_usd": "5000",
+                "limit_price": "0.55",
+                "target": TARGET,
+            },
         )
         self.assertEqual(SettlementStatus.CONTRADICTORY, self.verifier.verify(forged).status)
 
@@ -258,6 +392,42 @@ class PaperGatewayTests(unittest.TestCase):
         self.assertEqual(Decimal("50"), record.amount_usd)
         self.assertEqual(open_order.effect_id, record.effect_id)
         self.assertEqual(Decimal("950"), self.book.balances["USDC"])
+        self.assertEqual(Decimal("325"), self.book.balances["MEME"])
+        self.assertEqual("0.40", record.evidence["fill"]["fill_price"])
+        self.assertEqual("125", record.evidence["fill"]["base_quantity"])
+        self.assertEqual("50", record.evidence["fill"]["quote_quantity"])
+
+    def test_sell_limit_uses_the_signed_side_and_fill_time_quote(self):
+        sell = _order_intent(
+            intent_id="paper_gw_sell_order_00001",
+            primitive=EconomicPrimitive.SELL,
+            limit_price="0.50",
+        )
+        request, permit, *_ = self.issue(sell)
+        receipt = self.adapter.execute(request, permit)
+        record = self.verifier.verify(request)
+        self.assertEqual(SettlementStatus.FINALIZED, record.status)
+        self.assertEqual("SELL", receipt.evidence["fill"]["side"])
+        self.assertEqual("0.50", record.evidence["fill"]["fill_price"])
+        self.assertEqual(Decimal("100"), self.book.balances["MEME"])
+        self.assertEqual(Decimal("1050"), self.book.balances["USDC"])
+
+    def test_invalid_credit_balance_cancels_without_a_partial_balance_leg(self):
+        self.book.balances["USDC"] = Decimal("NaN")
+        before_base = self.book.balances["MEME"]
+        sell = _order_intent(
+            intent_id="paper_gw_atomic_fill_0001",
+            primitive=EconomicPrimitive.SELL,
+            limit_price="0.50",
+        )
+        request, permit, *_ = self.issue(sell)
+        with self.assertRaisesRegex(DeterministicFailure, "INVALID_PAPER_BALANCE:USDC"):
+            self.adapter.execute(request, permit)
+        self.assertEqual(before_base, self.book.balances["MEME"])
+        self.assertTrue(self.book.balances["USDC"].is_nan())
+        order = self.book.orders[client_order_id(request)]
+        self.assertEqual(PaperOrderState.CANCELLED, order.state)
+        self.assertEqual((1, 1), self.store.permit_counts(sell.intent_id))
 
     def test_cancel_of_a_filled_order_is_deterministic_and_does_not_unwind(self):
         place = _order_intent(intent_id="paper_gw_intent_00000010")
@@ -326,6 +496,8 @@ class PaperGatewayHttpTests(unittest.TestCase):
         self.book = PaperVenueBook({"MEME": Decimal("0.50")}, {"USDC": Decimal("1000")})
         self.service = PaperVenueService(
             VENUE, self.permit_verifier, self.book,
+            principal_id=PRINCIPAL,
+            target=TARGET,
             submit_token="submit-http-token",
             query_token="query-http-token",
             clock=lambda: NOW,
@@ -390,6 +562,91 @@ class PaperGatewayHttpTests(unittest.TestCase):
         self.assertFalse(record.authoritative)
         honest = self.verifier.verify(request)
         self.assertEqual(SettlementStatus.FINALIZED, honest.status)
+
+    def test_http_clients_reject_non_loopback_or_ambiguous_origins(self):
+        bad_origins = (
+            "http://example.com:80",
+            "https://127.0.0.1:443",
+            "http://localhost:8080",
+            "http://user:pass@127.0.0.1:8080",
+            "http://127.0.0.1:8080/prefix",
+            "http://127.0.0.1:8080?redirect=example.com",
+            "http://127.0.0.1",
+        )
+        for origin in bad_origins:
+            with self.subTest(origin=origin):
+                with self.assertRaisesRegex(ValueError, "numeric loopback HTTP origin"):
+                    PaperHttpSubmitClient(origin, "submit-token")
+                with self.assertRaisesRegex(ValueError, "numeric loopback HTTP origin"):
+                    PaperHttpQueryClient(origin, "query-token")
+
+    def test_malformed_authoritative_flag_never_becomes_authoritative(self):
+        request = ExecutionRequest.from_intent(
+            _order_intent(intent_id="paper_gw_bad_record_00001"),
+        )
+        client = PaperHttpQueryClient("http://127.0.0.1:1", "query-token")
+        malicious = {
+            "ok": True,
+            "record": {
+                "status": "NONE",
+                "effect_id": None,
+                "amount_usd": None,
+                "evidence": {"order_state": "ABSENT"},
+                "authoritative": "false",
+                "verified_request_hash": canonical_hash(request),
+            },
+        }
+        with patch("faar.paper_gateway._http_json", return_value=(200, malicious)):
+            with self.assertRaisesRegex(AmbiguousExecution, "RECORD"):
+                client.lookup(request)
+
+    def test_malformed_submit_response_is_ambiguous_not_a_false_receipt(self):
+        i = _order_intent(intent_id="paper_gw_bad_receipt_0001")
+        request, permit = self.issue(i)
+        client = PaperHttpSubmitClient("http://127.0.0.1:1", "submit-token")
+        malicious = {
+            "ok": True,
+            "receipt": {
+                "status": "FINALIZED",
+                "effect_id": 123,
+                "amount_usd": "50",
+                "evidence": {},
+            },
+        }
+        with patch("faar.paper_gateway._http_json", return_value=(200, malicious)):
+            with self.assertRaisesRegex(AmbiguousExecution, "RECEIPT"):
+                client.submit(request, permit)
+
+    def test_wire_decoders_reject_scalar_coercion(self):
+        i = _order_intent(intent_id="paper_gw_wire_types_00001")
+        request, permit = self.issue(i)
+        request_wire = request_to_wire(request)
+        request_wire["principal_id"] = 123
+        with self.assertRaisesRegex(DeterministicFailure, "MALFORMED_REQUEST"):
+            request_from_wire(request_wire)
+
+        permit_wire = deepcopy(permit_to_wire(permit))
+        permit_wire["permit"]["grant_version"] = True
+        with self.assertRaisesRegex(DeterministicFailure, "MALFORMED_PERMIT"):
+            permit_from_wire(permit_wire)
+
+
+class PaperVenueBookValidationTests(unittest.TestCase):
+    def test_nonfinite_or_negative_operator_state_is_rejected(self):
+        invalid = (
+            ({"MEME": Decimal("NaN")}, {"USDC": Decimal("10")}),
+            ({"MEME": Decimal("0")}, {"USDC": Decimal("10")}),
+            ({"MEME": Decimal("0.5")}, {"USDC": Decimal("-1")}),
+        )
+        for prices, balances in invalid:
+            with self.subTest(prices=prices, balances=balances):
+                with self.assertRaises(ValueError):
+                    PaperVenueBook(prices, balances)
+
+        book = PaperVenueBook({"MEME": Decimal("0.5")}, {"USDC": Decimal("10")})
+        with self.assertRaisesRegex(DeterministicFailure, "INVALID_PAPER_PRICE"):
+            book.set_quote("MEME", Decimal("NaN"))
+        self.assertEqual(Decimal("0.5"), book.price("MEME"))
 
 
 class LimitPriceGateTests(unittest.TestCase):

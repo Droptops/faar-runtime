@@ -202,16 +202,28 @@ deployment row or constitute an independent review.
 | RT-138 | A rebound payload could reconcile as the original fill | High | Lookup binds `request_hash`; mismatch is authoritative `CONTRADICTORY` |
 | RT-139 | A permit minted for another venue could be consumed here | High | `consume(..., venue=self.name)`; mismatch creates no order |
 | RT-140 | Admit-then-reject left authoritative `NONE` after a consumed permit | High | Rejected and cancelled originals reconcile as `CANCELLED` amount 0; effect id is stable from admission |
+| RT-141 | A principal with cancel authority could cancel another principal's order by venue order id | High | Orders carry an owner; `ORDER_NOT_OWNED` is returned before permit consumption |
+| RT-142 | One service accepted permits for any principal while mutating a shared account balance | High | Every service is pinned to one principal and checks submit and lookup requests before consumption |
+| RT-143 | `principal_id + ":" + intent_id` aliased identity pairs containing delimiters | Medium | Canonical domain-separated 128-bit client-order hash |
+| RT-144 | Side-less `PLACE_ORDER` was silently interpreted as BUY | High | Only explicit BUY/SELL accepted; unsupported primitives fail before consumption |
+| RT-145 | Market/FOK aliases, a second ignored slippage bound, non-USDC quote or unpinned target changed order meaning | High | Exact limit IOC/GTC, USDC quote, absolute-limit-only and pinned-target checks before consumption |
+| RT-146 | A resting GTC reported admission-time price and quantities after filling at a later quote | High | Fill evidence and both balance legs are calculated from the executable quote at actual fill time |
+| RT-147 | Loopback clients accepted a remote/HTTPS origin and could disclose bearer tokens and permits | High | Numeric loopback HTTP origin, explicit port and no userinfo/path/query are enforced at construction and send time |
+| RT-148 | A wire value `"false"` was truthy and became authoritative settlement | High | Exact boolean decoding; malformed records are transport ambiguity |
+| RT-149 | Malformed submit responses were coerced into receipts | Medium | Exact receipt schema/types; malformed post-submit output is `AmbiguousExecution` |
+| RT-150 | Request and permit wire decoders coerced scalar types before signature verification | Medium | Exact field sets and scalar types; canonical timestamp spelling; no `str()`/`int()` aliases |
+| RT-151 | Non-finite or negative operator book state could crash or corrupt matching | Medium | Bounded finite prices and non-negative balances at construction and quote update |
+| RT-152 | A failed fill could apply its debit before detecting an invalid credit leg | High | Both balance legs validate before either mutation; admitted failure remains authoritative `CANCELLED` |
 
 ## Executable regression matrix
 
 Current `make check` result for v0.4.0:
 
 ```text
-401 unit/invariant tests -> PASS
-171 targeted red-team attack classes, each mapped to named tests (249 tests) -> PASS, 0 unmapped
+412 unit/invariant tests -> PASS (1 optional-dependency skip)
+183 targeted red-team attack classes, each mapped to named tests (261 tests) -> PASS, 0 unmapped
 29 Hyperliquid testnet contract tests with deterministic fakes -> PASS; no live venue or credential claim
-19 paper-gateway tests (in-process + loopback HTTP) -> PASS; not a live venue or credential claim
+30 paper-gateway tests (in-process + loopback HTTP) -> PASS; not a live venue or credential claim
 160 deterministic denial mutations -> 0 unauthorized economic effects, 0 adapter calls
 100 retries of one logical intent -> 1 successful effect, 1 adapter call, 1 permit issued and consumed
 ambiguous timeout-after-effect recovery -> 1 successful effect, 1 adapter call
@@ -273,7 +285,7 @@ Caller-provided time cannot roll the security clock backwards, but a compromised
 
 ### R-12 — Reference settlement verifier shares ground truth with the mock venue
 
-The runtime enforces a distinct, trusted verifier per adapter. `MockSettlementVerifier` still reads the same in-memory ledger as `MockVenue`. The paper gateway splits submit and query credentials (and loopback HTTP paths) so the verifier cannot create an order; that is DONE-IN-REPO for `paper-gateway` only. Live venues need an independently authenticated read path or a quorum.
+The runtime enforces a distinct verifier object with a declared trusted profile per adapter. `MockSettlementVerifier` still reads the same in-memory ledger as `MockVenue`. The paper gateway splits submit and query credentials and loopback HTTP routes, but both reach the same process and in-memory book; that is role separation, not independent ground truth. R-12 therefore remains open for deployment. Live venues need an independently authenticated read path or a quorum whose sources do not share the same failure domain.
 
 ### R-13 — Anchor placement
 

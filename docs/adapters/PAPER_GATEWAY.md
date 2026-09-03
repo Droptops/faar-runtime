@@ -5,13 +5,19 @@ seed phrase, or funded account is used. This document is the review record
 required by [`ADAPTER_CONTRACT.md`](../ADAPTER_CONTRACT.md).
 
 The pair is `PaperGatewayAdapter` (submit) + `PaperGatewayVerifier` (query) in
-`faar/paper_gateway.py`. They never share a client object or a credential. The
-venue process (`PaperVenueService`) is the only holder of the book.
+`faar/paper_gateway.py`. They do not share a client object or role credential,
+but both reach the same `PaperVenueService` and in-memory book. This exercises
+role separation and the runtime's distinct-object requirement; it is not an
+independently operated settlement source.
 
 ## venue/authentication
 
-- Venue name: `paper-gateway`.
-- Transport: in-process role-split clients, or loopback HTTP (`127.0.0.1` only).
+- Venue name: `paper-gateway`; each service instance is pinned to one principal
+  and one target.
+- Transport: in-process role-split clients, or numeric loopback HTTP
+  (`127.0.0.1` by the bundled server). HTTP clients reject DNS names, non-loopback
+  addresses, HTTPS, userinfo, path prefixes, query strings and missing ports
+  before sending a bearer token or permit.
 - Authentication: two bearer tokens minted by the operator when the venue
   process starts. The submit token is accepted only on `POST /v1/orders`. The
   query token is accepted only on `POST /v1/reconcile`. A crossed token is
@@ -26,11 +32,26 @@ venue process (`PaperVenueService`) is the only holder of the book.
   consume a permit or create an effect.
 - Neither credential is a wallet, withdrawal, or transfer key. The venue has
   no withdraw path.
+- In-process objects share one Python interpreter, so attribute access is not
+  credential isolation. The loopback routes demonstrate role checks, not OS
+  process isolation, secret custody, or an independent data source.
 
 ## stable intent identity
 
-`client_order_id = "{principal_id}:{intent_id}"`. The venue treats that string
-as the idempotency key and as the lookup key. Gate 4.2 for this venue.
+`client_order_id` is `pco_` plus the first 128 bits of SHA-256 over a canonical,
+domain-separated object containing `principal_id` and `intent_id`. It is stable,
+does not expose either identifier, and cannot alias delimiter-containing identity
+pairs. The venue treats it as both idempotency and lookup key.
+
+## supported order semantics
+
+This reference gateway accepts only signed `BUY` or `SELL` limit orders quoted
+in `USDC`, with `IOC` (the default) or `GTC` time in force. `PLACE_ORDER` is
+rejected because its payload has no signed side; interpreting it as `BUY` would
+broaden the request. `SWAP`, `PAY`, market/FOK orders, non-USDC quote assets and
+requests carrying both an absolute limit and `max_slippage_bps` are refused
+before permit consumption. The service also checks its pinned principal and
+target before consumption.
 
 ## submission idempotency
 
@@ -50,8 +71,9 @@ order is refused before consume.
 
 ## reconciliation lookup + why it is authoritative
 
-`PaperGatewayVerifier.verify` uses the query credential only. For this paper
-book the lookup is the venue's own order index keyed by `client_order_id`:
+`PaperGatewayVerifier.verify` uses the query credential only. For this running
+paper process, lookup reads the venue's own order index keyed by
+`client_order_id`:
 
 | Book state | Settlement | Authoritative | Why |
 |---|---|---|---|
@@ -61,15 +83,25 @@ book the lookup is the venue's own order index keyed by `client_order_id`:
 | `FILLED` | `FINALIZED` | yes | fill, effect id, amount, request hash |
 | stored hash ≠ request | `CONTRADICTORY` | yes | rebound payload |
 
-A transport or credential failure is non-authoritative `UNKNOWN`.
-`effect_id` is the order identity from admission and does not change on fill.
+A transport or credential failure is non-authoritative `UNKNOWN`. Malformed
+wire types are rejected rather than coerced; in particular, the string
+`"false"` can never become an authoritative record. `effect_id` is the order
+identity from admission and does not change on fill.
+
+"Authoritative" here means authoritative for the lifetime of this exact
+in-memory test process. The book is not durable. After a restart it cannot prove
+absence for pre-restart activity; a consumed permit plus reported absence still
+causes the FAAR runtime to STOP. This does not satisfy production failover or
+independent-source evidence.
 
 ## settlement/effect identity
 
 A fill's `effect_id` is the order identity assigned at admission
 (`pg_` + SHA-256(`venue`, `client_order_id`, `"order"`)[:24]). A later fill
-does not mint a second id. A cancel is a separate intent with its own
-`effect_id` and `amount_usd=None`.
+does not mint a second id. Quantities and price evidence are computed atomically
+from the executable quote at actual fill time, not cached when a GTC order is
+admitted. A cancel is a separate intent with its own `effect_id` and
+`amount_usd=None`.
 
 ## finality definition
 
@@ -95,13 +127,15 @@ model a partial economic fill.
 - `FILLED` → `ORDER_ALREADY_FILLED` before consume. Balances are not unwound.
 - already `CANCELLED` → cancel is idempotent (state stays `CANCELLED`).
 - missing → `ORDER_NOT_FOUND` before consume.
+- an order owned by another principal → `ORDER_NOT_OWNED` before consume.
 
 A cancelled order's original intent reconciles as authoritative `CANCELLED`
 with amount 0.
 
 ## rate limits/outages
 
-None beyond the HTTP client timeout. A transport error is
+None beyond the HTTP client timeout, which must be finite and at most 60 seconds.
+A transport error is
 `AmbiguousExecution` (`PAPER_GATEWAY_TRANSPORT_ERROR:*`).
 
 ## network timeouts vs permit TTL
@@ -124,17 +158,24 @@ the shared store. A revoked or halted grant cannot fill.
 
 - Fill price can be configured worse than the displayed quote; the request
   `limit_price` is then the only envelope that stops the fill.
-- GTC orders rest; FAAR sees non-authoritative `UNKNOWN` until fill or cancel.
-  The runtime still has no open-order state (R-14).
+- GTC orders reconcile as authoritative `PARTIALLY_FILLED` amount 0 while open;
+  FAAR records `SETTLEMENT_ORDER_OPEN` and never resubmits them.
+- The book and order index are volatile. Restart recovery and datastore failover
+  are not implemented.
 - SQLite failover is not exercised here (gate 6.4).
 - Tokens are process-local strings, not KMS credentials (R-03).
 - The adapter process that holds the submit token remains in the TCB for
-  submission (R-04). The verifier is not.
+  submission (R-04). The verifier route shares the venue process and economic
+  ground truth (R-12); separate credentials alone do not remove it from the TCB.
+- The bundled loopback server has no TLS, external authentication, durable rate
+  limiter, or slow-client isolation. It must not be exposed outside the host.
 
 ## What this does not claim
 
 This is not an independent security review (gate 8), not a live venue, and not
-a production-safety claim. It turns the paper-gateway rows for gates 4.2, 4.4
-(open-order), 4.9, 6.7 and residual R-12 into in-repo tests. A real venue
-still needs its own review document and the remaining DEPLOYMENT rows. Live
+a production-safety claim. It provides in-repo model coverage for stable
+identity, open orders, finality and cancellation, plus structural submit/query
+role separation. It does not close those rows for a real venue and does not
+close R-12. A real venue still needs its own review document, independently
+authenticated settlement evidence, and every remaining DEPLOYMENT row. Live
 funds remain prohibited.

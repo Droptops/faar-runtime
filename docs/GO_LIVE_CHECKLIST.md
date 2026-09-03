@@ -81,7 +81,7 @@ settlement source, or venue-side fault campaign is present.
 | R-09 hung adapter delays revocation; orphaned adapter threads | DONE-IN-REPO | deadline + kill switch + `max_orphaned_adapter_calls`; a cancelled Python call cannot be killed, the venue refuses its expired or superseded permit |
 | R-10 intent namespace squatting | DEPLOYMENT | ingress authentication |
 | R-11 trusted clock | DEPLOYMENT | |
-| R-12 mock verifier shares ground truth with mock venue | DEPLOYMENT | paper-gateway splits submit/query credentials and loopback HTTP paths (DONE-IN-REPO for that venue only); Hyperliquid candidate separates `/exchange` and `/info`; live use still needs an independently operated node or quorum/archival source |
+| R-12 reference verifier shares venue ground truth / failure domain | DEPLOYMENT | paper-gateway splits roles but shares one process and book; Hyperliquid candidate separates `/exchange` and `/info` but uses the same venue; live use needs an independently operated source or a quorum/archival source with distinct failure domains |
 | R-13 anchor placement | DEPLOYMENT | anchor restored with the DB detects nothing |
 | R-14 partial fills and cancellation | DONE-IN-REPO / DEPLOYMENT (venue cancel terminality) | gates 4.4 and 6.7; `ADAPTER_CONTRACT.md` Part C |
 

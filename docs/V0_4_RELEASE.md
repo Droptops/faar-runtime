@@ -19,7 +19,8 @@ In scope:
 - a fixed-origin Hyperliquid testnet candidate for USDC spot BUY limit-IOC orders,
   tested with deterministic fakes and accompanied by a venue review
 - a paper / loopback gateway with split submit/query credentials, venue-bound
-  permit consume, and an independent query verifier (`docs/adapters/PAPER_GATEWAY.md`)
+  permit consume, and a role-split query verifier over the same in-memory venue
+  truth (`docs/adapters/PAPER_GATEWAY.md`)
 - the release gate (`make check`), including the mapped red-team matrix and the bounded permit protocol model
 
 Out of scope:
@@ -51,8 +52,8 @@ Current `make check` headline results:
 
 | Gate | Result |
 |---|---|
-| Unit/invariant tests | 382/382 pass |
-| Targeted red-team | 165 attack classes mapped to 242 named tests, 0 unmapped |
+| Unit/invariant tests | 412 run, 411 pass, 1 optional-dependency skip |
+| Targeted red-team | 183 attack classes mapped to 261 named tests, 0 unmapped |
 | Adversarial denial cases | 160; 0 unauthorized economic effects; 0 adapter calls |
 | Same-intent replay attempts | 100; 1 effect, 1 adapter call, 1 permit issued and consumed |
 | Seeded fuzz scenarios | 96; 0 duplicate-effect violations; 0 aggregate-budget violations |

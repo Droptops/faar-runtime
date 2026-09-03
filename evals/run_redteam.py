@@ -433,6 +433,42 @@ ATTACK_CLASSES: dict[str, tuple[str, ...]] = {
     "paper-gateway consumed permit paired with absence": (
         "test_paper_gateway.PaperGatewayTests.test_fill_worse_than_limit_price_is_rejected_and_creates_no_effect",
     ),
+    "paper-gateway cross-principal order cancellation": (
+        "test_paper_gateway.PaperGatewayTests.test_other_principal_cannot_cancel_an_order_in_a_shared_book",
+    ),
+    "paper-gateway request spending an unbound principal account": (
+        "test_paper_gateway.PaperGatewayTests.test_service_is_bound_to_one_principal_before_permit_consume",
+    ),
+    "paper-gateway client-order identity delimiter collision": (
+        "test_paper_gateway.PaperGatewayTests.test_stable_client_order_id_is_hashed_and_namespace_unambiguous",
+    ),
+    "paper-gateway PLACE_ORDER silently interpreted as BUY": (
+        "test_paper_gateway.PaperGatewayTests.test_place_order_without_a_signed_side_is_rejected_before_consume",
+    ),
+    "paper-gateway ignored or aliased order semantics": (
+        "test_paper_gateway.PaperGatewayTests.test_order_semantics_are_exact_and_rejected_before_consume",
+    ),
+    "paper-gateway resting order reporting stale admission-time fill facts": (
+        "test_paper_gateway.PaperGatewayTests.test_gtc_order_fills_when_the_book_moves_if_not_cancelled",
+    ),
+    "paper-gateway bearer credentials exfiltrated to a non-loopback origin": (
+        "test_paper_gateway.PaperGatewayHttpTests.test_http_clients_reject_non_loopback_or_ambiguous_origins",
+    ),
+    "paper-gateway stringified false promoted to authoritative settlement": (
+        "test_paper_gateway.PaperGatewayHttpTests.test_malformed_authoritative_flag_never_becomes_authoritative",
+    ),
+    "paper-gateway malformed submit response promoted to a receipt": (
+        "test_paper_gateway.PaperGatewayHttpTests.test_malformed_submit_response_is_ambiguous_not_a_false_receipt",
+    ),
+    "paper-gateway wire scalar coercion changing signed types": (
+        "test_paper_gateway.PaperGatewayHttpTests.test_wire_decoders_reject_scalar_coercion",
+    ),
+    "paper-gateway nonfinite operator book state": (
+        "test_paper_gateway.PaperVenueBookValidationTests.test_nonfinite_or_negative_operator_state_is_rejected",
+    ),
+    "paper-gateway failed fill applying only one balance leg": (
+        "test_paper_gateway.PaperGatewayTests.test_invalid_credit_balance_cancels_without_a_partial_balance_leg",
+    ),
 }
 
 

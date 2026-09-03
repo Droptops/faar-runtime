@@ -8,8 +8,9 @@ credentials**. Gate 6.4 (datastore failover) and gate 8 (independent review)
 remain OPEN.
 
 - `faar/paper_gateway.py`: paper / loopback venue whose submit and query
-  credentials are distinct; the query path cannot create an order. Review
-  record: `docs/adapters/PAPER_GATEWAY.md`.
+  credentials and routes are distinct. Both still share one in-memory venue
+  process and ground truth; this is not operational verifier independence.
+  Review record: `docs/adapters/PAPER_GATEWAY.md`.
 - Venue-bound permit consume (`PERMIT_VENUE_MISMATCH`); consume before any
   book mutation; cancel of a filled or missing order is refused before consume.
 - Admit-then-reject (worse than `limit_price`, insufficient balance) leaves
@@ -17,8 +18,14 @@ remain OPEN.
   with absence (`SETTLEMENT_CANCELLED_UNFILLED`).
 - Resting GTC is authoritative `PARTIALLY_FILLED` amount 0 (`SETTLEMENT_ORDER_OPEN`);
   effect id is the order identity from admission and does not change on fill.
-- Red-team classes RT-135..RT-140 (171 classes, 249 mapped tests). Unit suite
-  is 401 tests (1 skipped). Does not close gate 6.4, gate 8, key custody,
+- Grok follow-up fixes: the gateway is pinned to one principal and target;
+  cross-principal cancels are refused; client-order ids use a domain-separated
+  hash; `PLACE_ORDER` is no longer silently treated as BUY; order/TIF/quote
+  semantics and wire types are exact; GTC evidence is built at fill time;
+  balance legs validate before mutation; HTTP clients cannot send bearer tokens
+  or permits off numeric loopback.
+- Red-team classes RT-135..RT-152 (183 classes, 261 mapped tests). Unit suite
+  is 412 tests (1 skipped). Does not close gate 6.4, gate 8, key custody,
   authenticated ingress, or any live-venue row.
 
 ## 0.4.0 — 2026-09-02
