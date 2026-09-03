@@ -155,12 +155,13 @@ faar/
   paper.py            # safe paper-trading adapter
   paper_gateway.py    # paper / loopback venue with split submit/query credentials
   hyperliquid.py      # fixed-origin, limit-IOC Hyperliquid testnet candidate + verifier
+  postgres_store.py   # PostgreSQL 16 store-contract port candidate
   outcomes.py         # definition-of-done verification
   cli.py              # demo, provisioning, and operator commands
 
 docs/
   ARCHITECTURE.md         EXECUTION_PERMITS.md     OPERATIONS.md
-  STORE_CONTRACT.md
+  STORE_CONTRACT.md       POSTGRES_STORE.md
   INVARIANTS.md           THREAT_MODEL.md          TRUST_MODEL.md
   RISK_ENGINE_CONTRACT.md ADAPTER_CONTRACT.md      RECOVERY.md
   GRANT_PROVISIONING.md   DEFINITION_OF_DONE.md    UNPLUG_TEST.md
@@ -198,8 +199,9 @@ It is not a live-money adapter approval. See
 
 See [`docs/V0_4_RELEASE.md`](docs/V0_4_RELEASE.md). The deterministic release gate (`make check`) includes unit tests, adversarial denial/replay checks with adapter-call and permit-consumption metrics, a red-team matrix in which every attack class is mapped to named tests, seeded state-machine fuzz with an advancing clock, the demo CLI path with keyed evidence verification, and the bounded permit protocol model checker. Headline results:
 
-- 413 unit/invariant tests run (412 pass, 1 optional-dependency skip)
-- 184 targeted red-team attack classes mapped to 262 named tests, 0 unmapped
+- 425 unit/invariant tests discovered; 8 require the PostgreSQL 16 service job
+  (the reference job reports them as conditional skips)
+- 185 targeted red-team attack classes mapped to 264 named tests, 0 unmapped
 - 160 adversarial denial cases with 0 unauthorized economic effects and 0 adapter calls
 - 100 same-intent replay attempts with 1 economic effect, 1 adapter call, 1 permit issued and consumed
 - 96 seeded fuzz scenarios with 0 duplicate-effect and 0 aggregate-budget violations

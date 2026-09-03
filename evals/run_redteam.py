@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import sys
 import unittest
 from pathlib import Path
@@ -472,6 +473,10 @@ ATTACK_CLASSES: dict[str, tuple[str, ...]] = {
     "paper-gateway failed GTC match stranded as an open order": (
         "test_paper_gateway.PaperGatewayTests.test_gtc_failed_match_becomes_authoritative_unfilled_cancel",
     ),
+    "database execution guard letting a hung venue block cross-host revocation": (
+        "test_postgres_store.PostgresStoreBoundaryTests.test_execution_guard_never_acquires_a_database_session_lock",
+        "test_postgres_store.PostgresStoreContractTests.test_cross_process_revoke_does_not_wait_on_hung_adapter",
+    ),
 }
 
 
@@ -500,6 +505,14 @@ def main() -> None:
     stream = io.StringIO()
     result = unittest.TextTestRunner(stream=stream, verbosity=0).run(suite)
     failed = {test.id() for test, _ in result.failures} | {test.id() for test, _ in result.errors}
+    skipped = {test.id() for test, _ in result.skipped}
+    skipped_mapped = sorted(skipped & referenced)
+    conditional_skips = sorted(
+        test_id for test_id in skipped_mapped
+        if test_id.startswith("test_postgres_store.PostgresStoreContractTests.")
+        and not os.environ.get("FAAR_TEST_POSTGRES_DSN")
+    )
+    unexpected_skips = sorted(set(skipped_mapped) - set(conditional_skips))
     failed_classes = sorted(name for name, tests in ATTACK_CLASSES.items() if any(t in failed for t in tests))
 
     report = {
@@ -509,9 +522,11 @@ def main() -> None:
         "unit_tests_run": result.testsRun,
         "unit_failures": len(failed),
         "unmapped_tests": unmapped,
+        "conditional_mapped_tests_not_exercised": conditional_skips,
+        "unexpected_skipped_mapped_tests": unexpected_skips,
         "failed_attack_classes": failed_classes,
         "classes": list(ATTACK_CLASSES),
-        "pass": result.wasSuccessful() and not unmapped,
+        "pass": result.wasSuccessful() and not unmapped and not unexpected_skips,
         "claim_boundary": "Regression evidence only; not a formal proof, production audit, or live-venue security claim.",
     }
     print(json.dumps(report, indent=2))

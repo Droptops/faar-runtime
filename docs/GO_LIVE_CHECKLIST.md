@@ -52,7 +52,7 @@ settlement source, or venue-side fault campaign is present.
 | 6.1 | timeout before/after venue acceptance | DONE-IN-REPO | `MockMode` tests, deadline tests |
 | 6.2 | process / network partition | DONE-IN-REPO (deadline + window; worker killed before every store call) / DEPLOYMENT | `test_runtime_hardening`; `evals/run_crash_injection.py` |
 | 6.3 | duplicate workers | DONE-IN-REPO | `test_runtime.test_concurrent_workers_create_at_most_one_effect`, `test_multiprocess` |
-| 6.4 | datastore failover | OPEN (not testable against SQLite; `STORE_CONTRACT.md` lists every guarantee a replacement must reproduce and the tests that check it) | `STORE_CONTRACT.md`; `evals/run_crash_injection.py`; `test_multiprocess` |
+| 6.4 | datastore failover | OPEN (PostgreSQL 16 port and CI contract/crash job are in-repo; a single CI node does not prove managed failover) | `STORE_CONTRACT.md`; `POSTGRES_STORE.md`; `test_postgres_store`; PostgreSQL-backed `evals/run_crash_injection.py`; deployment failover record still required |
 | 6.5 | stale / malicious RPC or provider | DONE-IN-REPO (fail closed; a transient single-source error is retriable, a contest stops) | non-authoritative settlement tests, quorum tests; Hyperliquid missing/truncated/outage and rebinding tests |
 | 6.6 | revocation during submission | DONE-IN-REPO | fence and cross-process tests |
 | 6.7 | partial fill + cancellation race | DONE-IN-REPO (a cancel reporting no fill after a recorded fill STOPs; a fill after CANCELLED is a venue contract violation) / DEPLOYMENT | `test_partial_fills.test_cancel_reporting_no_fill_after_a_recorded_fill_stops`; crash scenarios `contradictory_settlement_stop` and `fill_regression_stop`; `ADAPTER_CONTRACT.md` Part C; Hyperliquid IOC tests use fakes only |

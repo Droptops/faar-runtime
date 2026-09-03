@@ -25,9 +25,17 @@ remain OPEN.
   balance legs validate before mutation; failed GTC matches become terminal
   unfilled cancellations; HTTP clients cannot send bearer tokens or permits off
   numeric loopback.
-- Red-team classes RT-135..RT-153 (184 classes, 262 mapped tests). Unit suite
-  is 413 tests (1 skipped). Does not close gate 6.4, gate 8, key custody,
+- Red-team classes RT-135..RT-154 (185 classes, 264 mapped tests). The combined
+  suite discovers 425 tests; 8 require the PostgreSQL service job. Does not
+  close gate 6.4, gate 8, key custody,
   authenticated ingress, or any live-venue row.
+- PostgreSQL 16 store port candidate: schema/migrations, transaction-scoped
+  cross-host writer serialization, durable leases, permit issuance ordering,
+  evidence heads and all inherited store operations. Eight live-PostgreSQL
+  contract tests cover runtime replay, atomic effect identity, multiprocess
+  turnover, leases, cross-process revocation and evidence integrity. RT-154
+  prevents a hung adapter from holding a database/session lock across the
+  external call. Failover evidence is still required before gate 6.4 closes.
 
 ## 0.4.0 — 2026-09-02
 

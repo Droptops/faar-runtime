@@ -70,13 +70,20 @@ the single txn whose commit order decides a race.
    read-committed isolation plus the row locks the SQL above implies; where the
    datastore cannot give `BEGIN IMMEDIATE` semantics, use `SELECT ... FOR UPDATE`
    on the grant row, the intent row and the permit row inside each **LP** method.
-2. Keep the per-grant execution guard (`execution_guard`) as a datastore-level
-   lock or advisory lock shared by every process; the in-process registry is not
-   enough across hosts.
+2. Keep `execution_guard` process-local and shared by store instances in that
+   process. Do **not** hold a datastore/session lock across the external adapter
+   call: a hung venue must not block a cross-host pause or revoke. Across hosts,
+   serialize every datastore linearization point (for PostgreSQL, a
+   transaction-scoped advisory writer lock is the conservative reference), and
+   rely on the durable grant epoch re-checked by `consume_execution_permit` so a
+   revoke that wins the transaction order kills the in-flight permit.
 3. Keep the authority anchor outside the datastore's backup and failover set;
    after a failover, run `list-grants` and confirm no `REGRESSED` version before
    resuming.
 4. Run `make check` against the port with the reference tests pointed at it, then
    `evals/run_crash_injection.py` with the worker killed at every datastore call.
+   The crash evaluator selects PostgreSQL when `FAAR_TEST_POSTGRES_DSN` is set;
+   its schema names are isolated and deterministic per crash case, and the CI
+   database must be disposable.
 5. Record the result in the deployment repository as evidence for gate 6.4; the
    in-repo status stays OPEN until then.

@@ -23,6 +23,7 @@ This is regression evidence for the reference store and mock venue, not a proof.
 from __future__ import annotations
 
 import json
+import hashlib
 import multiprocessing as mp
 import os
 import sys
@@ -98,6 +99,24 @@ EXPECTED_STOP_REASONS = {
 }
 
 SETTLEMENT_STOP_WITH_EFFECT = frozenset({"contradictory_settlement_stop", "fill_regression_stop"})
+
+
+def _postgres_schema(locator: str) -> str:
+    """Stable, non-secret schema name shared by parent and spawned workers."""
+    return "faar_crash_" + hashlib.sha256(locator.encode("utf-8")).hexdigest()[:40]
+
+
+def _open_store(locator: str, *, evidence_key: bytes | None = None):
+    dsn = os.environ.get("FAAR_TEST_POSTGRES_DSN")
+    if dsn:
+        from faar.postgres_store import PostgresIntentStore
+
+        return PostgresIntentStore(
+            dsn,
+            schema=_postgres_schema(locator),
+            evidence_key=evidence_key,
+        )
+    return SQLiteIntentStore(locator, evidence_key=evidence_key)
 
 
 class PersistentMockVenue(MockVenue):
@@ -204,7 +223,7 @@ class ContradictoryVerifier:
 class CrashingStore:
     """Counts store calls made by the runtime and kills the process before call N."""
 
-    def __init__(self, inner: SQLiteIntentStore, crash_at: int | None, counter_path: str) -> None:
+    def __init__(self, inner, crash_at: int | None, counter_path: str) -> None:
         self._inner = inner
         self._crash_at = crash_at
         self._counter_path = counter_path
@@ -239,7 +258,7 @@ def _build(store, venue_path: str, mode: MockMode, wrapper: str | None, clock):
 
 def worker(db: str, venue_path: str, counter_path: str, result_path: str, scenario: str, crash_at: int | None) -> None:
     _, mode, _, wrapper = next(s for s in SCENARIOS if s[0] == scenario)
-    inner = SQLiteIntentStore(db, evidence_key=EVIDENCE_KEY)
+    inner = _open_store(db, evidence_key=EVIDENCE_KEY)
     store = CrashingStore(inner, crash_at, counter_path)
     t, runtime, _ = _build(store, venue_path, mode, wrapper, lambda: NOW)
     i = intent(intent_id=INTENT_ID)
@@ -275,7 +294,7 @@ def _recover(db: str, venue_path: str, scenario: str) -> dict:
     """The runbook: clear the dead worker's lease, then process with fresh attestations
     while advancing the clock past the permit window until the intent is terminal."""
     _, _, recovery_mode, wrapper = next(s for s in SCENARIOS if s[0] == scenario)
-    store = SQLiteIntentStore(db, evidence_key=EVIDENCE_KEY)
+    store = _open_store(db, evidence_key=EVIDENCE_KEY)
     clock = {"now": NOW}
     recovery_wrapper = None if wrapper in {"reject", "fill_regression"} else wrapper
     t, runtime, venue = _build(store, venue_path, recovery_mode, recovery_wrapper, lambda: clock["now"])
@@ -359,14 +378,21 @@ def _violations(case: dict, scenario: str) -> list[str]:
 
 def main() -> None:
     ctx = mp.get_context("spawn")
-    report = {"suite": "FAAR v0.4 crash-injection recovery", "scenarios": {}, "cases": 0, "violations": []}
+    backend = "postgresql16" if os.environ.get("FAAR_TEST_POSTGRES_DSN") else "sqlite-reference"
+    report = {
+        "suite": "FAAR v0.4 crash-injection recovery",
+        "backend": backend,
+        "scenarios": {},
+        "cases": 0,
+        "violations": [],
+    }
     with tempfile.TemporaryDirectory(prefix="faar-crash-") as td:
         for scenario, *_ in SCENARIOS:
             # A clean run measures how many store calls one process() makes.
             base = os.path.join(td, scenario)
             os.makedirs(base)
             db = os.path.join(base, "clean.sqlite")
-            store = SQLiteIntentStore(db, evidence_key=EVIDENCE_KEY)
+            store = _open_store(db, evidence_key=EVIDENCE_KEY)
             store.provision_grant(grant(), canonical_hash(grant()))
             store.close()
             counter = os.path.join(base, "clean.count")
@@ -379,7 +405,7 @@ def main() -> None:
                 case_dir = os.path.join(base, f"crash-{crash_at:03d}")
                 os.makedirs(case_dir)
                 db = os.path.join(case_dir, "faar.sqlite")
-                store = SQLiteIntentStore(db, evidence_key=EVIDENCE_KEY)
+                store = _open_store(db, evidence_key=EVIDENCE_KEY)
                 store.provision_grant(grant(), canonical_hash(grant()))
                 store.close()
                 venue_path = os.path.join(case_dir, "venue.json")
@@ -403,8 +429,9 @@ def main() -> None:
             }
     report["pass"] = not report["violations"]
     report["claim_boundary"] = (
-        "Process kill at every store-call boundary of the reference runtime with the mock venue; "
-        "recovery follows the documented runbook. Not a proof and not a statement about a real venue."
+        f"Process kill at every store-call boundary using {backend} with the mock venue; "
+        "recovery follows the documented runbook. Not a proof, a managed-failover test, or a statement "
+        "about a real venue."
     )
     print(json.dumps(report, indent=2, default=str))
     if not report["pass"]:

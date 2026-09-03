@@ -215,14 +215,15 @@ deployment row or constitute an independent review.
 | RT-151 | Non-finite or negative operator book state could crash or corrupt matching | Medium | Bounded finite prices and non-negative balances at construction and quote update |
 | RT-152 | A failed fill could apply its debit before detecting an invalid credit leg | High | Both balance legs validate before either mutation; admitted failure remains authoritative `CANCELLED` |
 | RT-153 | A resting GTC that failed when it became marketable remained open indefinitely | High | Failed matches become authoritative unfilled `CANCELLED` records and are never retried as fills |
+| RT-154 | A datastore-level execution guard held across the external adapter call could let a hung venue block cross-host pause/revoke | High | PostgreSQL uses transaction-scoped writer locks only at datastore linearization points; the durable epoch rejects the in-flight permit after a winning revoke |
 
 ## Executable regression matrix
 
 Current `make check` result for v0.4.0:
 
 ```text
-413 unit/invariant tests -> PASS (1 optional-dependency skip)
-184 targeted red-team attack classes, each mapped to named tests (262 tests) -> PASS, 0 unmapped
+425 unit/invariant tests discovered -> reference PASS; 8 PostgreSQL integration tests are conditional on the PostgreSQL service job
+185 targeted red-team attack classes, each mapped to named tests (264 tests) -> PASS, 0 unmapped; conditional mappings are reported explicitly
 29 Hyperliquid testnet contract tests with deterministic fakes -> PASS; no live venue or credential claim
 31 paper-gateway tests (in-process + loopback HTTP) -> PASS; not a live venue or credential claim
 160 deterministic denial mutations -> 0 unauthorized economic effects, 0 adapter calls
