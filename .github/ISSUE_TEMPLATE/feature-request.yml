@@ -1,0 +1,35 @@
+name: Feature request
+description: Propose a bounded, invariant-preserving improvement
+title: "proposal: "
+labels: []
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What bounded problem should FAAR solve?
+    validations:
+      required: true
+  - type: textarea
+    id: authority
+    attributes:
+      label: Authority and invariant impact
+      description: Which authority boundary, invariant, or contract changes?
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Proposed evidence
+      description: Describe regression, adversarial, settlement, replay, and recovery tests.
+    validations:
+      required: true
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope confirmation
+      options:
+        - label: This proposal does not require real funds or production credentials.
+          required: true
+        - label: Missing financial limits will fail closed.
+          required: true

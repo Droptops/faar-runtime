@@ -2,6 +2,14 @@
 
 > **Models propose. FAAR authorizes. Deterministic executors act.**
 
+> [!CAUTION]
+> **FAAR is being built in public. It is pre-alpha, has not completed an
+> independent security review, and is not approved for live funds or production
+> credentials.** The repository's tests and red-team evidence are regression
+> evidence, not an audit or production-safety claim. Track the remaining work in
+> [ROADMAP.md](ROADMAP.md) and
+> [docs/GO_LIVE_CHECKLIST.md](docs/GO_LIVE_CHECKLIST.md).
+
 FAAR is a runtime authority layer for autonomous financial agents. It converts an agent's proposed economic action into a canonical intent, checks that action against deterministic capability and risk constraints, mints a narrowly scoped signed execution permit, and only then lets an executor create an economic effect that an independent verifier must confirm.
 
 FAAR is intentionally separate from model reasoning. A model may recommend or request an action; it does not get to expand its own authority, bypass limits, or decide that an ambiguous state is safe enough to execute.
@@ -50,6 +58,21 @@ AAR answers: **is EXECUTE the licensed work primitive?**
 FAAR answers: **is this specific economic execution within the granted capability envelope, and did it happen exactly once?**
 
 Both must pass before money moves.
+
+## Building in public
+
+FAAR publishes its runtime, contracts, invariants, tests, adversarial mappings,
+known limitations, and release gates so claims can be checked against code. Open
+gates stay visible; a self-authored red-team report is not presented as an
+independent review.
+
+- Start with [ROADMAP.md](ROADMAP.md) for the current milestone and contribution
+  priorities.
+- Use [CONTRIBUTING.md](CONTRIBUTING.md) for the invariant-first workflow.
+- Report vulnerabilities privately as described in [SECURITY.md](SECURITY.md);
+  do not put exploit details or credentials in a public issue.
+- Follow [docs/GO_LIVE_CHECKLIST.md](docs/GO_LIVE_CHECKLIST.md) for the exact
+  distinction between in-repository and deployment evidence.
 
 ## Core invariants
 

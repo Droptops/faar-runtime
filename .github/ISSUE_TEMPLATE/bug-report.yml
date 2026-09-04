@@ -1,0 +1,51 @@
+name: Bug report
+description: Report a reproducible non-sensitive defect
+title: "bug: "
+labels: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not report vulnerabilities, credentials, or live-deployment details
+        here. Follow SECURITY.md and use private vulnerability reporting.
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Observed behavior
+      description: What happened, including the machine-readable outcome.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What should have happened?
+    validations:
+      required: true
+  - type: input
+    id: invariant
+    attributes:
+      label: Invariant or contract
+      description: For example, I-12 or a section of STORE_CONTRACT.md.
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Prefer mock, paper, or testnet-only steps and remove secrets.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Commit SHA and environment
+    validations:
+      required: true
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety confirmation
+      options:
+        - label: This report contains no credentials, private keys, seed phrases, wallet secrets, or funded-account details.
+          required: true
+        - label: This is not an undisclosed vulnerability or live-deployment incident.
+          required: true
