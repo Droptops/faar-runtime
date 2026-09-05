@@ -16,3 +16,18 @@ build/
 coverage.xml
 htmlcov/
 .DS_Store
+
+# Local credentials / signing material
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.cer
+
+# Logs and local tooling
+*.log
+.tmp/
+tmp/
+.vscode/
+.idea/
