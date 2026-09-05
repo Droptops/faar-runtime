@@ -16,6 +16,9 @@
 
 - [ ] No credentials, private keys, seed phrases, wallet secrets, production
       endpoints, account identifiers, or funded-balance details are included.
+- [ ] No private model-provider session URLs, private drafting/artifact links,
+      internal handoff links, or proprietary logs/data are included in the PR,
+      commit messages, fixtures, or documentation.
 - [ ] No missing financial limit is treated as unbounded.
 - [ ] No real-money adapter or production-safety claim is introduced while a
       release gate remains open.
