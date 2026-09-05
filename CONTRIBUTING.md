@@ -16,6 +16,15 @@ Changes to grant provisioning, parsing, canonicalization, state transitions, usa
 
 Do not weaken a fail-closed behavior merely to improve availability. Do not add a test that passes by lowering an assertion.
 
+## Public repository hygiene
+
+Treat commit messages, pull-request bodies, review comments, fixtures, logs, and documentation as public artifacts.
+
+- Do not include credentials, private keys, seed phrases, wallet secrets, funded balances, production endpoints, account identifiers, or proprietary data.
+- Do not include private model-provider session URLs, private drafting/artifact links, or internal-only handoff links in commits or pull requests.
+- Keep generated logs and local signing/certificate material outside version control.
+- If sensitive metadata is committed, removing it from the working tree is not sufficient: revoke/rotate it where possible and evaluate Git history plus GitHub-managed pull-request refs.
+
 ## Live adapters
 
 Do not add a live-money adapter without satisfying `docs/ADAPTER_CONTRACT.md`, closing the rows in `docs/GO_LIVE_CHECKLIST.md`, and obtaining the independent review required by `docs/V0_2_RELEASE_GATES.md`.
